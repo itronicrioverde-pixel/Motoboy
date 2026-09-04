@@ -8,5 +8,6 @@ export type {
   IncomeSourceType,
   IncomeErrorCode,
   IncomeValidation,
+  IncomeRepository,
 } from './income-entry';
 export { validateIncomeEntry } from './income-entry';

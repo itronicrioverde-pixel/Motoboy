@@ -10,6 +10,7 @@ export type {
   ReceivableValidation,
   ReceivableOpErrorCode,
   ReceivableOpResult,
+  ReceivableRepository,
 } from './receivable';
 export {
   validateReceivable,

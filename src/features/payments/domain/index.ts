@@ -2,7 +2,15 @@
  * API pública do domínio Payment (entidades + FIFO). Sem default export.
  */
 
-export type { Allocation, Payment, PaymentKind, PaymentErrorCode, PaymentValidation } from './payment';
+export type {
+  Allocation,
+  Payment,
+  PaymentKind,
+  PaymentErrorCode,
+  PaymentValidation,
+  CreatePaymentInput,
+  PaymentRepository,
+} from './payment';
 export { validatePayment } from './payment';
 
 export type {

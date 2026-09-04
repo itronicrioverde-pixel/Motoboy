@@ -19,6 +19,22 @@ import {
   loadRotasIntoPanel,
 } from './features/rotas/presentation/panel-bridge';
 import { installMapaBridge } from './features/mapa/presentation/panel-bridge';
+import {
+  installCustomersBridge,
+  loadCustomersIntoPanel,
+} from './features/customers/presentation/panel-bridge';
+import {
+  installPaymentsBridge,
+  loadPaymentsIntoPanel,
+} from './features/payments/presentation/panel-bridge';
+import {
+  installIncomeBridge,
+  loadIncomeIntoPanel,
+} from './features/income/presentation/panel-bridge';
+import {
+  installReceivablesBridge,
+  loadReceivablesIntoPanel,
+} from './features/receivables/presentation/panel-bridge';
 import { bootstrapPanel } from './legacy/panel.js';
 import type { User } from 'firebase/auth';
 
@@ -74,6 +90,10 @@ installManutencoesBridge();
 installFaturamentoBridge();
 installRotasBridge();
 installMapaBridge();
+installCustomersBridge();
+installPaymentsBridge();
+installIncomeBridge();
+installReceivablesBridge();
 
 // Etapa 1B: o painel só inicializa dentro de uma entrada autenticada única.
 // O login NÃO é montado antes do primeiro estado da autenticação — assim quem
@@ -103,6 +123,10 @@ function enterAuthenticatedApp(user: User): void {
   void loadManutencoesIntoPanel();
   void loadFaturamentoIntoPanel();
   void loadRotasIntoPanel();
+  void loadCustomersIntoPanel();
+  void loadPaymentsIntoPanel();
+  void loadIncomeIntoPanel();
+  void loadReceivablesIntoPanel();
   // Remove o login somente depois de o bootstrap ter sido iniciado.
   unmountLoginView();
   // Revela o painel (retira o estado de boot).

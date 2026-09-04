@@ -13,6 +13,16 @@ import { isValidEffectiveDate, isValidServiceId } from '../../../shared/validati
 export type ReceivableSourceType = 'route' | 'manual';
 export type ReceivableStatus = 'open' | 'partial' | 'paid' | 'cancelled';
 
+export interface ReceivableRepository {
+  list(): Promise<Receivable[]>;
+  listByClient(clientId: string): Promise<Receivable[]>;
+  listOpenByClient(clientId: string): Promise<Receivable[]>;
+  observe(callback: (items: Receivable[]) => void): () => void;
+  save(receivable: Receivable): Promise<void>;
+  saveBatch(receivables: readonly Receivable[]): Promise<void>;
+  remove(id: string): Promise<void>;
+}
+
 export interface Receivable {
   readonly id: string;
   readonly clientId: string;

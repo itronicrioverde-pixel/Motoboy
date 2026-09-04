@@ -12,6 +12,13 @@ import { isValidEffectiveDate } from '../../../shared/validation';
 export type IncomeDirection = 'credit' | 'debit';
 export type IncomeSourceType = 'payment' | 'manual';
 
+export interface IncomeRepository {
+  list(): Promise<IncomeEntry[]>;
+  observe(callback: (items: IncomeEntry[]) => void): () => void;
+  save(entry: IncomeEntry): Promise<void>;
+  remove(id: string): Promise<void>;
+}
+
 export interface IncomeEntry {
   readonly id: string;
   readonly direction: IncomeDirection;

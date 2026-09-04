@@ -16,6 +16,25 @@ export interface Allocation {
 
 export type PaymentKind = 'payment' | 'reversal';
 
+export interface CreatePaymentInput {
+  readonly clientId: string;
+  readonly amountCents: Cents;
+  readonly allocations: readonly Allocation[];
+  readonly effectiveDate: string;
+  readonly idempotencyKey: string;
+  readonly requestHash: string;
+  readonly kind: PaymentKind;
+  readonly reversesPaymentId?: string;
+}
+
+export interface PaymentRepository {
+  list(): Promise<Payment[]>;
+  listByClient(clientId: string): Promise<Payment[]>;
+  observe(callback: (items: Payment[]) => void): () => void;
+  save(payment: Payment): Promise<void>;
+  remove(id: string): Promise<void>;
+}
+
 export interface Payment {
   readonly id: string;
   readonly clientId: string;

@@ -16,6 +16,29 @@ export interface Customer {
   readonly status: CustomerStatus;
 }
 
+export interface CreateCustomerInput {
+  readonly name: string;
+  readonly phone?: string;
+  readonly nickname?: string;
+  readonly notes?: string;
+}
+
+export interface UpdateCustomerInput {
+  readonly name?: string;
+  readonly phone?: string;
+  readonly nickname?: string;
+  readonly notes?: string;
+}
+
+export interface CustomerRepository {
+  list(): Promise<Customer[]>;
+  observe(callback: (items: Customer[]) => void): () => void;
+  create(input: CreateCustomerInput): Promise<Customer>;
+  update(id: string, input: UpdateCustomerInput): Promise<void>;
+  archive(id: string): Promise<void>;
+  remove(id: string): Promise<void>;
+}
+
 export type CustomerErrorCode = 'EMPTY_ID' | 'EMPTY_NAME' | 'INVALID_STATUS';
 
 export type CustomerValidation =
