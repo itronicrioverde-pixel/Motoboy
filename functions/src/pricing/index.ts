@@ -24,3 +24,6 @@ export type {
   PublishPricingTableResult,
 } from './publish-pricing-table';
 export { publishPricingTable } from './publish-pricing-table';
+
+// Adapters Admin/Firestore (DEC-019.3A) — implementações das ports.
+export * from './firestore';

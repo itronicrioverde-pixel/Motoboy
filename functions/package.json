@@ -10,6 +10,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
+    "test:emulator": "vitest run --config vitest.emulator.config.mts",
     "build": "node build.mjs",
     "check": "npm run typecheck && npm run test && npm run build"
   },
