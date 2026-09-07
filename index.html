@@ -3,12 +3,12 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://www.gstatic.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://servicodados.ibge.gov.br https://photon.komoot.io https://router.project-osrm.org https://*.tile.openstreetmap.org;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https://www.gstatic.com https://apis.google.com; worker-src 'self' blob:; frame-src 'self' https://*.firebaseapp.com https://*.firebaseio.com https://apis.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; connect-src 'self' https://*.googleapis.com https://*.firebaseio.com wss://*.firebaseio.com https://servicodados.ibge.gov.br https://photon.komoot.io https://nominatim.openstreetmap.org https://router.project-osrm.org https://*.tile.openstreetmap.org;">
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <title>Painel do Motoboy</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+
 <style>
   /* ============ DESIGN TOKENS ============ */
   :root{
@@ -1048,6 +1048,173 @@
     border:1px dashed var(--line); border-radius:var(--radius-md); font-size:12px; line-height:1.55;
   }
 
+  /* ============ ROTA ATIVA: PAINEL ============ */
+  .arp-panel{
+    background:var(--surface); border-radius:var(--radius-lg); padding:0;
+    box-shadow:0 -2px 16px rgba(0,0,0,0.18); overflow:hidden;
+  }
+  .arp-header{
+    background:var(--bg); padding:16px 18px 12px; border-bottom:1px solid var(--line);
+  }
+  .arp-header-info{ display:flex; gap:24px; margin-bottom:10px; }
+  .arp-eta-row, .arp-distance-row{ display:flex; flex-direction:column; }
+  .arp-eta{ font-size:22px; font-weight:700; color:var(--accent); line-height:1.1; }
+  .arp-eta-label{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-top:2px; }
+  .arp-distance{ font-size:16px; font-weight:600; color:var(--text); line-height:1.1; }
+  .arp-distance-label{ font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.06em; margin-top:2px; }
+  .arp-progress-bar{
+    height:6px; background:var(--line); border-radius:3px; overflow:hidden;
+  }
+  .arp-progress-fill{
+    height:100%; background:var(--accent); border-radius:3px;
+    transition:width 0.4s ease;
+  }
+  .arp-progress-text{
+    font-size:11px; color:var(--muted); margin-top:4px; text-align:right;
+  }
+  .arp-nav-step{
+    display:flex; align-items:center; gap:12px; padding:14px 18px;
+    background:var(--accent); color:#fff;
+  }
+  .arp-nav-icon{ font-size:28px; flex-shrink:0; }
+  .arp-nav-text{ font-size:15px; font-weight:600; line-height:1.3; }
+  .arp-stops{ padding:12px 18px; max-height:200px; overflow-y:auto; }
+  .arp-stops-title{
+    font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase;
+    letter-spacing:0.08em; margin-bottom:8px;
+  }
+  .arp-stops-list{ display:flex; flex-direction:column; gap:6px; }
+  .arp-stop-item{
+    display:flex; align-items:center; gap:10px; padding:8px 10px;
+    border-radius:var(--radius-sm); font-size:13px;
+  }
+  .arp-stop-item.pending{ background:var(--bg); }
+  .arp-stop-item.current{ background:var(--accent-bg, rgba(14,109,206,0.08)); border-left:3px solid var(--accent); }
+  .arp-stop-item.completed{ background:rgba(34,139,34,0.06); }
+  .arp-stop-item.skipped{ background:rgba(128,128,128,0.06); opacity:0.6; }
+  .arp-stop-icon{ font-size:14px; flex-shrink:0; width:20px; text-align:center; }
+  .arp-stop-item.completed .arp-stop-icon{ color:var(--green); }
+  .arp-stop-item.skipped .arp-stop-icon{ color:var(--muted); }
+  .arp-stop-info{ flex:1; min-width:0; }
+  .arp-stop-label{ font-weight:600; font-size:12px; color:var(--text); }
+  .arp-stop-address{ font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .arp-stop-value{ font-weight:600; font-size:12px; color:var(--green); flex-shrink:0; }
+  .arp-actions{
+    display:flex; gap:8px; padding:12px 18px; border-top:1px solid var(--line);
+  }
+  .arp-btn{
+    flex:1; padding:12px 10px; border:none; border-radius:var(--radius-md);
+    font-size:13px; font-weight:600; cursor:pointer; transition:all 0.15s;
+    min-height:44px; display:flex; align-items:center; justify-content:center; gap:6px;
+  }
+  .arp-btn-primary{ background:var(--green); color:#fff; }
+  .arp-btn-primary:active{ background:#1a7a1a; }
+  .arp-btn-secondary{ background:var(--bg); color:var(--text); border:1px solid var(--line); }
+  .arp-btn-secondary:active{ background:var(--line); }
+  .arp-secondary-actions{
+    display:grid; grid-template-columns:1fr 1fr; gap:6px; padding:0 18px 14px;
+  }
+  .arp-btn-outline{
+    padding:10px 8px; border:1px solid var(--line); border-radius:var(--radius-md);
+    background:transparent; color:var(--text); font-size:12px; cursor:pointer;
+    transition:all 0.15s; min-height:38px;
+  }
+  .arp-btn-outline:active{ background:var(--bg); }
+  .arp-btn-danger{
+    grid-column:1/-1; padding:10px 8px; border:1px solid var(--red, #d32f2f);
+    border-radius:var(--radius-md); background:transparent; color:var(--red, #d32f2f);
+    font-size:12px; font-weight:600; cursor:pointer; transition:all 0.15s; min-height:38px;
+  }
+  .arp-btn-danger:active{ background:rgba(211,47,47,0.08); }
+  .arp-btn-pause{ grid-column:auto; }
+
+  /* ============ ROTA ATIVA: MAPA FULLSCREEN ============ */
+  .active-route-map-overlay{
+    position:fixed; inset:0; z-index:2000; background:var(--bg);
+    display:flex; flex-direction:column;
+  }
+  .active-route-map-overlay[hidden]{ display:none; }
+  .armo-top{
+    display:flex; align-items:center; justify-content:space-between;
+    padding:12px 16px; background:var(--surface); border-bottom:1px solid var(--line);
+    min-height:52px; flex-shrink:0;
+  }
+  .armo-top-left{ display:flex; align-items:center; gap:10px; }
+  .armo-eta-badge{
+    background:var(--accent); color:#fff; padding:6px 12px; border-radius:20px;
+    font-size:14px; font-weight:700;
+  }
+  .armo-top-info{ font-size:12px; color:var(--muted); }
+  .armo-map-container{ flex:1; position:relative; }
+  .armo-bottom{
+    flex-shrink:0; max-height:45vh; overflow-y:auto;
+    background:var(--surface); border-top:1px solid var(--line);
+  }
+
+  /* ============ NAVEGACAO: HUD ============ */
+  .nhud-bar{
+    display:flex; align-items:center; gap:12px;
+    padding:12px 16px; background:var(--surface);
+    border-bottom:1px solid var(--line);
+  }
+  .nhud-left{ flex-shrink:0; }
+  .nhud-maneuver-icon{
+    width:44px; height:44px; border-radius:50%; background:var(--accent);
+    color:#fff; display:flex; align-items:center; justify-content:center;
+    font-size:22px;
+  }
+  .nhud-center{ flex:1; min-width:0; }
+  .nhud-step-text{
+    font-size:14px; font-weight:600; color:var(--text); line-height:1.3;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+  }
+  .nhud-step-distance{
+    font-size:12px; color:var(--muted); margin-top:2px;
+  }
+  .nhud-right{ flex-shrink:0; }
+  .nhud-close-btn{
+    width:32px; height:32px; border-radius:50%; border:none;
+    background:var(--bg); color:var(--muted); font-size:16px;
+    cursor:pointer; display:flex; align-items:center; justify-content:center;
+  }
+  .nhud-close-btn:active{ background:var(--line); }
+
+  /* ============ COMPARTILHAMENTO ============ */
+  .share-dialog{
+    position:fixed; bottom:0; left:0; right:0; z-index:2500;
+    background:var(--surface); border-radius:var(--radius-lg) var(--radius-lg) 0 0;
+    box-shadow:0 -4px 24px rgba(0,0,0,0.2); padding:24px 20px;
+    transform:translateY(100%); transition:transform 0.3s ease;
+    max-height:80vh; overflow-y:auto;
+  }
+  .share-dialog.open{ transform:translateY(0); }
+  .share-dialog-backdrop{
+    position:fixed; inset:0; z-index:2499; background:rgba(0,0,0,0.5);
+    display:none;
+  }
+  .share-dialog-backdrop.open{ display:block; }
+  .share-title{ font-size:18px; font-weight:700; margin-bottom:12px; }
+  .share-url{
+    display:flex; gap:8px; margin:12px 0;
+  }
+  .share-url input{
+    flex:1; padding:10px 12px; border:1px solid var(--line); border-radius:var(--radius-sm);
+    font-size:13px; background:var(--bg); color:var(--text);
+  }
+  .share-url button{
+    padding:10px 16px; border:none; border-radius:var(--radius-sm);
+    background:var(--accent); color:#fff; font-weight:600; font-size:13px;
+    cursor:pointer; white-space:nowrap;
+  }
+  .share-url button:active{ background:#0b5cb8; }
+  .share-note{ font-size:12px; color:var(--muted); line-height:1.5; }
+  .share-close{
+    width:100%; padding:12px; margin-top:16px; border:1px solid var(--line);
+    border-radius:var(--radius-md); background:transparent; color:var(--text);
+    font-size:14px; cursor:pointer;
+  }
+  .share-close:active{ background:var(--bg); }
+
   footer.appfoot{ text-align:center; font-size:12px; color:var(--muted-2); padding:10px 16px 4px; letter-spacing:0.04em; }
 
   @media(max-width:380px){
@@ -1677,6 +1844,35 @@
     </section>
 
   </main>
+
+  <!-- ===== ROTA ATIVA: OVERLAY MAPA ===== -->
+  <div class="active-route-map-overlay" id="activeRouteOverlay" hidden>
+    <div class="armo-top">
+      <div class="armo-top-left">
+        <span class="armo-eta-badge" id="armo-eta">--</span>
+        <span class="armo-top-info" id="armo-distance">-- restante</span>
+      </div>
+      <div class="armo-top-info" id="armo-progress">0%</div>
+    </div>
+    <div class="armo-map-container" id="armoMapContainer"></div>
+    <div class="armo-bottom">
+      <div id="navHudContainer"></div>
+      <div id="activeRoutePanelContainer"></div>
+    </div>
+  </div>
+
+  <!-- ===== COMPARTILHAMENTO: DIALOG ===== -->
+  <div class="share-dialog-backdrop" id="shareBackdrop"></div>
+  <div class="share-dialog" id="shareDialog" role="dialog" aria-modal="true" aria-hidden="true">
+    <div class="share-title">Compartilhar Rota</div>
+    <div class="share-note">Envie este link para o cliente acompanhar sua localização em tempo real.</div>
+    <div class="share-url">
+      <input type="text" id="shareUrlInput" readonly value="">
+      <button type="button" id="shareCopyBtn">Copiar</button>
+    </div>
+    <div class="share-note">O link expira em 24 horas. A localização é atualizada automaticamente.</div>
+    <button type="button" class="share-close" id="shareCloseBtn">Fechar</button>
+  </div>
 
   <footer class="appfoot">PAINEL DO MOTOBOY · VERSÃO DE TESTE</footer>
 

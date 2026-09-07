@@ -25,10 +25,10 @@ import {
 
 /**
  * RF-08: exigir e-mail verificado para entrar.
- * Ligado a partir da Etapa 3 (cadastro): contas recém-criadas só acessam o
- * painel depois de confirmar o e-mail.
+ * TEMPORARIAMENTE DESLIGADO para testes locais (conta criada sem caixa de
+ * entrada real). Voltar para `true` antes de publicar em produção.
  */
-export const REQUIRE_EMAIL_VERIFIED = true;
+export const REQUIRE_EMAIL_VERIFIED = false;
 
 export type AuthErrorCode =
   | 'invalid-credentials'
@@ -38,6 +38,8 @@ export type AuthErrorCode =
   | 'weak-password'
   | 'too-many-attempts'
   | 'network'
+  | 'auth-not-configured'
+  | 'unauthorized-domain'
   | 'service-unavailable';
 
 export class AuthError extends Error {
@@ -57,6 +59,8 @@ const MESSAGES: Record<AuthErrorCode, string> = {
   'weak-password': 'A senha deve ter pelo menos 6 caracteres.',
   'too-many-attempts': 'Muitas tentativas. Aguarde alguns minutos e tente novamente.',
   network: 'Sem conexão. Verifique sua internet e tente novamente.',
+  'auth-not-configured': 'Cadastro indisponível: o acesso por e-mail/senha não está ativo neste projeto Firebase.',
+  'unauthorized-domain': 'Este domínio não está autorizado no Firebase para autenticação.',
   'service-unavailable': 'Serviço temporariamente indisponível. Tente mais tarde.',
 };
 
@@ -81,6 +85,12 @@ function mapFirebaseError(code: string): AuthErrorCode {
       return 'too-many-attempts';
     case 'auth/network-request-failed':
       return 'network';
+    case 'auth/operation-not-allowed':
+    case 'auth/configuration-not-found':
+      // Projeto Firebase sem o provedor E-mail/Senha habilitado (HTTP 400 no signUp).
+      return 'auth-not-configured';
+    case 'auth/unauthorized-domain':
+      return 'unauthorized-domain';
     default:
       return 'service-unavailable';
   }

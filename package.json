@@ -13,6 +13,7 @@
     "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
+    "chart.js": "^4.4.1",
     "firebase": "12.18.0",
     "leaflet": "^1.9.4"
   },

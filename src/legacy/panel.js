@@ -1,3 +1,4 @@
+import { Chart } from 'chart.js/auto';
 import { showToast } from '../shared/presentation/notifications/index';
 
 export function bootstrapPanel() {
@@ -815,6 +816,8 @@ export function bootstrapPanel() {
     backdrop.classList.remove('open');
     drawer.setAttribute('aria-hidden', 'true');
     menuBtn.setAttribute('aria-expanded', 'false');
+    const activeItem = drawer.querySelector('.drawer-item.active');
+    if(activeItem && drawer.contains(document.activeElement)) activeItem.blur();
   }
 
   menuBtn.addEventListener('click', openDrawer);
@@ -852,7 +855,7 @@ export function bootstrapPanel() {
     closeStationList(); // 2C: fecha o combobox de posto ao navegar entre abas
     if(view === 'dashboard'){ renderDashboard(); }
     if(view === 'abastecimentos'){ ensureRefuelDateDefault(); } // 2B: garante data só se totalmente vazia (não é reset)
-    if(view === 'rotas'){ requestRegionCenter(); } // prepara o centro regional (GPS) para a busca de endereços
+    if(view === 'rotas'){ autoLocateOnce(); } // localiza o usuário de forma real ao abrir a aba
     if(view === 'faturamento'){ renderFaturamento(); }
     if(view === 'clientes'){ renderClientes(); }
     if(view === 'moto'){ renderMotoConsumo(); }
@@ -1793,8 +1796,15 @@ export function bootstrapPanel() {
   }
 
   function formatPhotonLabel(p){
-    const parts = [p.name, p.street, p.district, p.city, p.state].filter(Boolean);
-    return [...new Set(parts)].slice(0, 4).join(', ');
+    // Rua+numero quando existe (GPS de verdade); senão nome do POI/bairro;
+    // cidade por último. Sem misturar tudo.
+    if(p.street){
+      const rua = p.housenumber ? `${p.street}, ${p.housenumber}` : p.street;
+      const local = [p.district, p.city || p.county || p.locality].filter(Boolean);
+      return [rua, ...local].slice(0, 3).join(', ');
+    }
+    const local = [p.district, p.city || p.county || p.locality].filter(Boolean);
+    return [p.name, ...local].filter(Boolean).slice(0, 3).join(', ') || 'Endereço';
   }
 
   // Busca pela CIDADE ATUAL do motoboy: pega o GPS, descobre a cidade por
@@ -1803,47 +1813,404 @@ export function bootstrapPanel() {
   // A cidade NÃO é fixada no código — vem da posição real do aparelho.
   let regionCenter = null;    // { lat, lon } do aparelho, quando disponível
   let regionPlace = null;     // { city, state } da posição atual (reverse geocode)
-  let regionGeoTried = false; // pede a permissão de localização uma única vez
+  let regionGeoTried = false; // já tentou pedir a permissão de localização nesta sessão
+
+  /** Locais equivalentes à "cidade" no Photon (varia por município/OSM). */
+  function sameCity(props, place){
+    if(!place || !place.city) return true; // sem cidade conhecida: não filtra
+    const alvo = place.city.toLowerCase();
+    const candidatos = [props.city, props.county, props.locality, props.district]
+      .filter(v => typeof v === 'string')
+      .map(v => v.toLowerCase());
+    const estadoOk = !place.state || props.state === place.state;
+    return estadoOk && candidatos.includes(alvo);
+  }
+
   async function reverseCity(center){
     try{
       const url = `https://photon.komoot.io/reverse/?lon=${center.lon}&lat=${center.lat}&lang=default`;
       const res = await fetch(url);
       const data = await res.json();
       const p = data.features && data.features[0] && data.features[0].properties;
-      if(p && p.city) regionPlace = { city: p.city, state: p.state || null };
+      // Photon pode devolver a cidade em city, county (interior) ou locality
+      const cidade = p && (p.city || p.county || p.locality);
+      if(cidade) regionPlace = { city: cidade, state: p.state || null };
     }catch(e){ /* sem cidade: segue com a caixa + Brasil */ }
   }
-  function requestRegionCenter(){
-    if(regionGeoTried || regionCenter || !navigator.geolocation) return;
+
+  /** Pede o GPS. `retry` permite tentar de novo após negar (botão na UI). */
+  function requestRegionCenter(retry = false){
+    if(!navigator.geolocation) return;
+    if(regionCenter) return;
+    if(!retry && regionGeoTried) return;
     regionGeoTried = true;
     navigator.geolocation.getCurrentPosition(
-      (pos) => { regionCenter = { lat: pos.coords.latitude, lon: pos.coords.longitude }; reverseCity(regionCenter); },
-      () => { /* negado/indisponível: segue só com o filtro Brasil */ },
-      { maximumAge: 5 * 60 * 1000, timeout: 8000 }
+      (pos) => {
+        regionCenter = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+        reverseCity(regionCenter);
+      },
+      () => { /* negado/indisponível: usuário pode tentar de novo pelo botão */ },
+      { maximumAge: 5 * 60 * 1000, timeout: 10000, enableHighAccuracy: true }
     );
+  }
+
+  /**
+   * GPS de precisão: fica ouvindo o aparelho (watchPosition) em vez de pegar
+   * a primeira fixa (que pode ser grossa, via Wi-Fi). Chama onUpdate na 1ª
+   * fixa e a cada melhora relevante; para quando a precisão fica boa (<30m).
+   */
+  function preciseFix(onUpdate, onError){
+    if(!navigator.geolocation){ onError({ code: 0 }); return () => {}; }
+    let bestAcc = Infinity;
+    let watchId = null;
+    const stop = () => { if(watchId !== null){ navigator.geolocation.clearWatch(watchId); watchId = null; } };
+    watchId = navigator.geolocation.watchPosition((pos) => {
+      const acc = typeof pos.coords.accuracy === 'number' ? pos.coords.accuracy : Infinity;
+      const coords = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+      const first = bestAcc === Infinity;
+      const improved = acc < bestAcc * 0.8; // só vale se melhorar bastante
+      if(!first && !improved) return;
+      bestAcc = Math.min(bestAcc, acc);
+      onUpdate(coords, acc, first);
+      if(acc <= 30) stop(); // preciso o bastante — para de ouvir
+    }, (err) => { stop(); onError(err); }, { enableHighAccuracy: true, maximumAge: 0, timeout: 20000 });
+    return stop;
+  }
+
+  /**
+   * Localização real e automática ao abrir a aba Rotas: pega o GPS do
+   * aparelho, refina até precisão de rua e mostra o endereço no cartão
+   * "Ponto de partida". Uma única vez por sessão; o botão repete quando quiser.
+   */
+  let autoLocateDone = false;
+  function autoLocateOnce(){
+    if(autoLocateDone || !navigator.geolocation) return;
+    autoLocateDone = true;
+    const valueEl = document.getElementById('startValue');
+    if(valueEl && !startCoords) valueEl.textContent = 'Localizando você automaticamente...';
+    let lastGeocodeAcc = Infinity;
+    let geocoded = false;
+    let bestCoords = null;
+    let bestAcc = Infinity;
+    preciseFix(async (coords, acc, first) => {
+      regionCenter = coords;
+      regionGeoTried = true;
+
+      if(acc < bestAcc){
+        bestAcc = acc;
+        bestCoords = coords;
+      }
+
+      // Define startCoords quando precisão for razoável (<=200m) — cobre desktop e celular.
+      if(acc <= 200){
+        startCoords = coords;
+      }
+
+      // Geocoda na 1ª fixa (para regionPlace) e quando precisão melhora
+      const shouldGeocode = first || (acc <= 50 && lastGeocodeAcc > 50) || (!geocoded && acc <= 200);
+      if(shouldGeocode){
+        if(acc <= 50) lastGeocodeAcc = acc;
+        geocoded = true;
+        try{
+          // Busca endereço: tenta Photon (OSM) E HERE (dados proprietários) em paralelo.
+          // Usa o resultado que tiver rua (melhor para cidades pequenas do Brasil).
+          const [photonResult, hereResult] = await Promise.all([
+            fetch(`https://photon.komoot.io/reverse/?lon=${coords.lon}&lat=${coords.lat}&lang=default`)
+              .then(r => r.ok ? r.json() : null).catch(() => null),
+            hereReverseGeocode(coords.lat, coords.lon).catch(() => null),
+          ]);
+
+          const photonFeat = photonResult?.features?.[0];
+          const photonProps = photonFeat?.properties || {};
+
+          // Monta props unificadas: prefere HERE se tiver rua, senão usa Photon
+          let bestProps = photonProps;
+          let bestLabel = null;
+          if(hereResult && hereResult.street){
+            // HERE tem rua → usa ele
+            bestProps = {
+              street: hereResult.street,
+              housenumber: hereResult.housenumber,
+              name: hereResult.label,
+              city: hereResult.city,
+              state: hereResult.state,
+            };
+            bestLabel = hereResult.label;
+          } else if(photonProps.street){
+            bestLabel = formatPhotonLabel(photonProps);
+          } else if(hereResult && hereResult.label){
+            bestLabel = hereResult.label;
+          } else if(photonFeat){
+            bestLabel = formatPhotonLabel(photonProps);
+          }
+
+          // Atualiza regionPlace (cidade)
+          const cidade = bestProps.city || bestProps.county || bestProps.locality;
+          if(cidade) regionPlace = { city: cidade, state: bestProps.state || null };
+
+          if(valueEl && valueEl.isConnected){
+            const base = bestLabel || 'Localização encontrada';
+            valueEl.textContent = acc <= 50 ? base : `${base} (aprox.)`;
+          }
+        }catch(e){
+          if(valueEl && valueEl.isConnected) valueEl.textContent = startCoords ? 'Localização encontrada (aprox.)' : 'Localizando você automaticamente...';
+        }
+      }
+    }, () => {
+      if(!startCoords && bestCoords){
+        startCoords = bestCoords;
+        regionCenter = bestCoords;
+        if(valueEl && valueEl.isConnected) valueEl.textContent = 'Localização aproximada (' + Math.round(bestAcc) + 'm)';
+      } else if(valueEl && !startCoords){
+        valueEl.textContent = 'Toque no ✓ para liberar a localização (ou digite o endereço direto).';
+      }
+    });
   }
   function regionBbox(center, delta){
     const d = delta || 0.3; // ~30 km: cobre a cidade e o entorno imediato
     return `${center.lon - d},${center.lat - d},${center.lon + d},${center.lat + d}`;
   }
 
-  async function photonSearch(query, limit, signal){
-    const center = regionCenter || startCoords; // GPS, ou o ponto do "usar localização"
-    const fetchLimit = Math.min(limit + 8, 20); // pede a mais p/ compensar os filtros
+  async function photonFetch(query, fetchLimit, center, signal){
     let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=${fetchLimit}&lang=default`;
     if(center) url += `&bbox=${encodeURIComponent(regionBbox(center))}`;
     const res = await fetch(url, signal ? { signal } : undefined);
     if(!res.ok) throw new Error('photon-fail');
     const data = await res.json();
-    const brasil = (data.features || []).filter(f => f.properties && f.properties.countrycode === 'BR');
-    // Só a cidade atual (quando conhecida). Se nada casar a cidade, mantém o
-    // resultado da caixa para não deixar a lista vazia.
-    let lista = brasil;
-    if(regionPlace && regionPlace.city){
-      const daCidade = brasil.filter(f => f.properties.city === regionPlace.city
-        && (!regionPlace.state || f.properties.state === regionPlace.state));
-      if(daCidade.length > 0) lista = daCidade;
+    return (data.features || []).filter(f => f.properties && f.properties.countrycode === 'BR');
+  }
+
+  /**
+   * Segunda fonte: Nominatim (mesmo dado OSM, índice de busca diferente —
+   * acha ruas/bairros que o Photon perde em cidades pequenas). Resultado no
+   * MESMO formato do Photon (properties.type/name/street/city/state...).
+   */
+  async function nominatimFetch(query, fetchLimit, signal){
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query)}&countrycodes=br&limit=${fetchLimit}&addressdetails=1&format=json`;
+    const res = await fetch(url, signal ? { signal } : undefined);
+    if(!res.ok) throw new Error('nominatim-fail');
+    const data = await res.json();
+    return (Array.isArray(data) ? data : []).map(item => {
+      const a = item.address || {};
+      const cidade = a.city || a.town || a.village || a.municipality || a.suburb;
+      return {
+        properties: {
+          type: item.type === 'house' ? 'house' : (a.road ? 'street' : (a.suburb || a.neighbourhood ? 'district' : 'other')),
+          name: item.name || null,
+          street: a.road || null,
+          housenumber: a.house_number || null,
+          district: a.suburb || a.neighbourhood || a.city_district || null,
+          city: cidade || null,
+          county: a.county || null,
+          state: a.state || null,
+          countrycode: (a.country_code || 'br').toUpperCase(),
+        },
+        geometry: { coordinates: [parseFloat(item.lon), parseFloat(item.lat)] },
+      };
+    }).filter(f => f.properties.countrycode === 'BR' && Number.isFinite(f.geometry.coordinates[1]));
+  }
+
+  /**
+   * Terceira fonte: HERE Maps (dados proprietários — tem ruas que o OSM não mapeia).
+   * Requer VITE_HERE_API_KEY no .env. Sem chave, retorna vazio silenciosamente.
+   * Free tier: 250K req/mês.
+   */
+  async function hereFetch(query, fetchLimit, center, signal){
+    const hereKey = window.__HERE_API_KEY || '';
+    if(!hereKey) return [];
+    const params = new URLSearchParams({
+      q: query,
+      limit: String(Math.min(fetchLimit, 20)),
+      apiKey: hereKey,
+      countrycode: 'BRA',
+    });
+    if(center) params.set('at', `${center.lat},${center.lon}`);
+
+    // Autocomplete (rápido, aceita parcial)
+    const acUrl = `https://autocomplete.search.hereapi.com/v1/autocomplete?${params}`;
+    const acRes = await fetch(acUrl, signal ? { signal } : undefined);
+    if(!acRes.ok) return [];
+    const acData = await acRes.json();
+    return (acData.items || []).map(item => {
+      const a = item.address || {};
+      return {
+        properties: {
+          type: a.houseNumber ? 'house' : (a.street ? 'street' : 'other'),
+          name: item.title || a.label || null,
+          street: a.street || null,
+          housenumber: a.houseNumber || null,
+          district: a.district || null,
+          city: a.city || null,
+          county: a.county || null,
+          state: a.state || null,
+          countrycode: 'BR',
+        },
+        geometry: { coordinates: [item.position?.lon ?? 0, item.position?.lat ?? 0] },
+      };
+    }).filter(f => f.geometry.coordinates[0] !== 0 && f.geometry.coordinates[1] !== 0);
+  }
+
+  /**
+   * Reverse geocoding HERE: coordenadas → endereço.
+   */
+  async function hereReverseGeocode(lat, lon){
+    const hereKey = window.__HERE_API_KEY || '';
+    if(!hereKey) return null;
+    try{
+      const params = new URLSearchParams({
+        at: `${lat},${lon}`,
+        apiKey: hereKey,
+        lang: 'pt',
+      });
+      const res = await fetch(`https://geocode.search.hereapi.com/v1/geocode?${params}`);
+      if(!res.ok) return null;
+      const data = await res.json();
+      const first = (data.items || [])[0];
+      if(!first) return null;
+      const a = first.address || {};
+      return {
+        street: a.street || null,
+        housenumber: a.houseNumber || null,
+        city: a.city || a.county || a.district || null,
+        state: a.state || null,
+        label: first.title || a.label || null,
+      };
+    }catch(e){ return null; }
+  }
+
+  /** Junta fontes sem duplicar (mesmo nome + mesma cidade, ou mesma lat/lon). */
+  function mergeSources(...lists){
+    const vistos = new Set();
+    const result = [];
+    for(const list of lists){
+      for(const f of list){
+        const p = f.properties;
+        const nome = (p.name || p.street || '').toLowerCase();
+        const cidade = (p.city || p.county || '').toLowerCase();
+        const lat = f.geometry?.coordinates?.[1]?.toFixed(5) || '';
+        const lon = f.geometry?.coordinates?.[0]?.toFixed(5) || '';
+        const chave = nome ? `${nome}|${cidade}` : `${lat},${lon}`;
+        if(vistos.has(chave)) continue;
+        vistos.add(chave);
+        result.push(f);
+      }
     }
+    return result;
+  }
+
+  /** Remove números soltos da busca: "popular 78 569" → "popular" (OSM raramente tem a numeração). */
+  function streetWords(query){
+    const words = query.trim().split(/\s+/).filter(w => !/^\d+$/.test(w));
+    return words.join(' ');
+  }
+
+  /** Extrai palavras significativas (>= 3 chars) de uma query para matching. */
+  function significantWords(query){
+    return query.trim().split(/\s+/).filter(w => w.length >= 3 && !/^\d+$/.test(w)).map(w => w.toLowerCase());
+  }
+
+  /** Verifica se um feature contém alguma palavra-chave da query original. */
+  function hasKeywordMatch(props, keywords){
+    if(!keywords || keywords.length === 0) return true;
+    const candidates = [props.name, props.street, props.district, props.city, props.county, props.locality]
+      .filter(v => typeof v === 'string').map(v => v.toLowerCase());
+    return keywords.some(kw => candidates.some(c => c.includes(kw)));
+  }
+
+  /** Verifica se o match é forte: palavra-chave aparece no campo rua/nome do feature
+   *  (não só em bairro/cidade genérica). Ex: "popular" em "Rua Popular" = forte,
+   *  "popular" em "Praça do Bairro Popular" = fraco (match só no nome do bairro). */
+  function hasStrongMatch(props, keywords){
+    if(!keywords || keywords.length === 0) return true;
+    const streetFields = [props.street, props.housenumber]
+      .filter(v => typeof v === 'string').map(v => v.toLowerCase());
+    const nameField = typeof props.name === 'string' ? props.name.toLowerCase() : '';
+    // Match forte = keyword aparece no nome do POI/rua E não é só bairro/cidade
+    return keywords.some(kw => {
+      const inStreet = streetFields.some(c => c.includes(kw));
+      const inName = nameField.includes(kw);
+      return inStreet || inName;
+    });
+  }
+
+  /** Distância até o centro (para ordenar sugestões do mais perto pro mais longe). */
+  function distToCenter(f, center){
+    if(!center || !f.geometry || !Array.isArray(f.geometry.coordinates)) return Infinity;
+    return haversineKm({ lat: f.geometry.coordinates[1], lon: f.geometry.coordinates[0] }, center);
+  }
+
+  async function photonSearch(query, limit, signal){
+    const center = regionCenter || startCoords; // GPS, ou o ponto do "usar localização"
+    const fetchLimit = Math.min(limit + 12, 20); // pede a mais p/ compensar os filtros
+    const nomeRua = streetWords(query);
+    const keywords = significantWords(query);
+    const tentar = async (q, c) => {
+      if(!q.trim()) return [];
+      const [fot, nom, here] = await Promise.all([
+        photonFetch(q, fetchLimit, c, signal).catch(err => (err && err.name === 'AbortError') ? Promise.reject(err) : []),
+        nominatimFetch(q, fetchLimit, signal).catch(() => []),
+        hereFetch(q, fetchLimit, c, signal).catch(() => []),
+      ]);
+      return mergeSources(fot, nom, here);
+    };
+
+    // 1) caixa do GPS + busca completa (com numeração)
+    let lista = await tentar(query, center);
+
+    // 2) Filtro inteligente: se temos resultados mas NENHUM tem match forte
+    //    (keyword aparece só em bairro/cidade, não em rua/nome), busca com rua limpa.
+    //    Ex: "popular 78 569" → "Praça do Bairro Popular" tem match fraco → busca "popular"
+    const hasStrong = lista.some(f => hasStrongMatch(f.properties, keywords));
+    if(!hasStrong && nomeRua !== query.trim()){
+      const stripped = await tentar(nomeRua, center);
+      lista = lista.concat(stripped);
+      // Se ainda não tem match forte, busca com cidade appended
+      if(!lista.some(f => hasStrongMatch(f.properties, keywords))){
+        if(regionPlace && regionPlace.city){
+          const comCidade = await tentar(`${nomeRua}, ${regionPlace.city}`, null);
+          lista = lista.concat(comCidade);
+        }
+      }
+    }
+
+    // Foca na cidade do usuário quando conhecida; se ela não veio na caixa
+    // (cidades pequenas aparecem pouco no OSM), busca "rua, cidade" no Brasil todo.
+    if(regionPlace && regionPlace.city){
+      const daCidade = lista.filter(f => sameCity(f.properties, regionPlace));
+      if(daCidade.length > 0){
+        lista = daCidade;
+      }else{
+        const comCidade = await tentar(`${nomeRua}, ${regionPlace.city}`, null);
+        const naCidade = comCidade.filter(f => sameCity(f.properties, regionPlace));
+        if(naCidade.length > 0) lista = naCidade;
+      }
+    }
+    // 3) nada em lugar nenhum: busca ampla no Brasil com a busca completa
+    if(lista.length === 0){
+      lista = await tentar(query, null);
+    }
+
+    // Ruas, números e bairros primeiro; cidade e POIs genéricos depois;
+    // mesma cidade antes de fora; mais perto do GPS antes do mais longe.
+    function rankOf(p){
+      if(p.type === 'street' || p.type === 'house') return 0;
+      if(p.type === 'district' || p.type === 'suburb' || p.type === 'quarter'
+        || p.type === 'neighbourhood' || p.type === 'locality') return 1;
+      if(p.type === 'city' || p.type === 'town' || p.type === 'village' || p.type === 'hamlet') return 2;
+      return 3; // POIs, amenities etc.
+    }
+    lista = lista
+      .map((f, i) => ({ f, i, d: distToCenter(f, center) }))
+      .sort((a, b) => {
+        const naCidadeA = regionPlace && sameCity(a.f.properties, regionPlace) ? 0 : 1;
+        const naCidadeB = regionPlace && sameCity(b.f.properties, regionPlace) ? 0 : 1;
+        if(naCidadeA !== naCidadeB) return naCidadeA - naCidadeB;
+        const rank = rankOf(a.f.properties) - rankOf(b.f.properties);
+        if(rank !== 0) return rank;
+        if(a.d !== b.d) return a.d - b.d;
+        return a.i - b.i;
+      })
+      .map((x) => x.f);
     return lista.slice(0, limit).map(f => ({
       label: formatPhotonLabel(f.properties),
       lat: f.geometry.coordinates[1],
@@ -1871,10 +2238,10 @@ export function bootstrapPanel() {
         }
       }
     }catch(e){ /* segue para o OSRM */ }
-    // 2) OSRM (fallback gratuito)
+    // 2) OSRM (primário, gratuito)
     try{
       const url = `https://router.project-osrm.org/route/v1/driving/${origem.lon},${origem.lat};${destino.lon},${destino.lat}?overview=false`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
       if(!res.ok) throw new Error('osrm-fail');
       const data = await res.json();
       if(!data.routes || data.routes.length === 0) throw new Error('osrm-empty');
@@ -1974,7 +2341,7 @@ export function bootstrapPanel() {
   async function fetchSuggestions(query, boxEl, onPick, signal, isCurrent){
     requestRegionCenter(); // garante o centro regional (GPS) para priorizar a região
     try{
-      const results = await photonSearch(query, 5, signal);
+      const results = await photonSearch(query, 8, signal);
       if((signal && signal.aborted) || !isCurrent()) return;
       if(results.length === 0){
         boxEl.innerHTML = '<div class="suggest-empty">Nenhum endereço encontrado</div>';
@@ -2321,24 +2688,80 @@ export function bootstrapPanel() {
       return;
     }
     valueEl.textContent = 'Localizando...';
-    navigator.geolocation.getCurrentPosition(async (pos) => {
-      startCoords = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-      regionCenter = startCoords; // reaproveita como centro da busca regional
+    let lastGeocodeAcc = Infinity;
+    let geocoded = false;
+    let bestCoords = null;
+    let bestAcc = Infinity;
+    preciseFix(async (coords, acc, first) => {
+      regionCenter = coords;
       regionGeoTried = true;
-      try{
-        const url = `https://photon.komoot.io/reverse/?lon=${startCoords.lon}&lat=${startCoords.lat}&lang=default`;
-        const res = await fetch(url);
-        const data = await res.json();
-        const f = data.features && data.features[0];
-        if(f && f.properties && f.properties.city){
-          regionPlace = { city: f.properties.city, state: f.properties.state || null };
-        }
-        valueEl.textContent = f ? formatPhotonLabel(f.properties) : 'Localização encontrada';
-      }catch(e){
-        valueEl.textContent = 'Localização encontrada (endereço indisponível agora)';
+
+      if(acc < bestAcc){
+        bestAcc = acc;
+        bestCoords = coords;
       }
-    }, () => {
-      valueEl.textContent = 'Não conseguimos acessar sua localização — verifica a permissão do navegador.';
+
+      if(acc <= 200){
+        startCoords = coords;
+      }
+
+      const shouldGeocode = first || (acc <= 50 && lastGeocodeAcc > 50) || (!geocoded && acc <= 200);
+      if(shouldGeocode){
+        if(acc <= 50) lastGeocodeAcc = acc;
+        geocoded = true;
+        try{
+          const [photonResult, hereResult] = await Promise.all([
+            fetch(`https://photon.komoot.io/reverse/?lon=${coords.lon}&lat=${coords.lat}&lang=default`)
+              .then(r => r.ok ? r.json() : null).catch(() => null),
+            hereReverseGeocode(coords.lat, coords.lon).catch(() => null),
+          ]);
+
+          const photonFeat = photonResult?.features?.[0];
+          const photonProps = photonFeat?.properties || {};
+
+          let bestProps = photonProps;
+          let bestLabel = null;
+          if(hereResult && hereResult.street){
+            bestProps = {
+              street: hereResult.street,
+              housenumber: hereResult.housenumber,
+              name: hereResult.label,
+              city: hereResult.city,
+              state: hereResult.state,
+            };
+            bestLabel = hereResult.label;
+          } else if(photonProps.street){
+            bestLabel = formatPhotonLabel(photonProps);
+          } else if(hereResult && hereResult.label){
+            bestLabel = hereResult.label;
+          } else if(photonFeat){
+            bestLabel = formatPhotonLabel(photonProps);
+          }
+
+          const cidade = bestProps.city || bestProps.county || bestProps.locality;
+          if(cidade) regionPlace = { city: cidade, state: bestProps.state || null };
+
+          if(valueEl && valueEl.isConnected){
+            const base = bestLabel || 'Localização encontrada';
+            valueEl.textContent = acc <= 50 ? base : `${base} (aprox.)`;
+          }
+        }catch(e){
+          if(valueEl && valueEl.isConnected) valueEl.textContent = startCoords ? 'Localização encontrada (aprox.)' : 'Localizando...';
+        }
+      }
+    }, (err) => {
+      // Se não conseguiu GPS bom, usa a melhor estimativa
+      if(!startCoords && bestCoords){
+        startCoords = bestCoords;
+        regionCenter = bestCoords;
+        if(valueEl && valueEl.isConnected) valueEl.textContent = 'Localização aproximada (' + Math.round(bestAcc) + 'm)';
+      } else if(err && err.code === 1){
+        valueEl.textContent = 'Permissão de localização negada — libere nas configurações do navegador e toque de novo.';
+      }else if(err && err.code === 2){
+        valueEl.textContent = 'Sinal de GPS indisponível agora — tente novamente em instantes.';
+      }else{
+        valueEl.textContent = 'Não deu para localizar — toque no botão para tentar de novo.';
+      }
     });
   }
   document.getElementById('btnUseLocation').addEventListener('click', locateMe);
@@ -2375,8 +2798,27 @@ export function bootstrapPanel() {
         lastChain = chain;
         paintRouteTotals(chain, totalValue, hasFuelConfig, allCalculated && !needsApproxConfirm);
       });
+      // Se ainda não temos dados (primeiro cálculo), mostra loading
+      if(lastChain.pontos === 0 || lastChain.totalKm === 0){
+        document.getElementById('routeTotalKm').textContent = 'Calculando...';
+        document.getElementById('routeTotalMin').textContent = '...';
+        document.getElementById('routeTotalCusto').textContent = '—';
+        document.getElementById('routeResultado').textContent = '—';
+        document.getElementById('routeResultado').style.color = 'var(--muted)';
+      } else {
+        paintRouteTotals(lastChain, totalValue, hasFuelConfig, allCalculated && !needsApproxConfirm);
+      }
+    } else if(isCalculating){
+      // Mostra loading enquanto calcula individualmente
+      if(lastChain.totalKm === 0){
+        document.getElementById('routeTotalKm').textContent = 'Calculando...';
+        document.getElementById('routeTotalMin').textContent = '...';
+      } else {
+        paintRouteTotals(lastChain, totalValue, hasFuelConfig, false);
+      }
+    } else {
+      paintRouteTotals(lastChain, totalValue, hasFuelConfig, allCalculated && !needsApproxConfirm);
     }
-    paintRouteTotals(lastChain, totalValue, hasFuelConfig, allCalculated && !needsApproxConfirm);
 
     const confirmButton = document.getElementById('btnConfirmRoute');
     const confirmLabel = document.getElementById('confirmRouteLabel');
@@ -2427,6 +2869,11 @@ export function bootstrapPanel() {
     const totalMin = chain ? chain.totalMin : 0;
     const prefix = chain && chain.approx ? '≈ ' : '';
     const parcial = chain && !chain.completo ? ' · parcial' : '';
+
+    // Se está calculando e não tem dados ainda, não sobrescreve "Calculando..."
+    if(!chain || (chain.pontos === 0 && !chain.completo)){
+      return;
+    }
 
     document.getElementById('routeTotalKm').textContent = prefix + totalKm.toFixed(1).replace('.', ',') + ' km' + parcial;
     document.getElementById('routeTotalMin').textContent = prefix + totalMin + ' min';
@@ -2706,6 +3153,22 @@ export function bootstrapPanel() {
       ? `<b>Rota confirmada</b>${fmtBRL(recebidoNaHora)} recebido e ${fmtBRL(pendenteTotal)} enviado para Clientes.`
       : '<b>Rota confirmada</b>O valor recebido já entrou no resultado do mês.';
     viewClientsButton.style.display = pendenteTotal > 0 ? 'block' : 'none';
+    // Botão "Iniciar Rota" na confirmação
+    let startRouteBtn = document.getElementById('btnStartActiveRoute');
+    if(!startRouteBtn){
+      startRouteBtn = document.createElement('button');
+      startRouteBtn.type = 'button';
+      startRouteBtn.id = 'btnStartActiveRoute';
+      startRouteBtn.className = 'view-clients';
+      startRouteBtn.style.cssText = 'background:var(--green);color:#fff;margin-top:8px;display:block;width:100%;';
+      startRouteBtn.textContent = '📍 Iniciar Rota (Navegação)';
+      confirmation.appendChild(startRouteBtn);
+    }
+    startRouteBtn.style.display = 'block';
+    startRouteBtn.onclick = function(){
+      confirmation.classList.remove('open');
+      startActiveRouteMode();
+    };
     confirmation.classList.add('open');
   });
 
@@ -3163,5 +3626,200 @@ export function bootstrapPanel() {
   renderClientes();
   renderFaturamento();
   renderDashboard();
+
+  // ============ ROTA ATIVA: MODO NAVEGAÇÃO ============
+
+  function startActiveRouteMode(){
+    if(!window.__motoboyActiveRoute) return;
+    const overlay = document.getElementById('activeRouteOverlay');
+    if(!overlay) return;
+
+    // Coleta waypoints do planejamento
+    const waypoints = [];
+    let wpId = 0;
+    // Coleta GPS como primeira posição se disponível
+    if(startCoords){
+      waypoints.push({
+        id:'wp-start-'+wpId++, type:'pickup', label:'Posição Atual',
+        address:'Sua localização', coordinates:startCoords, value:0,
+        serviceIndex:-1, entregaIndex:-1, status:'completed'
+      });
+    }
+    routeServices.forEach(function(s, si){
+      if(s.coletaCoords){
+        waypoints.push({
+          id:'wp-col-'+wpId++, type:'pickup', label:'Coleta',
+          address:s.coleta, coordinates:s.coletaCoords, value:0,
+          serviceIndex:si, entregaIndex:-1, status:'pending'
+        });
+      }
+      s.entregas.forEach(function(e, ei){
+        if(e.entregaCoords && e.status === 'ok'){
+          waypoints.push({
+            id:'wp-ent-'+wpId++, type:'delivery', label:'Entrega',
+            address:e.entrega, coordinates:e.entregaCoords, value:e.valor||0,
+            serviceIndex:si, entregaIndex:ei, status:'pending'
+          });
+        }
+      });
+    });
+
+    if(waypoints.length < 2){
+      showToast('Adicione pelo menos um endereço de coleta e entrega.', {kind:'warning'});
+      return;
+    }
+
+    // Inicia rota ativa
+    window.__motoboyActiveRoute.start(waypoints);
+
+    // Mostra overlay
+    overlay.hidden = false;
+    setView('rotas'); // mantém na view de rotas
+
+    // Inicializa mapa Leaflet no overlay
+    const mapContainer = document.getElementById('armoMapContainer');
+    if(mapContainer && window.__motoboyMap){
+      mapContainer.innerHTML = '';
+      const mapDiv = document.createElement('div');
+      mapDiv.style.cssText = 'width:100%;height:100%;';
+      mapContainer.appendChild(mapDiv);
+      window.__motoboyMap.create({ container:mapDiv, center:startCoords || waypoints[0].coordinates, zoom:14 });
+
+      // Desenha marcadores
+      waypoints.forEach(function(wp, i){
+        if(wp.status !== 'completed'){
+          window.__motoboyMap.addMarker(wp.coordinates, wp.label + ' - ' + wp.address);
+        }
+      });
+
+      // Desenha rota
+      if(waypoints.length >= 2){
+        for(var i=0; i<waypoints.length-1; i++){
+          window.__motoboyMap.drawRoute({
+            origin:waypoints[i].coordinates,
+            destination:waypoints[i+1].coordinates,
+            originLabel:waypoints[i].label,
+            destinationLabel:waypoints[i+1].label
+          });
+        }
+      }
+    }
+
+    // Painel de rota ativa
+    var panelContainer = document.getElementById('activeRoutePanelContainer');
+    if(panelContainer){
+      var panel = new (window.__ActiveRoutePanel || function(callbacks){
+        this.mount = function(el){ el.innerHTML = '<div style="padding:16px;">Painel de rota ativa</div>'; };
+        this.unmount = function(){};
+        this.update = function(){};
+        this.updateNavigationStep = function(){};
+      })({
+        onCompleteStop: function(){
+          window.__motoboyActiveRoute.completeStop();
+        },
+        onSkipStop: function(){
+          window.__motoboyActiveRoute.skipStop();
+        },
+        onOptimize: function(){
+          var result = window.__motoboyActiveRoute.optimize();
+          if(result && result.savingsPercent > 0){
+            showToast('Rota otimizada! Economia de ' + result.savingsPercent + '% no percurso.', {kind:'success'});
+          } else {
+            showToast('A rota já está na ordem mais eficiente.', {kind:'info'});
+          }
+        },
+        onShare: async function(){
+          var route = window.__motoboyActiveRoute.getActiveRoute();
+          if(!route) return;
+          if(!window.__motoboySharing) return;
+          var token = await window.__motoboySharing.start(route.id);
+          if(token){
+            var baseUrl = window.location.origin;
+            var shareUrl = baseUrl + '/compartilhar/' + token;
+            document.getElementById('shareUrlInput').value = shareUrl;
+            document.getElementById('shareBackdrop').classList.add('open');
+            document.getElementById('shareDialog').classList.add('open');
+            document.getElementById('shareDialog').setAttribute('aria-hidden','false');
+          }
+        },
+        onPause: function(){
+          window.__motoboyActiveRoute.pause();
+        },
+        onResume: function(){
+          window.__motoboyActiveRoute.resume();
+        },
+        onStop: function(){
+          window.__motoboyActiveRoute.stop();
+          if(window.__motoboySharing) window.__motoboySharing.stop();
+          overlay.hidden = true;
+          showToast('Rota finalizada.', {kind:'info'});
+        }
+      });
+      panel.mount(panelContainer);
+
+      // Inscreve para atualizações
+      window.__motoboyActiveRoute.subscribe(function(){
+        var progress = window.__motoboyActiveRoute.getProgress();
+        var route = window.__motoboyActiveRoute.getActiveRoute();
+        panel.update(progress, route);
+
+        // Atualiza HUD
+        var hudContainer = document.getElementById('navHudContainer');
+        if(hudContainer){
+          var step = route && route.currentSteps ? route.currentSteps[route.currentStepIndex] : null;
+          panel.updateNavigationStep(step ? step.text : null);
+        }
+
+        // Atualiza topo do overlay
+        var etaEl = document.getElementById('armo-eta');
+        var distEl = document.getElementById('armo-distance');
+        var progEl = document.getElementById('armo-progress');
+        if(progress){
+          if(etaEl) etaEl.textContent = progress.ETA;
+          if(distEl) distEl.textContent = (progress.distanceRemainingMeters/1000).toFixed(1).replace('.',',') + ' km restante';
+          if(progEl) progEl.textContent = progress.percentComplete + '%';
+        }
+
+        // Rota concluída
+        if(route && route.status === 'completed'){
+          overlay.hidden = true;
+          showToast('Todas as entregas foram concluídas!', {kind:'success'});
+        }
+      });
+
+      // Trigger inicial
+      window.__motoboyActiveRoute.subscribe(function(){})();
+    }
+
+    // Share dialog close
+    var shareBackdrop = document.getElementById('shareBackdrop');
+    var shareDialog = document.getElementById('shareDialog');
+    function closeShareDialog(){
+      shareBackdrop.classList.remove('open');
+      shareDialog.classList.remove('open');
+      shareDialog.setAttribute('aria-hidden','true');
+    }
+    if(shareBackdrop) shareBackdrop.onclick = closeShareDialog;
+    var shareCloseBtn = document.getElementById('shareCloseBtn');
+    if(shareCloseBtn) shareCloseBtn.onclick = closeShareDialog;
+    var shareCopyBtn = document.getElementById('shareCopyBtn');
+    if(shareCopyBtn){
+      shareCopyBtn.onclick = function(){
+        var input = document.getElementById('shareUrlInput');
+        if(input && input.value){
+          navigator.clipboard.writeText(input.value).then(function(){
+            shareCopyBtn.textContent = 'Copiado!';
+            setTimeout(function(){ shareCopyBtn.textContent = 'Copiar'; }, 2000);
+          }).catch(function(){
+            input.select();
+            document.execCommand('copy');
+            shareCopyBtn.textContent = 'Copiado!';
+            setTimeout(function(){ shareCopyBtn.textContent = 'Copiar'; }, 2000);
+          });
+        }
+      };
+    }
+  }
+
   window.setView = setView;
 }

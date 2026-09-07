@@ -19,6 +19,7 @@ import {
   loadRotasIntoPanel,
 } from './features/rotas/presentation/panel-bridge';
 import { installMapaBridge } from './features/mapa/presentation/panel-bridge';
+import { installActiveRouteBridge } from './features/active-route/presentation/panel-bridge';
 import {
   installCustomersBridge,
   loadCustomersIntoPanel,
@@ -90,6 +91,7 @@ installManutencoesBridge();
 installFaturamentoBridge();
 installRotasBridge();
 installMapaBridge();
+installActiveRouteBridge();
 installCustomersBridge();
 installPaymentsBridge();
 installIncomeBridge();

@@ -5,6 +5,7 @@
  * Renderiza mapa interativo com marcadores, rotas e círculos.
  */
 
+import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 import type { GeoPoint } from '../domain/routing';
 

@@ -21,10 +21,12 @@ function haversineKm(a: GeoPoint, b: GeoPoint): number {
 }
 
 export class OsrmRoutingProvider implements RoutingProvider {
+  constructor(private readonly timeoutMs = 8000) {}
+
   async route(origin: GeoPoint, destination: GeoPoint): Promise<RouteResult | null> {
     try {
       const url = `https://router.project-osrm.org/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=false`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(this.timeoutMs) });
       if (!res.ok) return null;
       const data: unknown = await res.json();
       const routes = (data as { routes?: Array<{ distance?: number; duration?: number }> })?.routes;

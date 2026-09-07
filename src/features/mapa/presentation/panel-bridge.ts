@@ -45,10 +45,18 @@ declare global {
       fitAllMarkers(): void;
       destroy(): void;
     };
+    /** Chave HERE Maps para geocoding (opcional). */
+    __HERE_API_KEY?: string;
   }
 }
 
 export function installMapaBridge(): void {
+  // Expõe HERE API key para o legado (panel.js) usar em reverse geocoding e autocomplete
+  const hereKey = import.meta.env.VITE_HERE_API_KEY;
+  if (hereKey) {
+    window.__HERE_API_KEY = hereKey;
+  }
+
   // Roteamento com fallback (Google → OSRM → linha reta)
   window.__motoboyRoute = (origin, destination) => routingProvider.route(origin, destination);
   // Roteamento que SEMPRE retorna resultado (nunca null)
