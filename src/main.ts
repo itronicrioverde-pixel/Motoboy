@@ -24,18 +24,9 @@ import {
   installCustomersBridge,
   loadCustomersIntoPanel,
 } from './features/customers/presentation/panel-bridge';
-import {
-  installPaymentsBridge,
-  loadPaymentsIntoPanel,
-} from './features/payments/presentation/panel-bridge';
-import {
-  installIncomeBridge,
-  loadIncomeIntoPanel,
-} from './features/income/presentation/panel-bridge';
-import {
-  installReceivablesBridge,
-  loadReceivablesIntoPanel,
-} from './features/receivables/presentation/panel-bridge';
+import { installPaymentsBridge } from './features/payments/presentation/panel-bridge';
+import { installIncomeBridge } from './features/income/presentation/panel-bridge';
+import { installReceivablesBridge } from './features/receivables/presentation/panel-bridge';
 import {
   installMotoBridge,
   loadMotoIntoPanel,
@@ -113,6 +104,16 @@ installMotoBridge();
 // já tem sessão válida não vê o login piscar. Até lá, o #appBoot cobre a tela.
 let panelStarted = false;
 
+// Ponte para o painel legado: hidratação individual e controle de estado.
+declare global {
+  interface Window {
+    __hydrateMoto?: (data: { currentKm: number; consumption: number; consumptionIsManual: boolean }) => void;
+    __hydrateClientes?: (entities: Array<{ nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>) => void;
+    __flushHydrationQueue?: () => void;
+    __isHydrated?: () => boolean;
+  }
+}
+
 /**
  * Entrada autenticada única. Inicializa o painel legado uma só vez, apenas para
  * usuário autenticado e verificado. As pontes já foram instaladas acima.
@@ -132,20 +133,59 @@ function enterAuthenticatedApp(user: AuthUser): void {
   revealPanel();
   bootstrapPanel();
   panelStarted = true;
-  // As pontes existem; agora carregamos os dados do dono no Firestore.
-  void loadAbastecimentosIntoPanel();
-  void loadManutencoesIntoPanel();
-  void loadFaturamentoIntoPanel();
-  void loadRotasIntoPanel();
-  void loadCustomersIntoPanel();
-  void loadPaymentsIntoPanel();
-  void loadIncomeIntoPanel();
-  void loadReceivablesIntoPanel();
-  void loadMotoIntoPanel();
+
+  // Hidratação orquestrada: aguarda todas as cargas antes de habilitar persistência.
+  // Cada loader retorna sucesso, vazio ou falha explicitamente.
+  // Não considera erro capturado como carregamento concluído.
+  Promise.allSettled([
+    loadAbastecimentosIntoPanel(),
+    loadManutencoesIntoPanel(),
+    loadFaturamentoIntoPanel(),
+    loadRotasIntoPanel(),
+    loadCustomersIntoPanel(),
+    loadMotoIntoPanel(),
+  ]).then((results) => {
+    const failed = results.filter((r) => r.status === 'rejected');
+    if (failed.length > 0) {
+      console.warn(`[Boot] ${failed.length} carga(s) falharam; dados locais preservados.`);
+    }
+
+    // Hidrata clientes e moto individualmente.
+    // O painel legado mantém dados financeiros locais que o novo domínio não carrega;
+    // a hidratação preserva esses dados ao mesclar com o remoto.
+    void loadAndHydrateCustomers();
+    void loadAndHydrateMoto();
+
+    // Processa alterações que o usuário fez durante o carregamento.
+    window.__flushHydrationQueue?.();
+  });
+
   // Remove o login somente depois de o bootstrap ter sido iniciado.
   unmountLoginView();
   // Revela o painel (retira o estado de boot).
   removeBoot();
+}
+
+/** Carrega clientes do Firestore e hidrata o painel preservando dados financeiros locais. */
+async function loadAndHydrateCustomers(): Promise<void> {
+  try {
+    const result = await loadCustomersIntoPanel();
+    window.__hydrateClientes?.(result.data);
+  } catch {
+    // Falha na carga: hidrata com vazio para desbloquear a fila.
+    window.__hydrateClientes?.([]);
+  }
+}
+
+/** Carrega dados da moto do Firestore e hidrata o painel. */
+async function loadAndHydrateMoto(): Promise<void> {
+  try {
+    const result = await loadMotoIntoPanel();
+    window.__hydrateMoto?.(result.data);
+  } catch {
+    // Falha na carga: hidrata com vazio para desbloquear a fila.
+    window.__hydrateMoto?.({ currentKm: 0, consumption: 0, consumptionIsManual: false });
+  }
 }
 
 // RF-05 / RF-10 / RD-05.

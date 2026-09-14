@@ -14,7 +14,6 @@ declare global {
       save(payment: Payment): Promise<void>;
       remove(id: string): Promise<void>;
     };
-    __applyRemotePayments?: (entities: Payment[]) => void;
   }
 }
 
@@ -53,14 +52,4 @@ export function installPaymentsBridge(): void {
       }
     },
   };
-}
-
-export async function loadPaymentsIntoPanel(): Promise<void> {
-  try {
-    const items = await paymentsService.list();
-    window.__applyRemotePayments?.(items);
-  } catch (error) {
-    console.error('[Pagamentos] Erro ao carregar:', error);
-    /* offline/sem permissão: mantém o cache local */
-  }
 }

@@ -13,7 +13,6 @@ declare global {
       save(entry: IncomeEntry): Promise<void>;
       remove(id: string): Promise<void>;
     };
-    __applyRemoteIncome?: (entities: IncomeEntry[]) => void;
   }
 }
 
@@ -44,14 +43,4 @@ export function installIncomeBridge(): void {
       }
     },
   };
-}
-
-export async function loadIncomeIntoPanel(): Promise<void> {
-  try {
-    const items = await incomeService.list();
-    window.__applyRemoteIncome?.(items);
-  } catch (error) {
-    console.error('[Entradas] Erro ao carregar:', error);
-    /* offline/sem permissão: mantém o cache local */
-  }
 }

@@ -16,7 +16,6 @@ declare global {
       saveBatch(receivables: readonly Receivable[]): Promise<void>;
       remove(id: string): Promise<void>;
     };
-    __applyRemoteReceivables?: (entities: Receivable[]) => void;
   }
 }
 
@@ -71,14 +70,4 @@ export function installReceivablesBridge(): void {
       }
     },
   };
-}
-
-export async function loadReceivablesIntoPanel(): Promise<void> {
-  try {
-    const items = await receivablesService.list();
-    window.__applyRemoteReceivables?.(items);
-  } catch (error) {
-    console.error('[Contas a Receber] Erro ao carregar:', error);
-    /* offline/sem permissão: mantém o cache local */
-  }
 }

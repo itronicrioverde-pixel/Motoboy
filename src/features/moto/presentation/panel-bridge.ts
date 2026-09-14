@@ -2,10 +2,13 @@
  * Ponte entre o painel legado e a feature Moto.
  *
  * Salva e carrega os dados da moto (km, consumo) do Firestore.
+ * Hidratação: retorna dados brutos para main.ts orquestrar a hidratação
+ * individual do painel.
  */
 
 import { motoService } from '../index';
 import type { MotoData } from '../index';
+import type { LoadResult } from '../../abastecimentos/presentation/panel-bridge';
 
 declare global {
   interface Window {
@@ -37,11 +40,13 @@ export function installMotoBridge(): void {
   };
 }
 
-export async function loadMotoIntoPanel(): Promise<void> {
-  try {
-    const data = await motoService.get();
-    window.__applyRemoteMoto?.(data);
-  } catch (error) {
-    console.error('[Moto] Erro ao carregar:', error);
-  }
+/**
+ * Carrega os dados da moto do Firestore e retorna.
+ * Retorna sucesso com dados, vazio ou falha explicitamente.
+ * Erro capturado NÃO é considerado carregamento concluído.
+ * A hidratação do painel é feita por main.ts via __hydrateMoto.
+ */
+export async function loadMotoIntoPanel(): Promise<LoadResult<MotoData>> {
+  const data = await motoService.get();
+  return { ok: true, data };
 }

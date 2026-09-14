@@ -1,13 +1,18 @@
 /**
- * Ponte entre o painel legado (monólito index.html) e a feature Abastecimentos.
- *
- * Camada anti-corrupção (strangler pattern): traduz o "view-model" do monólito
- * (refuels) para a entidade do domínio e vice-versa, e faz o write-through para
- * o Firestore. O monólito continua dono da UI; aqui só cuidamos da persistência.
+ * Ponte entre o painel legado e a feature Abastecimentos (strangler pattern).
+ * Traduz o "view-model" do monólito (refuels) para a entidade do domínio e vice-versa,
+ * e faz o write-through para o Firestore. O monólito continua dono da UI; aqui só
+ * cuidamos da persistência.
  */
 
 import { abastecimentosService } from '../index';
 import type { Abastecimento, EditAbastecimento, NewAbastecimento } from '../index';
+
+/** Resultado explícito do carregamento remoto. */
+export interface LoadResult<T> {
+  ok: boolean;
+  data: T;
+}
 
 /** Formato do registro como o monólito o mantém em `refuels`. */
 interface RefuelVM {
@@ -80,13 +85,13 @@ export function installAbastecimentosBridge(): void {
   };
 }
 
-/** Carrega os abastecimentos do dono no Firestore e injeta no painel. */
-export async function loadAbastecimentosIntoPanel(): Promise<void> {
-  try {
-    const items = await abastecimentosService.list();
-    window.__applyRemoteAbastecimentos?.(items);
-  } catch (error) {
-    console.error('[Abastecimentos] Erro ao carregar:', error);
-    /* offline/sem permissão: mantém o que já está no cache local */
-  }
+/**
+ * Carrega os abastecimentos do dono no Firestore e injeta no painel.
+ * Retorna sucesso, vazio ou falha explicitamente.
+ * Erro capturado NÃO é considerado carregamento concluído.
+ */
+export async function loadAbastecimentosIntoPanel(): Promise<LoadResult<Abastecimento[]>> {
+  const items = await abastecimentosService.list();
+  window.__applyRemoteAbastecimentos?.(items);
+  return { ok: true, data: items };
 }

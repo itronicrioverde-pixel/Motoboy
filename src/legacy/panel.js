@@ -301,7 +301,14 @@ export function bootstrapPanel() {
   }
 
   let motoSaveTimer = null;
+  let motoRemoteLoaded = false;
+  // Hidratação: controla quando os dados remotos já foram aplicados ao estado.
+  // Antes da hidratação, alterações do usuário ficam na fila e não são gravadas no Firestore.
+  let motoHydrated = false;
+  let clientsHydrated = false;
+  let hydrationQueue = [];
   function saveMotoToFirestore(){
+    if(!motoRemoteLoaded) return;
     if(motoSaveTimer) clearTimeout(motoSaveTimer);
     motoSaveTimer = setTimeout(function(){
       const uid = currentUid();
@@ -333,9 +340,71 @@ export function bootstrapPanel() {
       localStorageAvailable = false;
     }
     updateStorageStatus();
+  }
+
+  // ---------- sincronização explícita com Firestore ----------
+  // Só é chamada após mutações reais do usuário, nunca dentro de saveLocalState().
+  function syncClientsToFirestore(){
+    if(!clientsHydrated) return;
     saveClientsToFirestore();
+  }
+  function syncMotoToFirestore(){
+    if(!motoHydrated) return;
     saveMotoToFirestore();
   }
+
+  // ---------- hidratação individual ----------
+  // Chamado por main.ts quando os dados remotos chegam (sucesso ou falha).
+  function hydrateMoto(data){
+    if(motoHydrated) return;
+    if(data && typeof data === 'object'){
+      if(Number(data.currentKm) > motoKm){
+        motoKm = Number(data.currentKm);
+        const el = document.getElementById('motoKmValue');
+        if(el) el.textContent = fmtKm(motoKm);
+      }
+      if(typeof data.consumption === 'number' && data.consumption > 0){
+        CONSUMO_ATUAL = data.consumption;
+      }
+      if(typeof data.consumptionIsManual === 'boolean'){
+        consumoManualDefinido = data.consumptionIsManual;
+      }
+    }
+    motoRemoteLoaded = true;
+    motoHydrated = true;
+    saveLocalState();
+  }
+  function hydrateClientes(remoteClientes){
+    if(clientsHydrated) return;
+    if(Array.isArray(remoteClientes)){
+      var remoteByName = {};
+      remoteClientes.forEach(function(c){ remoteByName[c.nome.toLowerCase()] = c; });
+      // Preserva dados financeiros locais que o remoto não carrega (formato legado).
+      var localOnly = clientes.filter(function(c){
+        if(remoteByName[c.nome.toLowerCase()]) return false;
+        return true;
+      });
+      clientes = remoteClientes.concat(localOnly);
+      clientes.forEach(syncClientBalance);
+    }
+    clientsHydrated = true;
+    saveLocalState();
+  }
+
+  // Processa a fila de alterações feitas antes da hidratação.
+  function flushHydrationQueue(){
+    var pending = hydrationQueue;
+    hydrationQueue = [];
+    pending.forEach(function(fn){ fn(); });
+  }
+
+  // Expõe para main.ts orquestrar a hidratação.
+  window.__hydrateMoto = hydrateMoto;
+  window.__hydrateClientes = hydrateClientes;
+  window.__flushHydrationQueue = flushHydrationQueue;
+  window.__isHydrated = function(){
+    return motoHydrated && clientsHydrated;
+  };
 
   function renderRefuelList(el, items, withActions){
     if(items.length === 0){
@@ -712,6 +781,7 @@ export function bootstrapPanel() {
         recalculateMotoKmFromRecords();
         recalcConsumoReal();
         saveLocalState();
+        syncMotoToFirestore();
         renderRefuelViews();
         renderMotoConsumo();
         renderFaturamento();
@@ -792,6 +862,7 @@ export function bootstrapPanel() {
     recalculateMotoKmFromRecords();
     recalcConsumoReal();
     saveLocalState();
+    syncMotoToFirestore();
     renderRefuelViews();
     renderMotoConsumo();
     renderFaturamento();
@@ -988,6 +1059,7 @@ export function bootstrapPanel() {
     if(typeof data.consumptionIsManual === 'boolean'){
       consumoManualDefinido = data.consumptionIsManual;
     }
+    motoRemoteLoaded = true;
   };
 
   function maintTotal(){ return maintenances.reduce((s, m) => s + m.valor, 0); }
@@ -1151,6 +1223,7 @@ export function bootstrapPanel() {
         if(editingMaintenanceIndex === currentIndex) resetMaintenanceFormMode();
         recalculateMotoKmFromRecords();
         saveLocalState();
+        syncMotoToFirestore();
         renderMaint();
         renderFaturamento();
         renderDashboard();
@@ -1234,6 +1307,7 @@ export function bootstrapPanel() {
     }
     recalculateMotoKmFromRecords();
     saveLocalState();
+    syncMotoToFirestore();
     renderMaint();
     renderFaturamento();
     renderDashboard();
@@ -1833,6 +1907,7 @@ export function bootstrapPanel() {
     CONSUMO_ATUAL = consumption;
     consumoManualDefinido = true;
     saveLocalState();
+    syncMotoToFirestore();
     document.getElementById('motoConsumptionStatus').textContent = `${consumption.toFixed(1).replace('.', ',')} km/L salvos à mão e usados nas rotas.`;
     renderMotoConsumo();
     renderRouteSummary();
@@ -3124,6 +3199,8 @@ export function bootstrapPanel() {
     }
 
     saveLocalState();
+    syncClientsToFirestore();
+    syncMotoToFirestore();
     initRouteHistoryFilters();
     renderRouteHistory();
     renderClientes();
@@ -3293,17 +3370,24 @@ export function bootstrapPanel() {
   }
 
   // Callback de sincronização: recebe clientes do Firestore e mescla com os locais.
+  // O formato legado mantém contas/recebimentos/pendente que o novo domínio não carrega.
+  // O merge preserva os dados financeiros locais quando o nome coincide.
   window.__applyRemoteClientes = function(remoteClientes){
     if(!Array.isArray(remoteClientes)) return;
     var remoteByName = {};
     remoteClientes.forEach(function(c){ remoteByName[c.nome.toLowerCase()] = c; });
     var localOnly = clientes.filter(function(c){ return !remoteByName[c.nome.toLowerCase()]; });
-    clientes = remoteClientes.concat(localOnly);
+    clientes = remoteClientes.map(function(remote){
+      var key = remote.nome.toLowerCase();
+      var local = clientes.find(function(c){ return c.nome.toLowerCase() === key; });
+      if(local){
+        remote.contas = local.contas || [];
+        remote.recebimentos = local.recebimentos || [];
+        remote.pendente = local.pendente || 0;
+      }
+      return remote;
+    }).concat(localOnly);
     clientes.forEach(syncClientBalance);
-    saveLocalState();
-    renderClientes();
-    renderFaturamento();
-    renderDashboard();
   };
 
   function addPendingToClient(nome, valor, desc, routeId){
@@ -3379,6 +3463,7 @@ export function bootstrapPanel() {
     if(window.__motoboyRotas) window.__motoboyRotas.remove(routeId);
 
     saveLocalState();
+    syncClientsToFirestore();
     renderFaturamento();
     renderClientes();
     renderDashboard();
@@ -3469,6 +3554,7 @@ export function bootstrapPanel() {
     applyReceipt(cliente, valor, receiptISO);
     entradas.unshift({ desc:`Recebimento de ${cliente.nome}`, valor, data: dateLabelFromISO(receiptISO), dateISO: receiptISO, clientName:cliente.nome });
     saveLocalState();
+    syncClientsToFirestore();
     receiptModalCtl.close();
     receiptClientIndex = null;
     renderClientes();
@@ -3514,6 +3600,7 @@ export function bootstrapPanel() {
         clientes.splice(currentIndex, 1);
         if(editingClientIndex === currentIndex) resetClientFormMode();
         saveLocalState();
+        syncClientsToFirestore();
         renderClientes();
         renderDashboard();
       }
@@ -3543,6 +3630,7 @@ export function bootstrapPanel() {
       clientes.push(newClient(nome));
     }
     saveLocalState();
+    syncClientsToFirestore();
     renderClientes();
     renderFaturamento();
     renderDashboard();
@@ -3718,7 +3806,6 @@ export function bootstrapPanel() {
   }
   recalculateMotoKmFromRecords();
   recalcConsumoReal();
-  saveLocalState();
   renderMotoConsumo();
   renderClientes();
   renderFaturamento();

@@ -824,3 +824,48 @@ Não existem solicitações externas de clientes; não existe carteira; não exi
 - Tabela igual em celular e computador, versionada, imutável e auditável, com publicação atômica e idempotente pelo servidor.
 - A qualidade do reconhecimento de área/endereço dependerá da habilitação futura do Google Places (billing/chave/App Check), com fallback Photon e garantia manual.
 - As etapas seguintes serão autorizadas uma a uma.
+
+---
+
+## DEC-022 — Separação entre persistência local e sincronização remota no bootstrap
+
+**Status:** Aprovada e implementada
+**Data:** 14/09/2026
+
+### Contexto
+
+O painel legado (`panel.js`) inicializa lendo `localStorage` e, ao final de `bootstrapPanel()`, chama `saveLocalState()` que escrevia de volta no localStorage E chamava `saveClientsToFirestore()` e `saveMotoToFirestore()`. Isso criava um race condition: dados potencialmente antigos eram gravados no Firestore antes da leitura remota completar. O `saveClientsToFirestore()` não possuía guarda (diferente de `saveMotoToFirestore()` que já tinha `motoRemoteLoaded`), permitindo que dados antigos de clientes sobrescrevessem dados atuais do Firestore. Além disso, `loadPaymentsIntoPanel`, `loadIncomeIntoPanel` e `loadReceivablesIntoPanel` eram chamadas no boot mas o painel legado não consumia seus resultados (não possuía `__applyRemote*` correspondentes).
+
+### Decisão
+
+- `saveLocalState()` escreve **exclusivamente** no localStorage. Não há chamadas automáticas ao Firestore dentro dela.
+- Sincronização Firestore (`saveClientsToFirestore`, `saveMotoToFirestore`) ocorre **somente após mutações reais do usuário**, por meio de `syncClientsToFirestore()` e `syncMotoToFirestore()`.
+- Ambas as funções de sync possuem guarda: só executam após a hidratação individual respectiva.
+- **Hidratação individual** para clientes (`__hydrateClientes`) e moto (`__hydrateMoto`): funções dedicadas no painel legado que recebem dados remotos, mesclam com o estado local (preservando dados financeiros legados) e marcam a hidratação como concluída.
+- `main.ts` orquestra a hidratação com `Promise.allSettled`, aguardando todas as cargas antes de chamar as funções de hidratação.
+- Loaders das bridges retornam `LoadResult<T>` (sucesso com dados, ou erro propagado). Erro capturado **não** é considerado carregamento concluído.
+- `saveLocalState()` é removida do final de `bootstrapPanel()`.
+- Removidos do boot: `loadPaymentsIntoPanel`, `loadIncomeIntoPanel`, `loadReceivablesIntoPanel` (o painel não consome seus resultados).
+- Merge financeiro de clientes preserva `contas`, `recebimentos` e `pendente` do estado local quando o nome do cliente coincide com o remoto.
+
+### Consequências
+
+- Dados antigos do localStorage não podem mais sobrescrever dados atuais do Firestore durante o bootstrap.
+- Sincronização Firestore só ocorre após hidratação + mutação real do usuário.
+- Comportamento offline preservado: cache local continua funcionando; sincronização remota é desbloqueada pela hidratação.
+- `__applyRemoteMoto` e `__applyRemoteClientes` não chamam `saveLocalState()` — a persistência é feita pelas funções de hidratação.
+- Nenhuma alteração de schema, rules, Functions, deploy ou contratos públicos.
+
+### Arquivos alterados
+
+- `src/legacy/panel.js` — saveLocalState(), hidratação, guards, sync explícito
+- `src/main.ts` — orquestração de hidratação, imports, tipagem
+- `src/features/abastecimentos/presentation/panel-bridge.ts` — LoadResult
+- `src/features/manutencoes/presentation/panel-bridge.ts` — LoadResult
+- `src/features/faturamento/presentation/panel-bridge.ts` — LoadResult
+- `src/features/rotas/presentation/panel-bridge.ts` — LoadResult
+- `src/features/customers/presentation/panel-bridge.ts` — LoadResult, retorno de dados
+- `src/features/moto/presentation/panel-bridge.ts` — LoadResult, retorno de dados
+- `src/features/payments/presentation/panel-bridge.ts` — remoção de loadPaymentsIntoPanel
+- `src/features/income/presentation/panel-bridge.ts` — remoção de loadIncomeIntoPanel
+- `src/features/receivables/presentation/panel-bridge.ts` — remoção de loadReceivablesIntoPanel
