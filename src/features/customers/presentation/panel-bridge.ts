@@ -1,10 +1,32 @@
 /**
  * Ponte entre o painel legado e a feature Customers (strangler pattern).
  * Expõe window.__motoboyCustomers para o monólito CRUD de clientes.
+ *
+ * O domínio Customer usa `name`, mas o painel legado espera `nome` +
+ * arrays `contas` e `recebimentos`. A loadCustomersIntoPanel mapeia
+ * antes de enviar para __applyRemoteClientes.
  */
 
 import { customersService } from '../index';
 import type { Customer } from '../index';
+
+/** Formato legado esperado pelo painel (panel.js). */
+interface LegacyCliente {
+  nome: string;
+  pendente: number;
+  contas: unknown[];
+  recebimentos: unknown[];
+}
+
+/** Converte Customer (domínio) → formato legado do painel. */
+function customerToLegacy(c: Customer): LegacyCliente {
+  return {
+    nome: c.name,
+    pendente: 0,
+    contas: [],
+    recebimentos: [],
+  };
+}
 
 declare global {
   interface Window {
@@ -15,7 +37,7 @@ declare global {
       archive(id: string): Promise<void>;
       remove(id: string): Promise<void>;
     };
-    __applyRemoteClientes?: (entities: Customer[]) => void;
+    __applyRemoteClientes?: (entities: LegacyCliente[]) => void;
   }
 }
 
@@ -68,7 +90,8 @@ export function installCustomersBridge(): void {
 export async function loadCustomersIntoPanel(): Promise<void> {
   try {
     const items = await customersService.list();
-    window.__applyRemoteClientes?.(items);
+    const legacy = items.map(customerToLegacy);
+    window.__applyRemoteClientes?.(legacy);
   } catch (error) {
     console.error('[Clientes] Erro ao carregar:', error);
     /* offline/sem permissão: mantém o cache local */
