@@ -6,7 +6,7 @@
  */
 
 import { activeRouteService, sharingService } from '../index';
-import type { Waypoint, OptimizationResult, RouteProgress } from '../index';
+import type { Waypoint, OptimizationResult, RouteProgress, TrackingState } from '../index';
 import { ActiveRoutePanel } from './active-route-panel';
 
 declare global {
@@ -20,6 +20,7 @@ declare global {
       skipStop(): void;
       optimize(): OptimizationResult | null;
       getProgress(): RouteProgress | null;
+      getTrackingState(): TrackingState | null;
       getActiveRoute(): ReturnType<typeof activeRouteService.getActiveRoute>;
       subscribe(callback: () => void): () => void;
     };
@@ -45,6 +46,7 @@ export function installActiveRouteBridge(): void {
     skipStop: () => activeRouteService.skipCurrentStop(),
     optimize: () => activeRouteService.optimizeRemaining(),
     getProgress: () => activeRouteService.getProgress(),
+    getTrackingState: () => activeRouteService.getTrackingState(),
     getActiveRoute: () => activeRouteService.getActiveRoute(),
     subscribe: (callback) => activeRouteService.subscribe(callback),
   };

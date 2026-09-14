@@ -15,7 +15,7 @@ declare global {
       archive(id: string): Promise<void>;
       remove(id: string): Promise<void>;
     };
-    __applyRemoteCustomers?: (entities: Customer[]) => void;
+    __applyRemoteClientes?: (entities: Customer[]) => void;
   }
 }
 
@@ -24,7 +24,8 @@ export function installCustomersBridge(): void {
     async list() {
       try {
         return await customersService.list();
-      } catch {
+      } catch (error) {
+        console.error('[Clientes] Erro ao listar:', error);
         return [];
       }
     },
@@ -32,28 +33,32 @@ export function installCustomersBridge(): void {
       try {
         const created = await customersService.create(data);
         return created.id;
-      } catch {
+      } catch (error) {
+        console.error('[Clientes] Erro ao criar:', error);
         return '';
       }
     },
     async update(id, data) {
       try {
         await customersService.update(id, data);
-      } catch {
+      } catch (error) {
+        console.error('[Clientes] Erro ao atualizar:', error);
         /* offline/erro */
       }
     },
     async archive(id) {
       try {
         await customersService.archive(id);
-      } catch {
+      } catch (error) {
+        console.error('[Clientes] Erro ao arquivar:', error);
         /* offline/erro */
       }
     },
     async remove(id) {
       try {
         await customersService.remove(id);
-      } catch {
+      } catch (error) {
+        console.error('[Clientes] Erro ao remover:', error);
         /* offline/erro */
       }
     },
@@ -63,8 +68,9 @@ export function installCustomersBridge(): void {
 export async function loadCustomersIntoPanel(): Promise<void> {
   try {
     const items = await customersService.list();
-    window.__applyRemoteCustomers?.(items);
-  } catch {
+    window.__applyRemoteClientes?.(items);
+  } catch (error) {
+    console.error('[Clientes] Erro ao carregar:', error);
     /* offline/sem permissão: mantém o cache local */
   }
 }

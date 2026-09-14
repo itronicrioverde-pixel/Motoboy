@@ -855,6 +855,38 @@
   }
   .add-service-btn:active{ background:var(--orange-dim); }
 
+  /* ============ MAPA DA ROTA (CRIAÇÃO) ============ */
+  .route-map-container{
+    margin-top:12px; border:1px solid var(--line); border-radius:var(--radius-md);
+    background:var(--surface-2); overflow:hidden;
+  }
+  .route-map-header{
+    display:flex; align-items:center; gap:6px;
+    padding:8px 12px; font-size:11px; font-weight:600; color:var(--muted);
+    border-bottom:1px solid var(--line); text-transform:uppercase; letter-spacing:.5px;
+  }
+  .route-map-canvas{
+    width:100%; height:220px; background:#e8e8e8; position:relative;
+  }
+  .route-map-canvas .leaflet-container{ width:100%; height:100%; }
+  .route-map-empty{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:6px; color:var(--muted); font-size:12px;
+  }
+  .route-map-empty svg{ opacity:.4; }
+
+  /* ============ MARCADOR DE POSIÇÃO GPS ============ */
+  .position-marker{ background:none; border:none; }
+  .position-marker-dot{
+    width:16px; height:16px; background:#3388ff; border:3px solid #fff;
+    border-radius:50%; box-shadow:0 2px 8px rgba(0,0,0,.4);
+    animation: position-pulse 2s ease-in-out infinite;
+  }
+  @keyframes position-pulse{
+    0%,100%{ transform:scale(1); opacity:1; }
+    50%{ transform:scale(1.5); opacity:.5; }
+  }
+
   /* ============ ROTAS: CLIENTE DA COLETA / ENTREGAS MÚLTIPLAS ============ */
   .cliente-row{ display:flex; gap:10px; align-items:flex-end; margin-bottom:14px; }
   .cliente-row .field-group{ flex:1; }
@@ -924,7 +956,7 @@
   /* ============ ROTAS: RESUMO E AÇÃO SEMPRE VISÍVEIS ============ */
   #view-rotas{ padding-bottom:calc(138px + env(safe-area-inset-bottom, 0px)); }
   .route-action-dock{
-    position:fixed; left:0; right:0; bottom:0; z-index:19;
+    position:fixed; left:0; right:0; bottom:0; z-index:1000;
     background:rgba(20,23,28,.97); border-top:1px solid var(--line);
     box-shadow:0 -12px 32px rgba(0,0,0,.34);
     transform:translateY(calc(100% + 6px)); opacity:0; pointer-events:none;
@@ -964,7 +996,7 @@
   }
   .route-confirmation.open{
     position:fixed; left:50%; bottom:calc(84px + env(safe-area-inset-bottom, 0px));
-    transform:translateX(-50%); width:min(calc(100% - 32px), 528px); z-index:22;
+    transform:translateX(-50%); width:min(calc(100% - 32px), 528px); z-index:1001;
     display:flex; align-items:center; justify-content:space-between; gap:12px;
     box-shadow:0 12px 30px rgba(0,0,0,.42);
   }
@@ -1259,6 +1291,7 @@
   <noscript><div class="noscript-warning"><b>O aplicativo precisa de JavaScript.</b> Abra pelo navegador ou pelo link publicado do app. O visualizador de arquivos do celular pode mostrar a tela, mas não executa as abas nem os cálculos.</div></noscript>
 
   <!-- ============ TOP BAR ============ -->
+  <div id="panelRoot" hidden>
   <div class="topbar">
     <button type="button" class="menu-btn" id="menuBtn" aria-label="Abrir menu" aria-controls="drawer" aria-expanded="false">
       <svg class="icon" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg>
@@ -1584,9 +1617,9 @@
           <div class="date-seg" id="refuelDate">
             <input type="text" class="seg seg-day" id="refuelDate-d" inputmode="numeric" maxlength="2" placeholder="DD" data-seg="day" aria-label="Dia" autocomplete="off">
             <span class="seg-sep" aria-hidden="true">/</span>
-            <input type="text" class="seg seg-month" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
+            <input type="text" class="seg seg-month" id="refuelDate-m" name="refuelDate-m" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
             <span class="seg-sep" aria-hidden="true">/</span>
-            <input type="text" class="seg seg-year" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
+            <input type="text" class="seg seg-year" id="refuelDate-y" name="refuelDate-y" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
           </div>
           <span class="date-error" id="refuelDate-error" aria-live="polite"></span>
         </div>
@@ -1746,6 +1779,14 @@
       <svg class="icon" viewBox="0 0 24 24" style="width:16px;height:16px;"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
       Adicionar outra coleta + entrega
     </button>
+
+    <div class="route-map-container" id="routeMapContainer" aria-label="Mapa da rota">
+      <div class="route-map-header">
+        <svg class="icon" viewBox="0 0 24 24" style="width:14px;height:14px;"><path d="M3 7l6-3 6 3 6-3v13l-6 3-6-3-6 3z"/><path d="M9 4v13"/><path d="M15 7v13"/></svg>
+        <span>MAPA DA ROTA</span>
+      </div>
+      <div class="route-map-canvas" id="routeMapCanvas"></div>
+    </div>
 
     <div class="route-action-dock" id="routeActionDock" aria-label="Resumo e confirmação da rota">
       <div class="route-action-inner">
@@ -1913,11 +1954,11 @@
         <div class="date-seg" id="maintDate">
           <input type="text" class="seg seg-day" id="maintDate-d" inputmode="numeric" maxlength="2" placeholder="DD" data-seg="day" aria-label="Dia" autocomplete="off">
           <span class="seg-sep" aria-hidden="true">/</span>
-          <input type="text" class="seg seg-month" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
-          <span class="seg-sep" aria-hidden="true">/</span>
-          <input type="text" class="seg seg-year" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
-        </div>
-        <span class="date-error" id="maintDate-error" aria-live="polite"></span>
+            <input type="text" class="seg seg-month" id="maintDate-m" name="maintDate-m" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
+            <span class="seg-sep" aria-hidden="true">/</span>
+            <input type="text" class="seg seg-year" id="maintDate-y" name="maintDate-y" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
+          </div>
+          <span class="date-error" id="maintDate-error" aria-live="polite"></span>
       </div>
       <div class="field-group" id="maintKmGroup">
         <label class="field-label" for="maintKm">KM DO PAINEL AGORA (OPCIONAL)</label>
@@ -1963,11 +2004,11 @@
         <div class="date-seg" id="entradaDate">
           <input type="text" class="seg seg-day" id="entradaDate-d" inputmode="numeric" maxlength="2" placeholder="DD" data-seg="day" aria-label="Dia" autocomplete="off">
           <span class="seg-sep" aria-hidden="true">/</span>
-          <input type="text" class="seg seg-month" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
-          <span class="seg-sep" aria-hidden="true">/</span>
-          <input type="text" class="seg seg-year" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
-        </div>
-        <span class="date-error" id="entradaDate-error" aria-live="polite"></span>
+            <input type="text" class="seg seg-month" id="entradaDate-m" name="entradaDate-m" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
+            <span class="seg-sep" aria-hidden="true">/</span>
+            <input type="text" class="seg seg-year" id="entradaDate-y" name="entradaDate-y" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
+          </div>
+          <span class="date-error" id="entradaDate-error" aria-live="polite"></span>
       </div>
       <div class="field-group edit-reason-field" id="entradaEditReasonField" hidden>
         <label class="field-label" for="entradaEditReason">MOTIVO DA CORREÇÃO (OPCIONAL)</label>
@@ -2031,11 +2072,11 @@
         <div class="date-seg" id="recebimentoDate">
           <input type="text" class="seg seg-day" id="recebimentoDate-d" inputmode="numeric" maxlength="2" placeholder="DD" data-seg="day" aria-label="Dia" autocomplete="off">
           <span class="seg-sep" aria-hidden="true">/</span>
-          <input type="text" class="seg seg-month" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
-          <span class="seg-sep" aria-hidden="true">/</span>
-          <input type="text" class="seg seg-year" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
-        </div>
-        <span class="date-error" id="recebimentoDate-error" aria-live="polite"></span>
+            <input type="text" class="seg seg-month" id="recebimentoDate-m" name="recebimentoDate-m" inputmode="numeric" maxlength="2" placeholder="MM" data-seg="month" aria-label="Mês" autocomplete="off">
+            <span class="seg-sep" aria-hidden="true">/</span>
+            <input type="text" class="seg seg-year" id="recebimentoDate-y" name="recebimentoDate-y" inputmode="numeric" maxlength="4" placeholder="AAAA" data-seg="year" aria-label="Ano" autocomplete="off">
+          </div>
+          <span class="date-error" id="recebimentoDate-error" aria-live="polite"></span>
       </div>
       <div class="info-banner" style="padding:11px 12px">
         <svg class="icon" viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>
@@ -2069,6 +2110,7 @@
     </div>
   </div>
 
+  </div><!-- /panelRoot -->
 
 <script type="module" src="/src/config/firebase.js"></script>
 <script type="module" src="/src/main.ts"></script>

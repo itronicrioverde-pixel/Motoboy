@@ -36,8 +36,12 @@ import {
   installReceivablesBridge,
   loadReceivablesIntoPanel,
 } from './features/receivables/presentation/panel-bridge';
+import {
+  installMotoBridge,
+  loadMotoIntoPanel,
+} from './features/moto/presentation/panel-bridge';
 import { bootstrapPanel } from './legacy/panel.js';
-import type { User } from 'firebase/auth';
+import type { AuthUser } from './features/auth/domain/auth-user';
 
 // Chaves de estado local do painel (hoje ele guarda os dados em localStorage).
 const PANEL_STATE_KEYS = ['motoboy-front-etapa1-v2-clean'];
@@ -85,6 +89,12 @@ function removeBoot(): void {
   appBoot?.remove();
 }
 
+// Raiz do painel: escondida até a autenticação confirmar (renderização em camadas).
+const panelRoot = document.getElementById('panelRoot');
+function revealPanel(): void {
+  panelRoot?.removeAttribute('hidden');
+}
+
 // Pontes de persistência do painel legado (write-through para o Firestore).
 installAbastecimentosBridge();
 installManutencoesBridge();
@@ -96,6 +106,7 @@ installCustomersBridge();
 installPaymentsBridge();
 installIncomeBridge();
 installReceivablesBridge();
+installMotoBridge();
 
 // Etapa 1B: o painel só inicializa dentro de uma entrada autenticada única.
 // O login NÃO é montado antes do primeiro estado da autenticação — assim quem
@@ -106,7 +117,7 @@ let panelStarted = false;
  * Entrada autenticada única. Inicializa o painel legado uma só vez, apenas para
  * usuário autenticado e verificado. As pontes já foram instaladas acima.
  */
-function enterAuthenticatedApp(user: User): void {
+function enterAuthenticatedApp(user: AuthUser): void {
   // Troca de usuário: sempre checa o UID atual ANTES da guarda, para que
   // panelStarted nunca impeça a detecção de troca de usuário.
   if (ensureLocalIsolation(user.uid)) {
@@ -117,7 +128,8 @@ function enterAuthenticatedApp(user: User): void {
     removeBoot();
     return; // inicialização única por carregamento
   }
-  // Só agora lemos o localStorage financeiro e renderizamos o painel.
+  // Só agora revelamos o painel e inicializamos.
+  revealPanel();
   bootstrapPanel();
   panelStarted = true;
   // As pontes existem; agora carregamos os dados do dono no Firestore.
@@ -129,6 +141,7 @@ function enterAuthenticatedApp(user: User): void {
   void loadPaymentsIntoPanel();
   void loadIncomeIntoPanel();
   void loadReceivablesIntoPanel();
+  void loadMotoIntoPanel();
   // Remove o login somente depois de o bootstrap ter sido iniciado.
   unmountLoginView();
   // Revela o painel (retira o estado de boot).

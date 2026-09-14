@@ -3,9 +3,18 @@
  *
  * É o servidor de demonstração do OSRM — sem garantia de disponibilidade.
  * Quando cai, o chamador deve cair no fallback de linha reta.
+ *
+ * Suporta retorno de geometria (polyline) quando solicitado.
  */
 
 import type { GeoPoint, RouteResult, RoutingProvider } from '../domain/routing';
+import { decodePolyline } from './polyline-decoder';
+
+/** Resultado de rota com geometria (polyline decodificada). */
+export interface RouteResultWithGeometry extends RouteResult {
+  /** Pontos da polyline decodificada (se overview=full). */
+  geometry?: GeoPoint[];
+}
 
 /** Haversine: distância em km entre dois pontos geográficos. */
 function haversineKm(a: GeoPoint, b: GeoPoint): number {
@@ -21,11 +30,14 @@ function haversineKm(a: GeoPoint, b: GeoPoint): number {
 }
 
 export class OsrmRoutingProvider implements RoutingProvider {
-  constructor(private readonly timeoutMs = 8000) {}
+  constructor(
+    private readonly timeoutMs = 8000,
+    private readonly baseUrl = 'https://router.project-osrm.org',
+  ) {}
 
   async route(origin: GeoPoint, destination: GeoPoint): Promise<RouteResult | null> {
     try {
-      const url = `https://router.project-osrm.org/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=false`;
+      const url = `${this.baseUrl}/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=false`;
       const res = await fetch(url, { signal: AbortSignal.timeout(this.timeoutMs) });
       if (!res.ok) return null;
       const data: unknown = await res.json();
@@ -40,6 +52,69 @@ export class OsrmRoutingProvider implements RoutingProvider {
     } catch {
       return null;
     }
+  }
+
+  /** Rota com geometria (polyline decodificada). */
+  async routeWithGeometry(
+    origin: GeoPoint,
+    destination: GeoPoint,
+  ): Promise<RouteResultWithGeometry | null> {
+    try {
+      const url = `${this.baseUrl}/route/v1/driving/${origin.lon},${origin.lat};${destination.lon},${destination.lat}?overview=full&geometries=polyline`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(this.timeoutMs) });
+      if (!res.ok) return null;
+      const data: unknown = await res.json();
+      const routes = (data as {
+        routes?: Array<{
+          distance?: number;
+          duration?: number;
+          geometry?: string;
+        }>;
+      })?.routes;
+      if (!routes || routes.length === 0) return null;
+
+      const route = routes[0];
+      const geometry = route.geometry ? decodePolyline(route.geometry) : undefined;
+
+      return {
+        km: route.distance! / 1000,
+        min: Math.round(route.duration! / 60),
+        approx: false,
+        geometry,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Rota em cadeia com geometria (vários pontos sequenciais). */
+  async routeChainWithGeometry(
+    points: GeoPoint[],
+  ): Promise<{ totalKm: number; totalMin: number; approx: boolean; segments: RouteResultWithGeometry[] } | null> {
+    if (points.length < 2) return null;
+
+    const segments: RouteResultWithGeometry[] = [];
+    let totalKm = 0;
+    let totalMin = 0;
+    let anyApprox = false;
+
+    for (let i = 0; i < points.length - 1; i++) {
+      const result = await this.routeWithGeometry(points[i], points[i + 1]);
+      if (!result) {
+        const fallback = OsrmRoutingProvider.straightLineRoute(points[i], points[i + 1]);
+        segments.push({ ...fallback, geometry: [points[i], points[i + 1]] });
+        totalKm += fallback.km;
+        totalMin += fallback.min;
+        anyApprox = true;
+      } else {
+        segments.push(result);
+        totalKm += result.km;
+        totalMin += result.min;
+        if (result.approx) anyApprox = true;
+      }
+    }
+
+    return { totalKm, totalMin, approx: anyApprox, segments };
   }
 
   /** Fallback de linha reta com fator de correção viário (1.3x) + velocidade média urbana. */

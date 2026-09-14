@@ -22,21 +22,24 @@ export function installIncomeBridge(): void {
     async list() {
       try {
         return await incomeService.list();
-      } catch {
+      } catch (error) {
+        console.error('[Entradas] Erro ao listar:', error);
         return [];
       }
     },
     async save(entry) {
       try {
         await incomeService.save(entry);
-      } catch {
+      } catch (error) {
+        console.error('[Entradas] Erro ao salvar:', error);
         /* offline/erro */
       }
     },
     async remove(id) {
       try {
         await incomeService.remove(id);
-      } catch {
+      } catch (error) {
+        console.error('[Entradas] Erro ao remover:', error);
         /* offline/erro */
       }
     },
@@ -47,7 +50,8 @@ export async function loadIncomeIntoPanel(): Promise<void> {
   try {
     const items = await incomeService.list();
     window.__applyRemoteIncome?.(items);
-  } catch {
+  } catch (error) {
+    console.error('[Entradas] Erro ao carregar:', error);
     /* offline/sem permissão: mantém o cache local */
   }
 }

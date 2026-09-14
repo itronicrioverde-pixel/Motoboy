@@ -1,34 +1,23 @@
 /**
  * Serviço de autenticação (camada de aplicação).
  *
- * Concentra toda a conversa com o Firebase Authentication. A camada de
- * apresentação (login-view) só chama estas funções e nunca lida com os
- * códigos internos do Firebase.
+ * Concentra a lógica de autenticação. A camada de apresentação (login-view)
+ * chama estas funções e nunca lida com implementações concretas.
  *
  * RF-04 (mensagens de erro), RF-05 (sessão persistente), RF-06 (recuperação),
  * RF-09 (sair), RF-10 (estado de autenticação para proteger o painel).
+ *
+ * A implementação concreta (Firebase) é injetada via AuthRepository.
  */
 
-import { auth } from '../../../config/firebase.js';
-import {
-  signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
-  updateProfile,
-  sendPasswordResetEmail,
-  sendEmailVerification,
-  signOut,
-  onAuthStateChanged,
-  setPersistence,
-  browserLocalPersistence,
-  type User,
-} from 'firebase/auth';
+import type { AuthUser } from '../domain/auth-user';
+import type { AuthRepository } from '../domain/auth-repository';
+import { FirebaseAuthRepository } from '../infrastructure/firebase-auth-repository';
 
 /**
  * RF-08: exigir e-mail verificado para entrar.
- * TEMPORARIAMENTE DESLIGADO para testes locais (conta criada sem caixa de
- * entrada real). Voltar para `true` antes de publicar em produção.
  */
-export const REQUIRE_EMAIL_VERIFIED = false;
+export const REQUIRE_EMAIL_VERIFIED = true;
 
 export type AuthErrorCode =
   | 'invalid-credentials'
@@ -68,61 +57,31 @@ export function authMessage(code: AuthErrorCode): string {
   return MESSAGES[code];
 }
 
-function mapFirebaseError(code: string): AuthErrorCode {
-  switch (code) {
-    case 'auth/invalid-credential':
-    case 'auth/wrong-password':
-    case 'auth/user-not-found':
-    case 'auth/invalid-email':
-      return 'invalid-credentials';
-    case 'auth/user-disabled':
-      return 'account-disabled';
-    case 'auth/email-already-in-use':
-      return 'email-in-use';
-    case 'auth/weak-password':
-      return 'weak-password';
-    case 'auth/too-many-requests':
-      return 'too-many-attempts';
-    case 'auth/network-request-failed':
-      return 'network';
-    case 'auth/operation-not-allowed':
-    case 'auth/configuration-not-found':
-      // Projeto Firebase sem o provedor E-mail/Senha habilitado (HTTP 400 no signUp).
-      return 'auth-not-configured';
-    case 'auth/unauthorized-domain':
-      return 'unauthorized-domain';
-    default:
-      return 'service-unavailable';
-  }
-}
+// Instância do repositório de autenticação.
+// Único ponto de dependência da infraestrutura Firebase nesta camada.
+const authRepository: AuthRepository = new FirebaseAuthRepository();
 
-function errorCodeOf(err: unknown): string {
-  return typeof err === 'object' && err !== null && 'code' in err
-    ? String((err as { code: unknown }).code)
-    : '';
-}
-
-// RF-05: mantém a sessão após fechar o navegador (persistência local).
-const persistenceReady = setPersistence(auth, browserLocalPersistence).catch(() => {
-  /* se falhar, o Firebase mantém a persistência padrão */
+// RF-05: garante persistência antes de operações que dependem dela.
+const persistenceReady = authRepository.ensurePersistence().catch(() => {
+  /* se falhar, a implementação mantém a persistência padrão */
 });
 
 export async function signIn(email: string, password: string): Promise<void> {
   await persistenceReady;
   try {
-    const credential = await signInWithEmailAndPassword(auth, email, password);
-    if (REQUIRE_EMAIL_VERIFIED && !credential.user.emailVerified) {
+    const user = await authRepository.signIn(email, password);
+    if (REQUIRE_EMAIL_VERIFIED && !user.emailVerified) {
       try {
-        await sendEmailVerification(credential.user);
+        await authRepository.resendVerification();
       } catch {
         /* ignora falha ao reenviar */
       }
-      await signOut(auth);
+      await authRepository.signOut();
       throw new AuthError('email-not-verified');
     }
   } catch (err) {
     if (err instanceof AuthError) throw err;
-    throw new AuthError(mapFirebaseError(errorCodeOf(err)));
+    throw new AuthError('service-unavailable');
   }
 }
 
@@ -134,11 +93,12 @@ export async function signIn(email: string, password: string): Promise<void> {
 export async function sendReset(email: string): Promise<void> {
   await persistenceReady;
   try {
-    await sendPasswordResetEmail(auth, email);
+    await authRepository.sendResetEmail(email);
   } catch (err) {
-    const code = errorCodeOf(err);
-    if (code === 'auth/too-many-requests') throw new AuthError('too-many-attempts');
-    if (code === 'auth/network-request-failed') throw new AuthError('network');
+    if (err instanceof AuthError) {
+      if (err.code === 'too-many-attempts') throw err;
+      if (err.code === 'network') throw err;
+    }
     /* user-not-found / invalid-email: silencioso (mensagem genérica na UI) */
   }
 }
@@ -152,75 +112,51 @@ export async function sendReset(email: string): Promise<void> {
 export async function signUp(name: string, email: string, password: string): Promise<void> {
   await persistenceReady;
   try {
-    const credential = await createUserWithEmailAndPassword(auth, email, password);
-    if (name) {
-      try {
-        await updateProfile(credential.user, { displayName: name });
-      } catch {
-        /* nome é opcional; não bloqueia o cadastro */
-      }
-    }
-    try {
-      await sendEmailVerification(credential.user);
-    } catch {
-      /* verificação pode ser reenviada na tela seguinte */
-    }
+    await authRepository.signUp(name, email, password);
   } catch (err) {
-    throw new AuthError(mapFirebaseError(errorCodeOf(err)));
+    if (err instanceof AuthError) throw err;
+    throw new AuthError('service-unavailable');
   }
 }
 
 /** RF-08: reenvia o e-mail de verificação para o usuário atual. */
 export async function resendVerification(): Promise<void> {
-  const user = auth.currentUser;
-  if (!user) return;
   try {
-    await sendEmailVerification(user);
+    await authRepository.resendVerification();
   } catch (err) {
-    if (errorCodeOf(err) === 'auth/too-many-requests') throw new AuthError('too-many-attempts');
+    if (err instanceof AuthError) {
+      if (err.code === 'too-many-attempts') throw err;
+    }
     throw new AuthError('service-unavailable');
   }
 }
 
 /** RF-08: recarrega o usuário e informa se o e-mail já foi verificado. */
 export async function reloadAndCheckVerified(): Promise<boolean> {
-  const user = auth.currentUser;
-  if (!user) return false;
-  await user.reload();
-  const verified = Boolean(auth.currentUser?.emailVerified);
-  if (verified) {
-    // Força a renovação do token para o claim email_verified chegar às
-    // regras do Firestore (senão as escritas seriam negadas logo após verificar).
-    try {
-      await auth.currentUser?.getIdToken(true);
-    } catch {
-      /* ignora falha de refresh */
-    }
-  }
-  return verified;
+  return authRepository.reloadAndCheckVerified();
 }
 
 /** E-mail do usuário autenticado no momento (para a tela de verificação). */
 export function currentEmail(): string | null {
-  return auth.currentUser?.email ?? null;
+  return authRepository.getCurrentUser()?.email ?? null;
 }
 
 /** uid do usuário autenticado no momento (para escopar os dados por dono). */
 export function currentUid(): string | null {
-  return auth.currentUser?.uid ?? null;
+  return authRepository.currentUid();
 }
 
 /** RF-09: encerra a sessão. */
 export async function logout(): Promise<void> {
-  await signOut(auth);
+  await authRepository.signOut();
 }
 
 /** RF-10: observa o estado de autenticação (dispara no load e a cada mudança). */
-export function observeAuth(callback: (user: User | null) => void): () => void {
-  return onAuthStateChanged(auth, callback);
+export function observeAuth(callback: (user: AuthUser | null) => void): () => void {
+  return authRepository.onAuthStateChanged(callback);
 }
 
 /** true quando há sessão válida (respeitando a exigência de verificação). */
-export function isAuthenticated(user: User | null): boolean {
+export function isAuthenticated(user: AuthUser | null): boolean {
   return Boolean(user) && (!REQUIRE_EMAIL_VERIFIED || Boolean(user?.emailVerified));
 }

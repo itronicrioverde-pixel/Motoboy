@@ -22,14 +22,16 @@ export function installRotasBridge(): void {
     async save(rota) {
       try {
         await rotasService.save(rota);
-      } catch {
+      } catch (error) {
+        console.error('[Rotas] Erro ao salvar:', error);
         /* offline/erro: mantém o cache local */
       }
     },
     async remove(id) {
       try {
         await rotasService.remove(id);
-      } catch {
+      } catch (error) {
+        console.error('[Rotas] Erro ao remover:', error);
         /* offline/erro: mantém o cache local */
       }
     },
@@ -40,7 +42,8 @@ export async function loadRotasIntoPanel(): Promise<void> {
   try {
     const items = await rotasService.list();
     window.__applyRemoteRotas?.(items);
-  } catch {
+  } catch (error) {
+    console.error('[Rotas] Erro ao carregar:', error);
     /* offline/sem permissão: mantém o cache local */
   }
 }

@@ -51,16 +51,18 @@ function significantWords(query: string): string[] {
   return query.trim().split(/\s+/).filter((w) => w.length >= 3 && !/^\d+$/.test(w)).map(norm);
 }
 
-/** Match forte: keyword aparece no nome/rua do feature (não só em bairro/cidade). */
+/** Match forte: keyword aparece no nome/rua/valor-osm do feature. */
 function hasStrongMatch(props: Record<string, unknown>, keywords: string[]): boolean {
   if (keywords.length === 0) return true;
   const streetFields = [props.street, props.housenumber]
     .filter((v): v is string => typeof v === 'string').map(norm);
   const nameField = typeof props.name === 'string' ? norm(props.name) : '';
+  const osmValue = typeof props.osm_value === 'string' ? norm(props.osm_value) : '';
   return keywords.some((kw) => {
     const inStreet = streetFields.some((c) => c.includes(kw));
     const inName = nameField.includes(kw);
-    return inStreet || inName;
+    const inOsm = osmValue.includes(kw);
+    return inStreet || inName || inOsm;
   });
 }
 
@@ -72,6 +74,9 @@ function norm(s: string): string {
 /** Verifica se um feature é da mesma cidade que o usuário. */
 function isSameCity(props: Record<string, unknown>, userCity: string | null): boolean {
   if (!userCity) return true;
+  // POIs (lojas, restaurantes) têm coordenadas válidas mesmo sem campo city — não filtra
+  const osmKey = typeof props.osm_key === 'string' ? props.osm_key.toLowerCase() : '';
+  if (['shop', 'amenity', 'leisure', 'commercial', 'retail', 'tourism'].includes(osmKey)) return true;
   const alvo = norm(userCity);
   const candidatos = [props.city, props.county, props.locality, props.district]
     .filter((v): v is string => typeof v === 'string')
@@ -79,25 +84,62 @@ function isSameCity(props: Record<string, unknown>, userCity: string | null): bo
   return candidatos.includes(alvo);
 }
 
+/** Detecta se o feature pertence à categoria de POI buscada. */
+function categoryMatch(props: Record<string, unknown>, keywords: string[]): boolean {
+  if (keywords.length === 0) return false;
+  const osmVal = typeof props.osm_value === 'string' ? norm(props.osm_value) : '';
+  const name = typeof props.name === 'string' ? norm(props.name) : '';
+  return keywords.some((kw) => {
+    if (osmVal && osmVal.includes(kw)) return true;
+    if (name && name.includes(kw)) return true;
+    return false;
+  });
+}
+
 /**
  * Ranking de tipo de resultado (menor = melhor).
  * Ruas e casas são mais específicas que bairros ou cidades.
+ * POIs com match forte no nome ficam entre rua e bairro.
  */
-function typeRank(props: Record<string, unknown>): number {
+function typeRank(props: Record<string, unknown>, hasStrongNameMatch = false, isCategoryMatch = false): number {
   const t = String(props.type ?? '').toLowerCase();
   if (t === 'house' || t === 'street') return 0;
+  // POIs (lojas, restaurantes) com match forte ou de categoria → entre rua e bairro
+  if ((hasStrongNameMatch || isCategoryMatch) && isPOI(props)) return 0.5;
   if (t === 'district' || t === 'suburb' || t === 'neighbourhood') return 1;
   if (t === 'city' || t === 'town' || t === 'village') return 2;
   if (t === 'state') return 3;
-  return 4; // POIs e outros
+  return 4; // POIs sem match forte e outros
+}
+
+/** Verifica se um feature é um POI (loja, restaurante, etc.). */
+function isPOI(props: Record<string, unknown>): boolean {
+  const t = String(props.type ?? '').toLowerCase();
+  if (['shop', 'amenity', 'leisure', 'commercial', 'retail', 'tourism'].includes(t)) return true;
+  // Photon retorna osm_key e osm_value como campos separados
+  const osmKey = String(props.osm_key ?? '').toLowerCase();
+  const osmValue = String(props.osm_value ?? '').toLowerCase();
+  if (['shop', 'amenity', 'leisure', 'commercial', 'retail', 'tourism'].includes(osmKey)) return true;
+  // Lojas e restaurante específicos
+  const poiValues = ['pharmacy', 'restaurant', 'cafe', 'bar', 'bakery', 'supermarket',
+    'convenience', 'clothes', 'electronics', 'hairdresser', 'car_repair', 'fuel'];
+  if (poiValues.includes(osmValue)) return true;
+  return false;
 }
 
 /**
  * Calcula score de um feature para ordenação.
  * Menor score = melhor resultado.
  */
-function rankScore(props: Record<string, unknown>, userCity: string | null, userCoords: GeoPoint | null): number {
-  let score = typeRank(props);
+function rankScore(
+  props: Record<string, unknown>,
+  userCity: string | null,
+  userCoords: GeoPoint | null,
+  keywords: string[] = [],
+): number {
+  const strongMatch = keywords.length > 0 && hasStrongMatch(props, keywords);
+  const catMatch = keywords.length > 0 && categoryMatch(props, keywords);
+  let score = typeRank(props, strongMatch, catMatch);
 
   // Bônus: mesma cidade
   if (userCity && isSameCity(props, userCity)) {
@@ -110,7 +152,6 @@ function rankScore(props: Record<string, unknown>, userCity: string | null, user
   if (userCoords) {
     const lat = Number(props.lat ?? (props as Record<string, unknown>).latitude);
     const lon = Number(props.lon ?? (props as Record<string, unknown>).longitude);
-    // Approximate distance in degrees (rough but fast)
     if (Number.isFinite(lat) && Number.isFinite(lon)) {
       const dlat = Math.abs(lat - userCoords.lat);
       const dlon = Math.abs(lon - userCoords.lon);
@@ -146,9 +187,17 @@ export class PhotonGeocodingProvider implements GeocodingProvider {
     const city = this.userCity;
     const keywords = significantWords(query);
 
-    const photon = async (q: string, c: GeoPoint | null): Promise<GeoFeature[]> => {
+    /** Busca Photon com ou sem filtro de POI. */
+    const photon = async (q: string, c: GeoPoint | null, osmTag?: string): Promise<GeoFeature[]> => {
       let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&limit=${fetchLimit}&lang=default`;
       if (c) url += `&bbox=${encodeURIComponent(regionBbox(c))}`;
+      // Photon aceita múltiplos osm_tag como parâmetros separados
+      if (osmTag) {
+        const tags = osmTag.split('|');
+        for (const tag of tags) {
+          url += `&osm_tag=${encodeURIComponent(tag)}`;
+        }
+      }
       const res = await fetch(url);
       if (!res.ok) return [];
       const data: unknown = await res.json();
@@ -213,7 +262,7 @@ export class PhotonGeocodingProvider implements GeocodingProvider {
       return features
         .map((f) => ({
           feature: f,
-          score: rankScore(f.properties ?? {}, city, center ?? null),
+          score: rankScore(f.properties ?? {}, city, center ?? null, keywords),
         }))
         .sort((a, b) => a.score - b.score)
         .map((s) => s.feature)
@@ -221,26 +270,36 @@ export class PhotonGeocodingProvider implements GeocodingProvider {
     };
 
     try {
-      // 1) bbox do GPS (quando existe), nas duas fontes
-      let features = merge(await photon(query, center ?? null), await nominatim(query));
+      // 1) Busca dupla: query normal + query com filtro POI (lojas, restaurantes, etc.)
+      const [normalResults, poiResults] = await Promise.all([
+        photon(query, center ?? null),
+        photon(query, center ?? null, 'shop|amenity|leisure'),
+      ]);
+      let features = merge(normalResults, poiResults);
+
+      // Adiciona resultados do Nominatim
+      const nomResults = await nominatim(query);
+      features = merge(features, nomResults);
 
       // 2) Filtro inteligente: se temos resultados mas NENHUM tem match forte
       //    (keyword só em bairro/cidade, não em rua/nome), busca com rua limpa.
       const hasStrong = features.some((f) => hasStrongMatch(f.properties ?? {}, keywords));
       if (!hasStrong && nomeRua !== query.trim()) {
-        const strippedFeatures = merge(
-          await photon(nomeRua, center ?? null),
-          await nominatim(nomeRua),
-        );
-        features = merge(features, strippedFeatures);
+        const [strippedNormal, strippedPOI] = await Promise.all([
+          photon(nomeRua, center ?? null),
+          photon(nomeRua, center ?? null, 'shop|amenity|leisure'),
+        ]);
+        const strippedFeatures = merge(strippedNormal, strippedPOI);
+        features = merge(features, merge(strippedFeatures, await nominatim(nomeRua)));
         // Se ainda não tem match forte, busca com cidade appended
         if (!features.some((f) => hasStrongMatch(f.properties ?? {}, keywords))) {
           if (city) {
-            const cityFeatures = merge(
-              await photon(`${nomeRua}, ${city}`, center ?? null),
-              await nominatim(`${nomeRua}, ${city}`),
-            );
-            features = merge(features, cityFeatures);
+            const [cityNormal, cityPOI] = await Promise.all([
+              photon(`${nomeRua}, ${city}`, center ?? null),
+              photon(`${nomeRua}, ${city}`, center ?? null, 'shop|amenity|leisure'),
+            ]);
+            const cityFeatures = merge(cityNormal, cityPOI);
+            features = merge(features, merge(cityFeatures, await nominatim(`${nomeRua}, ${city}`)));
           }
         }
       }
@@ -248,14 +307,23 @@ export class PhotonGeocodingProvider implements GeocodingProvider {
       // 3) Se temos cidade conhecida e poucos resultados, busca com cidade appended
       if (city && features.length < 3) {
         const queryComCidade = `${query}, ${city}`;
-        const extraPhoton = await photon(queryComCidade, center ?? null);
+        const [extraNormal, extraPOI] = await Promise.all([
+          photon(queryComCidade, center ?? null),
+          photon(queryComCidade, center ?? null, 'shop|amenity|leisure'),
+        ]);
+        const extraPhoton = merge(extraNormal, extraPOI);
         const extraNominatim = await nominatim(queryComCidade);
         features = merge(features, merge(extraPhoton, extraNominatim));
       }
 
       // 4) sem bbox (GPS negado ou endereço de fora da caixa)
       if (features.length === 0) {
-        features = merge(await photon(query, null), await nominatim(query));
+        const [noBboxNormal, noBboxPOI] = await Promise.all([
+          photon(query, null),
+          photon(query, null, 'shop|amenity|leisure'),
+        ]);
+        features = merge(features, merge(noBboxNormal, noBboxPOI));
+        features = merge(features, await nominatim(query));
       }
 
       // 5) Para buscas de bairro/referência: tenta busca ampla sem bbox
@@ -264,10 +332,12 @@ export class PhotonGeocodingProvider implements GeocodingProvider {
         if (palavras.length > 1) {
           const ultima = palavras[palavras.length - 1];
           if (ultima.length > 2) {
-            features = merge(
-              await photon(ultima, null),
-              await nominatim(ultima),
-            );
+            const [lastNormal, lastPOI] = await Promise.all([
+              photon(ultima, null),
+              photon(ultima, null, 'shop|amenity|leisure'),
+            ]);
+            features = merge(features, merge(lastNormal, lastPOI));
+            features = merge(features, await nominatim(ultima));
           }
         }
       }

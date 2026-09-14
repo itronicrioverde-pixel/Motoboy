@@ -23,28 +23,32 @@ export function installPaymentsBridge(): void {
     async list() {
       try {
         return await paymentsService.list();
-      } catch {
+      } catch (error) {
+        console.error('[Pagamentos] Erro ao listar:', error);
         return [];
       }
     },
     async listByClient(clientId) {
       try {
         return await paymentsService.listByClient(clientId);
-      } catch {
+      } catch (error) {
+        console.error('[Pagamentos] Erro ao listar por cliente:', error);
         return [];
       }
     },
     async save(payment) {
       try {
         await paymentsService.save(payment);
-      } catch {
+      } catch (error) {
+        console.error('[Pagamentos] Erro ao salvar:', error);
         /* offline/erro */
       }
     },
     async remove(id) {
       try {
         await paymentsService.remove(id);
-      } catch {
+      } catch (error) {
+        console.error('[Pagamentos] Erro ao remover:', error);
         /* offline/erro */
       }
     },
@@ -55,7 +59,8 @@ export async function loadPaymentsIntoPanel(): Promise<void> {
   try {
     const items = await paymentsService.list();
     window.__applyRemotePayments?.(items);
-  } catch {
+  } catch (error) {
+    console.error('[Pagamentos] Erro ao carregar:', error);
     /* offline/sem permissão: mantém o cache local */
   }
 }

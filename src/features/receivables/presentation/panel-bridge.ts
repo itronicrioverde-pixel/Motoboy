@@ -25,42 +25,48 @@ export function installReceivablesBridge(): void {
     async list() {
       try {
         return await receivablesService.list();
-      } catch {
+      } catch (error) {
+        console.error('[Contas a Receber] Erro ao listar:', error);
         return [];
       }
     },
     async listByClient(clientId) {
       try {
         return await receivablesService.listByClient(clientId);
-      } catch {
+      } catch (error) {
+        console.error('[Contas a Receber] Erro ao listar por cliente:', error);
         return [];
       }
     },
     async listOpenByClient(clientId) {
       try {
         return await receivablesService.listOpenByClient(clientId);
-      } catch {
+      } catch (error) {
+        console.error('[Contas a Receber] Erro ao listar abertas por cliente:', error);
         return [];
       }
     },
     async save(receivable) {
       try {
         await receivablesService.save(receivable);
-      } catch {
+      } catch (error) {
+        console.error('[Contas a Receber] Erro ao salvar:', error);
         /* offline/erro */
       }
     },
     async saveBatch(receivables) {
       try {
         await receivablesService.saveBatch(receivables);
-      } catch {
+      } catch (error) {
+        console.error('[Contas a Receber] Erro ao salvar em lote:', error);
         /* offline/erro */
       }
     },
     async remove(id) {
       try {
         await receivablesService.remove(id);
-      } catch {
+      } catch (error) {
+        console.error('[Contas a Receber] Erro ao remover:', error);
         /* offline/erro */
       }
     },
@@ -71,7 +77,8 @@ export async function loadReceivablesIntoPanel(): Promise<void> {
   try {
     const items = await receivablesService.list();
     window.__applyRemoteReceivables?.(items);
-  } catch {
+  } catch (error) {
+    console.error('[Contas a Receber] Erro ao carregar:', error);
     /* offline/sem permissão: mantém o cache local */
   }
 }

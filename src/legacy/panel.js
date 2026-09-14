@@ -1,5 +1,8 @@
 import { Chart } from 'chart.js/auto';
 import { showToast } from '../shared/presentation/notifications/index';
+import { db } from '../config/firebase.js';
+import { doc, setDoc } from 'firebase/firestore';
+import { currentUid } from '../features/auth/application/auth-service';
 
 export function bootstrapPanel() {
   // ---------- estado local do aplicativo ----------
@@ -285,6 +288,34 @@ export function bootstrapPanel() {
       : 'O navegador bloqueou o armazenamento local. Os dados durarão somente enquanto esta página estiver aberta.';
   }
 
+  let clientsSaveTimer = null;
+  function saveClientsToFirestore(){
+    if(clientsSaveTimer) clearTimeout(clientsSaveTimer);
+    clientsSaveTimer = setTimeout(function(){
+      const uid = currentUid();
+      if(!uid || !Array.isArray(clientes)) return;
+      setDoc(doc(db, 'users', uid, 'clients', 'data'), { clientes: clientes }, { merge: true }).catch(function(err){
+        console.error('[Clientes] Erro ao salvar no Firestore:', err);
+      });
+    }, 500);
+  }
+
+  let motoSaveTimer = null;
+  function saveMotoToFirestore(){
+    if(motoSaveTimer) clearTimeout(motoSaveTimer);
+    motoSaveTimer = setTimeout(function(){
+      const uid = currentUid();
+      if(!uid) return;
+      setDoc(doc(db, 'users', uid, 'moto', 'data'), {
+        currentKm: motoKm,
+        consumption: CONSUMO_ATUAL,
+        consumptionIsManual: consumoManualDefinido
+      }, { merge: true }).catch(function(err){
+        console.error('[Moto] Erro ao salvar no Firestore:', err);
+      });
+    }, 500);
+  }
+
   function saveLocalState(){
     try{
       localStorage.setItem(LOCAL_STATE_KEY, JSON.stringify({
@@ -302,6 +333,8 @@ export function bootstrapPanel() {
       localStorageAvailable = false;
     }
     updateStorageStatus();
+    saveClientsToFirestore();
+    saveMotoToFirestore();
   }
 
   function renderRefuelList(el, items, withActions){
@@ -855,7 +888,20 @@ export function bootstrapPanel() {
     closeStationList(); // 2C: fecha o combobox de posto ao navegar entre abas
     if(view === 'dashboard'){ renderDashboard(); }
     if(view === 'abastecimentos'){ ensureRefuelDateDefault(); } // 2B: garante data só se totalmente vazia (não é reset)
-    if(view === 'rotas'){ autoLocateOnce(); } // localiza o usuário de forma real ao abrir a aba
+    if(view === 'rotas'){
+      autoLocateOnce(); // localiza o usuário de forma real ao abrir a aba
+      // Inicializa mapa se GPS já disponível (segunda+ visita)
+      if(startCoords && !routeMapInitialized){
+        initRouteMap(startCoords, 15);
+      }
+      if(routeMapInitialized && window.__motoboyMap){
+        window.__motoboyMap.invalidateSize();
+        setTimeout(function(){
+          updateRouteMap();
+          if(window.__motoboyMap) window.__motoboyMap.invalidateSize();
+        }, 50);
+      }
+    }
     if(view === 'faturamento'){ renderFaturamento(); }
     if(view === 'clientes'){ renderClientes(); }
     if(view === 'moto'){ renderMotoConsumo(); }
@@ -927,6 +973,23 @@ export function bootstrapPanel() {
       if(el) el.textContent = fmtKm(motoKm);
     }
   }
+
+  // Callback de sincronização: recebe dados da moto do Firestore.
+  window.__applyRemoteMoto = function(data){
+    if(!data || typeof data !== 'object') return;
+    if(Number(data.currentKm) > motoKm){
+      motoKm = Number(data.currentKm);
+      const el = document.getElementById('motoKmValue');
+      if(el) el.textContent = fmtKm(motoKm);
+    }
+    if(typeof data.consumption === 'number' && data.consumption > 0){
+      CONSUMO_ATUAL = data.consumption;
+    }
+    if(typeof data.consumptionIsManual === 'boolean'){
+      consumoManualDefinido = data.consumptionIsManual;
+    }
+  };
+
   function maintTotal(){ return maintenances.reduce((s, m) => s + m.valor, 0); }
 
   function renderMaint(){
@@ -1818,6 +1881,9 @@ export function bootstrapPanel() {
   /** Locais equivalentes à "cidade" no Photon (varia por município/OSM). */
   function sameCity(props, place){
     if(!place || !place.city) return true; // sem cidade conhecida: não filtra
+    // POIs (lojas, restaurantes) têm coordenadas válidas mesmo sem campo city — não filtra
+    var osmKey = (props.osm_key || '').toLowerCase();
+    if(['shop','amenity','leisure','commercial','retail','tourism'].indexOf(osmKey) >= 0) return true;
     const alvo = place.city.toLowerCase();
     const candidatos = [props.city, props.county, props.locality, props.district]
       .filter(v => typeof v === 'string')
@@ -1904,6 +1970,7 @@ export function bootstrapPanel() {
       // Define startCoords quando precisão for razoável (<=200m) — cobre desktop e celular.
       if(acc <= 200){
         startCoords = coords;
+        onFirstGpsFix(coords);
       }
 
       // Geocoda na 1ª fixa (para regionPlace) e quando precisão melhora
@@ -1912,41 +1979,16 @@ export function bootstrapPanel() {
         if(acc <= 50) lastGeocodeAcc = acc;
         geocoded = true;
         try{
-          // Busca endereço: tenta Photon (OSM) E HERE (dados proprietários) em paralelo.
-          // Usa o resultado que tiver rua (melhor para cidades pequenas do Brasil).
-          const [photonResult, hereResult] = await Promise.all([
-            fetch(`https://photon.komoot.io/reverse/?lon=${coords.lon}&lat=${coords.lat}&lang=default`)
-              .then(r => r.ok ? r.json() : null).catch(() => null),
-            hereReverseGeocode(coords.lat, coords.lon).catch(() => null),
-          ]);
+          const photonRes = await fetch(`https://photon.komoot.io/reverse/?lon=${coords.lon}&lat=${coords.lat}&lang=default`)
+            .then(r => r.ok ? r.json() : null).catch(() => null);
 
-          const photonFeat = photonResult?.features?.[0];
+          const photonFeat = photonRes?.features?.[0];
           const photonProps = photonFeat?.properties || {};
 
-          // Monta props unificadas: prefere HERE se tiver rua, senão usa Photon
-          let bestProps = photonProps;
-          let bestLabel = null;
-          if(hereResult && hereResult.street){
-            // HERE tem rua → usa ele
-            bestProps = {
-              street: hereResult.street,
-              housenumber: hereResult.housenumber,
-              name: hereResult.label,
-              city: hereResult.city,
-              state: hereResult.state,
-            };
-            bestLabel = hereResult.label;
-          } else if(photonProps.street){
-            bestLabel = formatPhotonLabel(photonProps);
-          } else if(hereResult && hereResult.label){
-            bestLabel = hereResult.label;
-          } else if(photonFeat){
-            bestLabel = formatPhotonLabel(photonProps);
-          }
+          const bestLabel = photonFeat ? formatPhotonLabel(photonProps) : null;
 
-          // Atualiza regionPlace (cidade)
-          const cidade = bestProps.city || bestProps.county || bestProps.locality;
-          if(cidade) regionPlace = { city: cidade, state: bestProps.state || null };
+          const cidade = photonProps.city || photonProps.county || photonProps.locality;
+          if(cidade) regionPlace = { city: cidade, state: photonProps.state || null };
 
           if(valueEl && valueEl.isConnected){
             const base = bestLabel || 'Localização encontrada';
@@ -1960,6 +2002,7 @@ export function bootstrapPanel() {
       if(!startCoords && bestCoords){
         startCoords = bestCoords;
         regionCenter = bestCoords;
+        onFirstGpsFix(bestCoords);
         if(valueEl && valueEl.isConnected) valueEl.textContent = 'Localização aproximada (' + Math.round(bestAcc) + 'm)';
       } else if(valueEl && !startCoords){
         valueEl.textContent = 'Toque no ✓ para liberar a localização (ou digite o endereço direto).';
@@ -1971,9 +2014,16 @@ export function bootstrapPanel() {
     return `${center.lon - d},${center.lat - d},${center.lon + d},${center.lat + d}`;
   }
 
-  async function photonFetch(query, fetchLimit, center, signal){
+  async function photonFetch(query, fetchLimit, center, signal, osmTag){
     let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=${fetchLimit}&lang=default`;
     if(center) url += `&bbox=${encodeURIComponent(regionBbox(center))}`;
+    // Photon aceita múltiplos osm_tag como parâmetros separados
+    if(osmTag){
+      const tags = osmTag.split('|');
+      for(var t = 0; t < tags.length; t++){
+        url += `&osm_tag=${encodeURIComponent(tags[t])}`;
+      }
+    }
     const res = await fetch(url, signal ? { signal } : undefined);
     if(!res.ok) throw new Error('photon-fail');
     const data = await res.json();
@@ -2008,74 +2058,6 @@ export function bootstrapPanel() {
         geometry: { coordinates: [parseFloat(item.lon), parseFloat(item.lat)] },
       };
     }).filter(f => f.properties.countrycode === 'BR' && Number.isFinite(f.geometry.coordinates[1]));
-  }
-
-  /**
-   * Terceira fonte: HERE Maps (dados proprietários — tem ruas que o OSM não mapeia).
-   * Requer VITE_HERE_API_KEY no .env. Sem chave, retorna vazio silenciosamente.
-   * Free tier: 250K req/mês.
-   */
-  async function hereFetch(query, fetchLimit, center, signal){
-    const hereKey = window.__HERE_API_KEY || '';
-    if(!hereKey) return [];
-    const params = new URLSearchParams({
-      q: query,
-      limit: String(Math.min(fetchLimit, 20)),
-      apiKey: hereKey,
-      countrycode: 'BRA',
-    });
-    if(center) params.set('at', `${center.lat},${center.lon}`);
-
-    // Autocomplete (rápido, aceita parcial)
-    const acUrl = `https://autocomplete.search.hereapi.com/v1/autocomplete?${params}`;
-    const acRes = await fetch(acUrl, signal ? { signal } : undefined);
-    if(!acRes.ok) return [];
-    const acData = await acRes.json();
-    return (acData.items || []).map(item => {
-      const a = item.address || {};
-      return {
-        properties: {
-          type: a.houseNumber ? 'house' : (a.street ? 'street' : 'other'),
-          name: item.title || a.label || null,
-          street: a.street || null,
-          housenumber: a.houseNumber || null,
-          district: a.district || null,
-          city: a.city || null,
-          county: a.county || null,
-          state: a.state || null,
-          countrycode: 'BR',
-        },
-        geometry: { coordinates: [item.position?.lon ?? 0, item.position?.lat ?? 0] },
-      };
-    }).filter(f => f.geometry.coordinates[0] !== 0 && f.geometry.coordinates[1] !== 0);
-  }
-
-  /**
-   * Reverse geocoding HERE: coordenadas → endereço.
-   */
-  async function hereReverseGeocode(lat, lon){
-    const hereKey = window.__HERE_API_KEY || '';
-    if(!hereKey) return null;
-    try{
-      const params = new URLSearchParams({
-        at: `${lat},${lon}`,
-        apiKey: hereKey,
-        lang: 'pt',
-      });
-      const res = await fetch(`https://geocode.search.hereapi.com/v1/geocode?${params}`);
-      if(!res.ok) return null;
-      const data = await res.json();
-      const first = (data.items || [])[0];
-      if(!first) return null;
-      const a = first.address || {};
-      return {
-        street: a.street || null,
-        housenumber: a.houseNumber || null,
-        city: a.city || a.county || a.district || null,
-        state: a.state || null,
-        label: first.title || a.label || null,
-      };
-    }catch(e){ return null; }
   }
 
   /** Junta fontes sem duplicar (mesmo nome + mesma cidade, ou mesma lat/lon). */
@@ -2125,11 +2107,14 @@ export function bootstrapPanel() {
     const streetFields = [props.street, props.housenumber]
       .filter(v => typeof v === 'string').map(v => v.toLowerCase());
     const nameField = typeof props.name === 'string' ? props.name.toLowerCase() : '';
-    // Match forte = keyword aparece no nome do POI/rua E não é só bairro/cidade
+    // Verifica também o valor OSM (pharmacy, restaurant, bakery, etc.)
+    const osmValue = typeof props.osm_value === 'string' ? props.osm_value.toLowerCase() : '';
+    // Match forte = keyword aparece no nome/rua/valor-osm do feature
     return keywords.some(kw => {
       const inStreet = streetFields.some(c => c.includes(kw));
       const inName = nameField.includes(kw);
-      return inStreet || inName;
+      const inOsm = osmValue.includes(kw);
+      return inStreet || inName || inOsm;
     });
   }
 
@@ -2144,17 +2129,19 @@ export function bootstrapPanel() {
     const fetchLimit = Math.min(limit + 12, 20); // pede a mais p/ compensar os filtros
     const nomeRua = streetWords(query);
     const keywords = significantWords(query);
+
+    // Busca com query dupla: normal + filtro POI (lojas, restaurantes, etc.)
     const tentar = async (q, c) => {
       if(!q.trim()) return [];
-      const [fot, nom, here] = await Promise.all([
+      const [fotNormal, fotPOI, nom] = await Promise.all([
         photonFetch(q, fetchLimit, c, signal).catch(err => (err && err.name === 'AbortError') ? Promise.reject(err) : []),
+        photonFetch(q, fetchLimit, c, signal, 'shop|amenity|leisure').catch(() => []),
         nominatimFetch(q, fetchLimit, signal).catch(() => []),
-        hereFetch(q, fetchLimit, c, signal).catch(() => []),
       ]);
-      return mergeSources(fot, nom, here);
+      return mergeSources(fotNormal, fotPOI, nom);
     };
 
-    // 1) caixa do GPS + busca completa (com numeração)
+    // 1) caixa do GPS + busca completa (com numeração + POI)
     let lista = await tentar(query, center);
 
     // 2) Filtro inteligente: se temos resultados mas NENHUM tem match forte
@@ -2190,14 +2177,41 @@ export function bootstrapPanel() {
       lista = await tentar(query, null);
     }
 
-    // Ruas, números e bairros primeiro; cidade e POIs genéricos depois;
-    // mesma cidade antes de fora; mais perto do GPS antes do mais longe.
+    // Ruas, números e bairros primeiro; POIs com match forte no nome ficam entre rua e bairro;
+    // cidade e POIs genéricos depois; mesma cidade antes de fora; mais perto do GPS antes do mais longe.
+    function isPOILike(props){
+      var t = (props.type || '').toLowerCase();
+      if(['shop','amenity','leisure','commercial','retail','tourism'].indexOf(t) >= 0) return true;
+      // Photon retorna osm_key e osm_value como campos separados
+      var osmKey = (props.osm_key || '').toLowerCase();
+      var osmValue = (props.osm_value || '').toLowerCase();
+      if(['shop','amenity','leisure','commercial','retail','tourism'].indexOf(osmKey) >= 0) return true;
+      // Lojas e restaurante específicos
+      var poiValues = ['pharmacy','restaurant','cafe','bar','bakery','supermarket',
+        'convenience','clothes','electronics','hairdresser','car_repair','fuel'];
+      if(poiValues.indexOf(osmValue) >= 0) return true;
+      return false;
+    }
+    // Detecta se a query é uma categoria de POI (restaurante, farmácia, padaria, etc.)
+    // e se o feature pertence a essa categoria via osm_value ou nome
+    function categoryMatch(props, kws){
+      if(!kws || kws.length === 0) return false;
+      var osmVal = (props.osm_value || '').toLowerCase();
+      var name = (props.name || '').toLowerCase();
+      return kws.some(function(kw){
+        if(osmVal && osmVal.indexOf(kw) >= 0) return true;
+        if(name && name.indexOf(kw) >= 0) return true;
+        return false;
+      });
+    }
     function rankOf(p){
       if(p.type === 'street' || p.type === 'house') return 0;
+      // POIs com match na categoria da busca → entre rua e bairro
+      if(isPOILike(p) && (hasStrongMatch(p, keywords) || categoryMatch(p, keywords))) return 0.5;
       if(p.type === 'district' || p.type === 'suburb' || p.type === 'quarter'
         || p.type === 'neighbourhood' || p.type === 'locality') return 1;
       if(p.type === 'city' || p.type === 'town' || p.type === 'village' || p.type === 'hamlet') return 2;
-      return 3; // POIs, amenities etc.
+      return 3; // POIs genéricos e outros
     }
     lista = lista
       .map((f, i) => ({ f, i, d: distToCenter(f, center) }))
@@ -2229,29 +2243,19 @@ export function bootstrapPanel() {
   }
 
   async function routeBetween(origem, destino){
-    // 1) Google Routes API (quando a chave estiver configurada no .env)
+    // 1) Cadeia inteligente: OSRM local (offline) → OSRM público → GraphHopper
     try{
-      if(window.__motoboyRoute){
-        const g = await window.__motoboyRoute(origem, destino);
-        if(g && typeof g.km === 'number'){
-          return { km: g.km, min: g.min, approx: !!g.approx };
+      if(window.__motoboyRouteWithFallback){
+        const r = await window.__motoboyRouteWithFallback(origem, destino);
+        if(r && typeof r.km === 'number'){
+          return { km: r.km, min: r.min, approx: !!r.approx };
         }
       }
-    }catch(e){ /* segue para o OSRM */ }
-    // 2) OSRM (primário, gratuito)
-    try{
-      const url = `https://router.project-osrm.org/route/v1/driving/${origem.lon},${origem.lat};${destino.lon},${destino.lat}?overview=false`;
-      const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      if(!res.ok) throw new Error('osrm-fail');
-      const data = await res.json();
-      if(!data.routes || data.routes.length === 0) throw new Error('osrm-empty');
-      return { km: data.routes[0].distance / 1000, min: Math.round(data.routes[0].duration / 60), approx: false };
-    }catch(e){
-      // 3) plano B: linha reta com fator de correção viário + velocidade média urbana
-      const km = haversineKm(origem, destino) * 1.3;
-      const min = Math.round((km / 28) * 60);
-      return { km, min, approx: true };
-    }
+    }catch(e){ /* segue para fallback */ }
+    // 2) Plano B: linha reta com fator de correção viário + velocidade média urbana
+    const km = haversineKm(origem, destino) * 1.3;
+    const min = Math.round((km / 28) * 60);
+    return { km, min, approx: true };
   }
 
   // Calcula a rota como uma cadeia sequencial de verdade: ponto de partida (se o motoboy
@@ -2631,7 +2635,7 @@ export function bootstrapPanel() {
         setText: (v) => { s.coleta = v; },
         clearCoords: () => { s.coletaCoords = null; s.entregas.forEach(e => e.status = 'idle'); },
         setStatus: () => {},
-        setCoords: (lat, lon) => { s.coletaCoords = { lat, lon }; },
+        setCoords: (lat, lon) => { s.coletaCoords = { lat, lon }; updateRouteMap(); },
         refresh: () => { s.entregas.forEach((e, j) => updateRouteCalc(idx, j)); },
         tryCalc: () => { s.entregas.forEach((e, j) => { if(s.coleta && e.entrega){ calcularEntrega(idx, j); } }); }
       });
@@ -2656,7 +2660,7 @@ export function bootstrapPanel() {
           setText: (v) => { e.entrega = v; },
           clearCoords: () => { e.entregaCoords = null; e.status = 'idle'; },
           setStatus: () => {},
-          setCoords: (lat, lon) => { e.entregaCoords = { lat, lon }; },
+          setCoords: (lat, lon) => { e.entregaCoords = { lat, lon }; updateRouteMap(); },
           refresh: () => { updateRouteCalc(idx, j); },
           tryCalc: () => { if(s.coleta && e.entrega){ calcularEntrega(idx, j); } }
         });
@@ -2703,6 +2707,7 @@ export function bootstrapPanel() {
 
       if(acc <= 200){
         startCoords = coords;
+        onFirstGpsFix(coords);
       }
 
       const shouldGeocode = first || (acc <= 50 && lastGeocodeAcc > 50) || (!geocoded && acc <= 200);
@@ -2710,36 +2715,16 @@ export function bootstrapPanel() {
         if(acc <= 50) lastGeocodeAcc = acc;
         geocoded = true;
         try{
-          const [photonResult, hereResult] = await Promise.all([
-            fetch(`https://photon.komoot.io/reverse/?lon=${coords.lon}&lat=${coords.lat}&lang=default`)
-              .then(r => r.ok ? r.json() : null).catch(() => null),
-            hereReverseGeocode(coords.lat, coords.lon).catch(() => null),
-          ]);
+          const photonRes = await fetch(`https://photon.komoot.io/reverse/?lon=${coords.lon}&lat=${coords.lat}&lang=default`)
+            .then(r => r.ok ? r.json() : null).catch(() => null);
 
-          const photonFeat = photonResult?.features?.[0];
+          const photonFeat = photonRes?.features?.[0];
           const photonProps = photonFeat?.properties || {};
 
-          let bestProps = photonProps;
-          let bestLabel = null;
-          if(hereResult && hereResult.street){
-            bestProps = {
-              street: hereResult.street,
-              housenumber: hereResult.housenumber,
-              name: hereResult.label,
-              city: hereResult.city,
-              state: hereResult.state,
-            };
-            bestLabel = hereResult.label;
-          } else if(photonProps.street){
-            bestLabel = formatPhotonLabel(photonProps);
-          } else if(hereResult && hereResult.label){
-            bestLabel = hereResult.label;
-          } else if(photonFeat){
-            bestLabel = formatPhotonLabel(photonProps);
-          }
+          const bestLabel = photonFeat ? formatPhotonLabel(photonProps) : null;
 
-          const cidade = bestProps.city || bestProps.county || bestProps.locality;
-          if(cidade) regionPlace = { city: cidade, state: bestProps.state || null };
+          const cidade = photonProps.city || photonProps.county || photonProps.locality;
+          if(cidade) regionPlace = { city: cidade, state: photonProps.state || null };
 
           if(valueEl && valueEl.isConnected){
             const base = bestLabel || 'Localização encontrada';
@@ -2754,6 +2739,7 @@ export function bootstrapPanel() {
       if(!startCoords && bestCoords){
         startCoords = bestCoords;
         regionCenter = bestCoords;
+        onFirstGpsFix(bestCoords);
         if(valueEl && valueEl.isConnected) valueEl.textContent = 'Localização aproximada (' + Math.round(bestAcc) + 'm)';
       } else if(err && err.code === 1){
         valueEl.textContent = 'Permissão de localização negada — libere nas configurações do navegador e toque de novo.';
@@ -3174,6 +3160,103 @@ export function bootstrapPanel() {
 
   document.getElementById('btnViewPendingClients').addEventListener('click', () => setView('clientes'));
 
+  // ============ MAPA NA CRIAÇÃO DE ROTA ============
+  let routeMapInitialized = false;
+
+  function initRouteMap(center, zoom){
+    if(routeMapInitialized) return;
+    if(!window.__motoboyMap) return;
+    const canvas = document.getElementById('routeMapCanvas');
+    if(!canvas) return;
+
+    const c = center || startCoords || { lat: -17.74, lon: -50.92 };
+    const z = zoom || (startCoords ? 15 : 12);
+    window.__motoboyMap.create({ container: canvas, center: c, zoom: z });
+    routeMapInitialized = true;
+  }
+
+  // Chamado quando o GPS resolve pela primeira vez — cria ou centraliza o mapa
+  function onFirstGpsFix(coords){
+    if(!window.__motoboyMap) return;
+    if(!routeMapInitialized){
+      // Primeira vez: cria mapa centrado no GPS com zoom alto
+      initRouteMap(coords, 15);
+    } else {
+      // Mapa já existe: centraliza no GPS
+      window.__motoboyMap.setCenter(coords, 15);
+    }
+    updateRouteMap();
+  }
+
+  function updateRouteMap(){
+    if(!routeMapInitialized || !window.__motoboyMap) return;
+
+    window.__motoboyMap.clearMarkers();
+    window.__motoboyMap.clearRoutes();
+
+    const pontos = [];
+    let markerNum = 1;
+
+    // Ponto de partida
+    if(startCoords){
+      pontos.push(startCoords);
+      window.__motoboyMap.addNumberedMarker(startCoords, markerNum++, 'Ponto de Partida');
+    }
+
+    // Coletas e entregas
+    routeServices.forEach(function(s){
+      if(s.coletaCoords){
+        pontos.push(s.coletaCoords);
+        window.__motoboyMap.addNumberedMarker(s.coletaCoords, markerNum++, 'Coleta');
+      }
+      s.entregas.forEach(function(e){
+        if(e.entregaCoords){
+          pontos.push(e.entregaCoords);
+          window.__motoboyMap.addNumberedMarker(e.entregaCoords, markerNum++, 'Entrega');
+        }
+      });
+    });
+
+    if(pontos.length === 0) return;
+
+    // Se temos 2+ pontos, tenta rota com geometria real (OSRM polyline)
+    if(pontos.length >= 2 && window.__motoboyRouteChainWithGeometry){
+      window.__motoboyRouteChainWithGeometry(pontos).then(function(result){
+        if(!result) return;
+        result.segments.forEach(function(seg){
+          if(seg.geometry && seg.geometry.length >= 2){
+            window.__motoboyMap.drawPolyline(seg.geometry);
+          } else {
+            const idx = result.segments.indexOf(seg);
+            if(idx < pontos.length - 1){
+              window.__motoboyMap.drawRoute({
+                origin: pontos[idx],
+                destination: pontos[idx + 1]
+              });
+            }
+          }
+        });
+        window.__motoboyMap.fitAll();
+      });
+    } else if(pontos.length >= 2){
+      for(var i = 0; i < pontos.length - 1; i++){
+        window.__motoboyMap.drawRoute({
+          origin: pontos[i],
+          destination: pontos[i + 1]
+        });
+      }
+      window.__motoboyMap.fitAll();
+    } else {
+      // Só tem GPS — centraliza com zoom alto (mostra rua)
+      window.__motoboyMap.setCenter(pontos[0], 15);
+      // Força recálculo de tiles após centralizar (garante renderização)
+      setTimeout(function(){
+        if(window.__motoboyMap) window.__motoboyMap.invalidateSize();
+      }, 100);
+    }
+  }
+
+  // Atualiza mapa quando serviços são renderizados
   renderServices();
   renderRouteSummary();
   initRouteHistoryFilters();
@@ -3208,6 +3291,20 @@ export function bootstrapPanel() {
     cliente.recebimentos = cliente.recebimentos || [];
     cliente.pendente = cliente.contas.reduce((total, conta) => total + Math.max(0, conta.saldo || 0), 0);
   }
+
+  // Callback de sincronização: recebe clientes do Firestore e mescla com os locais.
+  window.__applyRemoteClientes = function(remoteClientes){
+    if(!Array.isArray(remoteClientes)) return;
+    var remoteByName = {};
+    remoteClientes.forEach(function(c){ remoteByName[c.nome.toLowerCase()] = c; });
+    var localOnly = clientes.filter(function(c){ return !remoteByName[c.nome.toLowerCase()]; });
+    clientes = remoteClientes.concat(localOnly);
+    clientes.forEach(syncClientBalance);
+    saveLocalState();
+    renderClientes();
+    renderFaturamento();
+    renderDashboard();
+  };
 
   function addPendingToClient(nome, valor, desc, routeId){
     let c = clientes.find(c => c.nome.toLowerCase() === nome.toLowerCase());
@@ -3676,34 +3773,73 @@ export function bootstrapPanel() {
     overlay.hidden = false;
     setView('rotas'); // mantém na view de rotas
 
-    // Inicializa mapa Leaflet no overlay
-    const mapContainer = document.getElementById('armoMapContainer');
-    if(mapContainer && window.__motoboyMap){
+    // Inicializa mapa Leaflet no overlay — defer para garantir layout computado
+    function initActiveRouteMap(){
+      const mapContainer = document.getElementById('armoMapContainer');
+      if(!mapContainer || !window.__motoboyMap) return;
       mapContainer.innerHTML = '';
       const mapDiv = document.createElement('div');
       mapDiv.style.cssText = 'width:100%;height:100%;';
       mapContainer.appendChild(mapDiv);
       window.__motoboyMap.create({ container:mapDiv, center:startCoords || waypoints[0].coordinates, zoom:14 });
 
-      // Desenha marcadores
-      waypoints.forEach(function(wp, i){
+      // Desenha marcadores com números
+      var mkNum = 1;
+      waypoints.forEach(function(wp){
         if(wp.status !== 'completed'){
-          window.__motoboyMap.addMarker(wp.coordinates, wp.label + ' - ' + wp.address);
+          window.__motoboyMap.addNumberedMarker(wp.coordinates, mkNum++, wp.label + ' - ' + wp.address);
         }
       });
 
-      // Desenha rota
+      // Desenha rota com geometria real (OSRM polyline) quando disponível
       if(waypoints.length >= 2){
-        for(var i=0; i<waypoints.length-1; i++){
-          window.__motoboyMap.drawRoute({
-            origin:waypoints[i].coordinates,
-            destination:waypoints[i+1].coordinates,
-            originLabel:waypoints[i].label,
-            destinationLabel:waypoints[i+1].label
+        var wpCoords = waypoints.map(function(wp){ return wp.coordinates; });
+        if(window.__motoboyRouteChainWithGeometry){
+          window.__motoboyRouteChainWithGeometry(wpCoords).then(function(result){
+            if(!result) {
+              // Fallback: linhas retas
+              for(var i=0; i<waypoints.length-1; i++){
+                window.__motoboyMap.drawRoute({
+                  origin:waypoints[i].coordinates,
+                  destination:waypoints[i+1].coordinates,
+                  originLabel:waypoints[i].label,
+                  destinationLabel:waypoints[i+1].label
+                });
+              }
+              return;
+            }
+            result.segments.forEach(function(seg){
+              if(seg.geometry && seg.geometry.length >= 2){
+                window.__motoboyMap.drawPolyline(seg.geometry);
+              } else {
+                var idx = result.segments.indexOf(seg);
+                if(idx < waypoints.length - 1){
+                  window.__motoboyMap.drawRoute({
+                    origin:waypoints[idx].coordinates,
+                    destination:waypoints[idx+1].coordinates
+                  });
+                }
+              }
+            });
+            window.__motoboyMap.fitAll();
           });
+        } else {
+          for(var i=0; i<waypoints.length-1; i++){
+            window.__motoboyMap.drawRoute({
+              origin:waypoints[i].coordinates,
+              destination:waypoints[i+1].coordinates,
+              originLabel:waypoints[i].label,
+              destinationLabel:waypoints[i+1].label
+            });
+          }
         }
       }
     }
+
+    // Garante que o browser computou o layout flex do overlay antes de criar o mapa
+    requestAnimationFrame(function(){
+      setTimeout(initActiveRouteMap, 60);
+    });
 
     // Painel de rota ativa
     var panelContainer = document.getElementById('activeRoutePanelContainer');
@@ -3751,6 +3887,7 @@ export function bootstrapPanel() {
         onStop: function(){
           window.__motoboyActiveRoute.stop();
           if(window.__motoboySharing) window.__motoboySharing.stop();
+          if(window.__motoboyMap) window.__motoboyMap.removePositionMarker();
           overlay.hidden = true;
           showToast('Rota finalizada.', {kind:'info'});
         }
@@ -3780,8 +3917,20 @@ export function bootstrapPanel() {
           if(progEl) progEl.textContent = progress.percentComplete + '%';
         }
 
+        // Atualiza marcador de posição GPS no mapa em tempo real
+        if(window.__motoboyMap && route && route.status === 'navigating'){
+          try {
+            var trackingState = window.__motoboyActiveRoute.getTrackingState();
+            if(trackingState && trackingState.position){
+              window.__motoboyMap.addPositionMarker(trackingState.position, trackingState.accuracy);
+              window.__motoboyMap.centerOnPosition(trackingState.position);
+            }
+          } catch(e){ /* ignora se tracking não disponível */ }
+        }
+
         // Rota concluída
         if(route && route.status === 'completed'){
+          if(window.__motoboyMap) window.__motoboyMap.removePositionMarker();
           overlay.hidden = true;
           showToast('Todas as entregas foram concluídas!', {kind:'success'});
         }
