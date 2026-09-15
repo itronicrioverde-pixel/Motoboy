@@ -7,12 +7,8 @@
 
 import { abastecimentosService } from '../index';
 import type { Abastecimento, EditAbastecimento, NewAbastecimento } from '../index';
-
-/** Resultado explícito do carregamento remoto. */
-export interface LoadResult<T> {
-  ok: boolean;
-  data: T;
-}
+import type { LoadResult } from '../../../shared/application/load-result';
+import { loadOk, loadFail } from '../../../shared/application/load-result';
 
 /** Formato do registro como o monólito o mantém em `refuels`. */
 interface RefuelVM {
@@ -87,11 +83,15 @@ export function installAbastecimentosBridge(): void {
 
 /**
  * Carrega os abastecimentos do dono no Firestore e injeta no painel.
- * Retorna sucesso, vazio ou falha explicitamente.
- * Erro capturado NÃO é considerado carregamento concluído.
+ * Nunca lança: retorna ok:false em caso de falha.
  */
 export async function loadAbastecimentosIntoPanel(): Promise<LoadResult<Abastecimento[]>> {
-  const items = await abastecimentosService.list();
-  window.__applyRemoteAbastecimentos?.(items);
-  return { ok: true, data: items };
+  try {
+    const items = await abastecimentosService.list();
+    window.__applyRemoteAbastecimentos?.(items);
+    return loadOk(items);
+  } catch (error) {
+    console.error('[Abastecimentos] Erro ao carregar:', error);
+    return loadFail(error);
+  }
 }

@@ -6,7 +6,8 @@
 
 import { manutencoesService } from '../index';
 import type { EditManutencao, Manutencao, NewManutencao } from '../index';
-import type { LoadResult } from '../../abastecimentos/presentation/panel-bridge';
+import type { LoadResult } from '../../../shared/application/load-result';
+import { loadOk, loadFail } from '../../../shared/application/load-result';
 
 /** Formato do registro como o monólito mantém em `maintenances`. */
 interface MaintenanceVM {
@@ -78,11 +79,15 @@ export function installManutencoesBridge(): void {
 
 /**
  * Carrega as manutenções do dono no Firestore e injeta no painel.
- * Retorna sucesso, vazio ou falha explicitamente.
- * Erro capturado NÃO é considerado carregamento concluído.
+ * Nunca lança: retorna ok:false em caso de falha.
  */
 export async function loadManutencoesIntoPanel(): Promise<LoadResult<Manutencao[]>> {
-  const items = await manutencoesService.list();
-  window.__applyRemoteManutencoes?.(items);
-  return { ok: true, data: items };
+  try {
+    const items = await manutencoesService.list();
+    window.__applyRemoteManutencoes?.(items);
+    return loadOk(items);
+  } catch (error) {
+    console.error('[Manutenções] Erro ao carregar:', error);
+    return loadFail(error);
+  }
 }

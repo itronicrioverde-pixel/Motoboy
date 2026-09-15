@@ -6,7 +6,8 @@
 
 import { entradasService } from '../index';
 import type { EditEntrada, Entrada, NewEntrada } from '../index';
-import type { LoadResult } from '../../abastecimentos/presentation/panel-bridge';
+import type { LoadResult } from '../../../shared/application/load-result';
+import { loadOk, loadFail } from '../../../shared/application/load-result';
 
 interface EntradaVM {
   fsId?: string | null;
@@ -69,11 +70,15 @@ export function installFaturamentoBridge(): void {
 
 /**
  * Carrega as entradas do dono no Firestore e injeta no painel.
- * Retorna sucesso, vazio ou falha explicitamente.
- * Erro capturado NÃO é considerado carregamento concluído.
+ * Nunca lança: retorna ok:false em caso de falha.
  */
 export async function loadFaturamentoIntoPanel(): Promise<LoadResult<Entrada[]>> {
-  const items = await entradasService.list();
-  window.__applyRemoteEntradas?.(items);
-  return { ok: true, data: items };
+  try {
+    const items = await entradasService.list();
+    window.__applyRemoteEntradas?.(items);
+    return loadOk(items);
+  } catch (error) {
+    console.error('[Faturamento] Erro ao carregar:', error);
+    return loadFail(error);
+  }
 }

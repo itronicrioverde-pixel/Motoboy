@@ -6,7 +6,8 @@
 
 import { rotasService } from '../index';
 import type { Rota } from '../index';
-import type { LoadResult } from '../../abastecimentos/presentation/panel-bridge';
+import type { LoadResult } from '../../../shared/application/load-result';
+import { loadOk, loadFail } from '../../../shared/application/load-result';
 
 declare global {
   interface Window {
@@ -41,11 +42,15 @@ export function installRotasBridge(): void {
 
 /**
  * Carrega as rotas do dono no Firestore e injeta no painel.
- * Retorna sucesso, vazio ou falha explicitamente.
- * Erro capturado NÃO é considerado carregamento concluído.
+ * Nunca lança: retorna ok:false em caso de falha.
  */
 export async function loadRotasIntoPanel(): Promise<LoadResult<Rota[]>> {
-  const items = await rotasService.list();
-  window.__applyRemoteRotas?.(items);
-  return { ok: true, data: items };
+  try {
+    const items = await rotasService.list();
+    window.__applyRemoteRotas?.(items);
+    return loadOk(items);
+  } catch (error) {
+    console.error('[Rotas] Erro ao carregar:', error);
+    return loadFail(error);
+  }
 }

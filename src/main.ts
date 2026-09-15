@@ -31,6 +31,8 @@ import {
   installMotoBridge,
   loadMotoIntoPanel,
 } from './features/moto/presentation/panel-bridge';
+import { isLoadSuccess } from './shared/application/load-result';
+import type { LoadResult } from './shared/application/load-result';
 import { bootstrapPanel } from './legacy/panel.js';
 import type { AuthUser } from './features/auth/domain/auth-user';
 
@@ -135,8 +137,8 @@ function enterAuthenticatedApp(user: AuthUser): void {
   panelStarted = true;
 
   // Hidratação orquestrada: aguarda todas as cargas antes de habilitar persistência.
-  // Cada loader retorna sucesso, vazio ou falha explicitamente.
-  // Não considera erro capturado como carregamento concluído.
+  // Cada loader retorna LoadResult — sucesso vazio é ok:true, falha é ok:false.
+  // Promise.allSettled é proteção adicional contra rejeição não tratada.
   Promise.allSettled([
     loadAbastecimentosIntoPanel(),
     loadManutencoesIntoPanel(),
@@ -144,15 +146,23 @@ function enterAuthenticatedApp(user: AuthUser): void {
     loadRotasIntoPanel(),
     loadCustomersIntoPanel(),
     loadMotoIntoPanel(),
-  ]).then((results) => {
-    const failed = results.filter((r) => r.status === 'rejected');
-    if (failed.length > 0) {
-      console.warn(`[Boot] ${failed.length} carga(s) falharam; dados locais preservados.`);
+  ]).then((settlements) => {
+    // Verifica falhas em dois níveis: promise rejeitada OU ok:false.
+    // Loaders nunca lançam (retornam loadFail), mas allSettled é proteção adicional.
+    let failedCount = 0;
+    for (const s of settlements) {
+      if (s.status === 'rejected') {
+        failedCount++;
+      } else if (!s.value.ok) {
+        failedCount++;
+      }
+    }
+
+    if (failedCount > 0) {
+      console.warn(`[Boot] ${failedCount} carga(s) falharam; dados locais preservados.`);
     }
 
     // Hidrata clientes e moto individualmente.
-    // O painel legado mantém dados financeiros locais que o novo domínio não carrega;
-    // a hidratação preserva esses dados ao mesclar com o remoto.
     void loadAndHydrateCustomers();
     void loadAndHydrateMoto();
 
@@ -168,24 +178,18 @@ function enterAuthenticatedApp(user: AuthUser): void {
 
 /** Carrega clientes do Firestore e hidrata o painel preservando dados financeiros locais. */
 async function loadAndHydrateCustomers(): Promise<void> {
-  try {
-    const result = await loadCustomersIntoPanel();
-    window.__hydrateClientes?.(result.data);
-  } catch {
-    // Falha na carga: hidrata com vazio para desbloquear a fila.
-    window.__hydrateClientes?.([]);
-  }
+  const result: LoadResult<Array<{ nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>> =
+    await loadCustomersIntoPanel();
+  if (!isLoadSuccess(result)) return;
+  window.__hydrateClientes?.(result.data);
 }
 
 /** Carrega dados da moto do Firestore e hidrata o painel. */
 async function loadAndHydrateMoto(): Promise<void> {
-  try {
-    const result = await loadMotoIntoPanel();
-    window.__hydrateMoto?.(result.data);
-  } catch {
-    // Falha na carga: hidrata com vazio para desbloquear a fila.
-    window.__hydrateMoto?.({ currentKm: 0, consumption: 0, consumptionIsManual: false });
-  }
+  const result: LoadResult<{ currentKm: number; consumption: number; consumptionIsManual: boolean }> =
+    await loadMotoIntoPanel();
+  if (!isLoadSuccess(result)) return;
+  window.__hydrateMoto?.(result.data);
 }
 
 // RF-05 / RF-10 / RD-05.

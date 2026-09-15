@@ -12,7 +12,8 @@
 
 import { customersService } from '../index';
 import type { Customer } from '../index';
-import type { LoadResult } from '../../abastecimentos/presentation/panel-bridge';
+import type { LoadResult } from '../../../shared/application/load-result';
+import { loadOk, loadFail } from '../../../shared/application/load-result';
 
 /** Formato legado esperado pelo painel (panel.js). */
 interface LegacyCliente {
@@ -93,12 +94,16 @@ export function installCustomersBridge(): void {
 
 /**
  * Carrega os clientes do Firestore e retorna no formato legado.
- * Retorna sucesso com dados, vazio ou falha explicitamente.
- * Erro capturado NÃO é considerado carregamento concluído.
+ * Nunca lança: retorna ok:false em caso de falha.
  * A hidratação do painel é feita por main.ts via __hydrateClientes.
  */
 export async function loadCustomersIntoPanel(): Promise<LoadResult<LegacyCliente[]>> {
-  const items = await customersService.list();
-  const legacy = items.map(customerToLegacy);
-  return { ok: true, data: legacy };
+  try {
+    const items = await customersService.list();
+    const legacy = items.map(customerToLegacy);
+    return loadOk(legacy);
+  } catch (error) {
+    console.error('[Clientes] Erro ao carregar:', error);
+    return loadFail(error);
+  }
 }

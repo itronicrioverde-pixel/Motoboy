@@ -8,7 +8,8 @@
 
 import { motoService } from '../index';
 import type { MotoData } from '../index';
-import type { LoadResult } from '../../abastecimentos/presentation/panel-bridge';
+import type { LoadResult } from '../../../shared/application/load-result';
+import { loadOk, loadFail } from '../../../shared/application/load-result';
 
 declare global {
   interface Window {
@@ -42,11 +43,15 @@ export function installMotoBridge(): void {
 
 /**
  * Carrega os dados da moto do Firestore e retorna.
- * Retorna sucesso com dados, vazio ou falha explicitamente.
- * Erro capturado NÃO é considerado carregamento concluído.
+ * Nunca lança: retorna ok:false em caso de falha.
  * A hidratação do painel é feita por main.ts via __hydrateMoto.
  */
 export async function loadMotoIntoPanel(): Promise<LoadResult<MotoData>> {
-  const data = await motoService.get();
-  return { ok: true, data };
+  try {
+    const data = await motoService.get();
+    return loadOk(data);
+  } catch (error) {
+    console.error('[Moto] Erro ao carregar:', error);
+    return loadFail(error);
+  }
 }
