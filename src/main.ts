@@ -31,10 +31,9 @@ import {
   installMotoBridge,
   loadMotoIntoPanel,
 } from './features/moto/presentation/panel-bridge';
-import { isLoadSuccess } from './shared/application/load-result';
-import type { LoadResult } from './shared/application/load-result';
 import { bootstrapPanel } from './legacy/panel.js';
 import type { AuthUser } from './features/auth/domain/auth-user';
+import { createHydrationManager } from './shared/application/hydration';
 
 // Chaves de estado local do painel (hoje ele guarda os dados em localStorage).
 const PANEL_STATE_KEYS = ['motoboy-front-etapa1-v2-clean'];
@@ -106,6 +105,9 @@ installMotoBridge();
 // já tem sessão válida não vê o login piscar. Até lá, o #appBoot cobre a tela.
 let panelStarted = false;
 
+// ---------- Hidratação por feature ----------
+const hydration = createHydrationManager();
+
 // Ponte para o painel legado: hidratação individual e controle de estado.
 declare global {
   interface Window {
@@ -113,7 +115,43 @@ declare global {
     __hydrateClientes?: (entities: Array<{ nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>) => void;
     __flushHydrationQueue?: () => void;
     __isHydrated?: () => boolean;
+    /** Retenta o carregamento de uma feature que falhou. */
+    __retryLoadFeature?: (feature: 'clientes' | 'moto') => void;
   }
+}
+
+// Tipo legado de clientes que o painel espera.
+type LegacyCliente = { nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] };
+
+// Tipo de dados da moto que o painel espera.
+type MotoData = { currentKm: number; consumption: number; consumptionIsManual: boolean };
+
+// Mapa de loaders: cada feature tem seu loader e sua função de hidratação.
+// Sem índices mágicos — cada resultado é acessado por nome claro.
+const featureLoaders = {
+  clientes: {
+    load: () => loadCustomersIntoPanel(),
+    hydrate: (data: unknown) => {
+      window.__hydrateClientes?.(data as LegacyCliente[]);
+    },
+  },
+  moto: {
+    load: () => loadMotoIntoPanel(),
+    hydrate: (data: unknown) => {
+      window.__hydrateMoto?.(data as MotoData);
+    },
+  },
+} as const;
+
+/**
+ * Retenta o carregamento de uma feature que falhou.
+ * Delega ao hydration manager — bloqueia retries concorrentes.
+ * Processa fila de mutações após hidratação (bem-sucedida ou não).
+ */
+function retryFeatureLoad(feature: 'clientes' | 'moto'): void {
+  void hydration.retryFeatureLoad(feature, featureLoaders[feature]).then(() => {
+    window.__flushHydrationQueue?.();
+  });
 }
 
 /**
@@ -136,39 +174,19 @@ function enterAuthenticatedApp(user: AuthUser): void {
   bootstrapPanel();
   panelStarted = true;
 
-  // Hidratação orquestrada: aguarda todas as cargas antes de habilitar persistência.
-  // Cada loader retorna LoadResult — sucesso vazio é ok:true, falha é ok:false.
-  // Promise.allSettled é proteção adicional contra rejeição não tratada.
-  Promise.allSettled([
-    loadAbastecimentosIntoPanel(),
-    loadManutencoesIntoPanel(),
-    loadFaturamentoIntoPanel(),
-    loadRotasIntoPanel(),
-    loadCustomersIntoPanel(),
-    loadMotoIntoPanel(),
-  ]).then((settlements) => {
-    // Verifica falhas em dois níveis: promise rejeitada OU ok:false.
-    // Loaders nunca lançam (retornam loadFail), mas allSettled é proteção adicional.
-    let failedCount = 0;
-    for (const s of settlements) {
-      if (s.status === 'rejected') {
-        failedCount++;
-      } else if (!s.value.ok) {
-        failedCount++;
-      }
-    }
+  // Carregamento: cada loader é executado exatamente uma vez.
+  // Loaders de abastecimentos, manutenções, faturamento e rotas aplicam dados
+  // diretamente via __applyRemote* internamente — seus resultados não são
+  // usados para hidratação separada.
+  void loadAbastecimentosIntoPanel();
+  void loadManutencoesIntoPanel();
+  void loadFaturamentoIntoPanel();
+  void loadRotasIntoPanel();
 
-    if (failedCount > 0) {
-      console.warn(`[Boot] ${failedCount} carga(s) falharam; dados locais preservados.`);
-    }
-
-    // Hidrata clientes e moto individualmente.
-    void loadAndHydrateCustomers();
-    void loadAndHydrateMoto();
-
-    // Processa alterações que o usuário fez durante o carregamento.
-    window.__flushHydrationQueue?.();
-  });
+  // Clientes e moto: hidratação independente e concorrente.
+  // Cada um inicia imediatamente — não bloqueiam um ao outro.
+  void hydration.loadFeature('clientes', featureLoaders.clientes);
+  void hydration.loadFeature('moto', featureLoaders.moto);
 
   // Remove o login somente depois de o bootstrap ter sido iniciado.
   unmountLoginView();
@@ -176,21 +194,8 @@ function enterAuthenticatedApp(user: AuthUser): void {
   removeBoot();
 }
 
-/** Carrega clientes do Firestore e hidrata o painel preservando dados financeiros locais. */
-async function loadAndHydrateCustomers(): Promise<void> {
-  const result: LoadResult<Array<{ nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>> =
-    await loadCustomersIntoPanel();
-  if (!isLoadSuccess(result)) return;
-  window.__hydrateClientes?.(result.data);
-}
-
-/** Carrega dados da moto do Firestore e hidrata o painel. */
-async function loadAndHydrateMoto(): Promise<void> {
-  const result: LoadResult<{ currentKm: number; consumption: number; consumptionIsManual: boolean }> =
-    await loadMotoIntoPanel();
-  if (!isLoadSuccess(result)) return;
-  window.__hydrateMoto?.(result.data);
-}
+// Expõe retry por feature.
+window.__retryLoadFeature = retryFeatureLoad;
 
 // RF-05 / RF-10 / RD-05.
 observeAuth((user) => {
