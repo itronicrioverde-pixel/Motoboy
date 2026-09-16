@@ -353,6 +353,38 @@ describe('createHydrationManager', () => {
       expect(mgr.state.clientes).toEqual({ status: 'failed', error: customError });
     });
   });
+
+  describe('applyLoadResult — hidratação sem efeitos colaterais externos', () => {
+    it('não altera estado de outra feature', () => {
+      const state = createState();
+      const loaders = makeLoaders();
+
+      applyLoadResult(state, 'clientes', loadOk([1]), loaders);
+
+      expect(state.moto).toEqual({ status: 'pending' });
+    });
+
+    it('loadOk com array vazio → ok (documento inexistente = válido)', () => {
+      const state = createState();
+      const loaders = makeLoaders({ hydrate: vi.fn() });
+
+      applyLoadResult(state, 'clientes', loadOk([]), loaders);
+
+      expect(state.clientes).toEqual({ status: 'ok' });
+      expect(loaders.hydrate).toHaveBeenCalledWith([]);
+    });
+
+    it('loadOk com dados padrão → ok (documento vazio = válido)', () => {
+      const state = createState();
+      const defaultData = { currentKm: 0, consumption: 0, consumptionIsManual: false };
+      const loaders = makeLoaders({ hydrate: vi.fn() });
+
+      applyLoadResult(state, 'moto', loadOk(defaultData), loaders);
+
+      expect(state.moto).toEqual({ status: 'ok' });
+      expect(loaders.hydrate).toHaveBeenCalledWith(defaultData);
+    });
+  });
 });
 
 // ---------- FeatureHydrationState — discriminated union ----------

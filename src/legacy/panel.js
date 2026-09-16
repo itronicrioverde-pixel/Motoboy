@@ -301,14 +301,14 @@ export function bootstrapPanel() {
   }
 
   let motoSaveTimer = null;
-  let motoRemoteLoaded = false;
   // Hidratação: controla quando os dados remotos já foram aplicados ao estado.
-  // Antes da hidratação, alterações do usuário ficam na fila e não são gravadas no Firestore.
+  // Antes da hidratação, ações que ALTERAM esses dados ficam bloqueadas (o cache
+  // local segue visível apenas em leitura). Nada é enfileirado: não simulamos
+  // suporte offline com uma fila falsa.
   let motoHydrated = false;
   let clientsHydrated = false;
-  let hydrationQueue = [];
   function saveMotoToFirestore(){
-    if(!motoRemoteLoaded) return;
+    if(!motoHydrated) return;
     if(motoSaveTimer) clearTimeout(motoSaveTimer);
     motoSaveTimer = setTimeout(function(){
       const uid = currentUid();
@@ -370,7 +370,6 @@ export function bootstrapPanel() {
         consumoManualDefinido = data.consumptionIsManual;
       }
     }
-    motoRemoteLoaded = true;
     motoHydrated = true;
     saveLocalState();
   }
@@ -391,17 +390,33 @@ export function bootstrapPanel() {
     saveLocalState();
   }
 
-  // Processa a fila de alterações feitas antes da hidratação.
-  function flushHydrationQueue(){
-    var pending = hydrationQueue;
-    hydrationQueue = [];
-    pending.forEach(function(fn){ fn(); });
+  // ---------- bloqueio de interação antecipada ----------
+  // Enquanto a feature não está hidratada, ações que ALTERAM seus dados ficam
+  // bloqueadas — o cache local continua visível em leitura. Nunca marcamos como
+  // hidratado só para liberar a interface, nem sincronizamos dados antigos como
+  // fallback. Em falha, o próprio ato de tentar dispara um novo retry.
+  function notifySyncing(feature){
+    showToast('Sincronizando dados. Aguarde ou tente novamente.', { kind: 'warning' });
+    if(typeof window.__isFeatureFailed === 'function' && window.__isFeatureFailed(feature)
+       && typeof window.__retryLoadFeature === 'function'){
+      window.__retryLoadFeature(feature);
+    }
+  }
+  // true quando a ação pode prosseguir; false (e avisa) quando ainda sincronizando.
+  function ensureClientesInteractive(){
+    if(clientsHydrated) return true;
+    notifySyncing('clientes');
+    return false;
+  }
+  function ensureMotoInteractive(){
+    if(motoHydrated) return true;
+    notifySyncing('moto');
+    return false;
   }
 
   // Expõe para main.ts orquestrar a hidratação.
   window.__hydrateMoto = hydrateMoto;
   window.__hydrateClientes = hydrateClientes;
-  window.__flushHydrationQueue = flushHydrationQueue;
   window.__isHydrated = function(){
     return motoHydrated && clientsHydrated;
   };
@@ -764,6 +779,7 @@ export function bootstrapPanel() {
     document.getElementById('refuelLocation').focus();
   }
   function deleteRefuel(index){
+    if(!ensureMotoInteractive()) return;
     const item = refuels[index];
     if(!item) return;
     requestDeleteConfirmation(
@@ -778,10 +794,15 @@ export function bootstrapPanel() {
         if(editingRefuelIndex === currentIndex) resetRefuelForm();
         else if(editingRefuelIndex !== null && currentIndex < editingRefuelIndex) editingRefuelIndex -= 1;
         PRECO_ATUAL = latestRefuelPrice();
+        const prevMotoKm = motoKm;
+        const prevConsumo = CONSUMO_ATUAL;
+        const prevManual = consumoManualDefinido;
         recalculateMotoKmFromRecords();
         recalcConsumoReal();
         saveLocalState();
-        syncMotoToFirestore();
+        if(motoKm !== prevMotoKm || CONSUMO_ATUAL !== prevConsumo || consumoManualDefinido !== prevManual){
+          syncMotoToFirestore();
+        }
         renderRefuelViews();
         renderMotoConsumo();
         renderFaturamento();
@@ -804,6 +825,7 @@ export function bootstrapPanel() {
   document.getElementById('refuelLiterPriceInput').addEventListener('input', updateCalculatedRefuelLiters);
   document.getElementById('refuelPaidValue').addEventListener('input', updateCalculatedRefuelLiters);
   document.getElementById('btnSaveRefuel').addEventListener('click', () => {
+    if(!ensureMotoInteractive()) return;
     const local = document.getElementById('refuelLocation').value.trim() || 'Posto não informado';
     const { liters, paid, price } = updateCalculatedRefuelLiters();
     if(!price || price <= 0 || !paid || paid <= 0){
@@ -859,10 +881,16 @@ export function bootstrapPanel() {
       }
     }
     PRECO_ATUAL = price;
+    const prevMotoKm = motoKm;
+    const prevConsumo = CONSUMO_ATUAL;
+    const prevManual = consumoManualDefinido;
     recalculateMotoKmFromRecords();
     recalcConsumoReal();
     saveLocalState();
-    syncMotoToFirestore();
+    // Sincroniza moto somente se o abastecimento alterou efetivamente o estado.
+    if(motoKm !== prevMotoKm || CONSUMO_ATUAL !== prevConsumo || consumoManualDefinido !== prevManual){
+      syncMotoToFirestore();
+    }
     renderRefuelViews();
     renderMotoConsumo();
     renderFaturamento();
@@ -1059,7 +1087,6 @@ export function bootstrapPanel() {
     if(typeof data.consumptionIsManual === 'boolean'){
       consumoManualDefinido = data.consumptionIsManual;
     }
-    motoRemoteLoaded = true;
   };
 
   function maintTotal(){ return maintenances.reduce((s, m) => s + m.valor, 0); }
@@ -1209,6 +1236,7 @@ export function bootstrapPanel() {
     document.getElementById(item && expenseCategoryInfo(item).needsDescription ? 'maintDesc' : 'maintValor').focus();
   }
   function deleteMaintenance(index){
+    if(!ensureMotoInteractive()) return;
     const item = maintenances[index];
     if(!item) return;
     requestDeleteConfirmation(
@@ -1221,9 +1249,12 @@ export function bootstrapPanel() {
         // Ponte: remove no Firestore.
         if(window.__motoboyManutencoes && item.fsId) window.__motoboyManutencoes.remove(item.fsId);
         if(editingMaintenanceIndex === currentIndex) resetMaintenanceFormMode();
+        const prevMotoKm = motoKm;
         recalculateMotoKmFromRecords();
         saveLocalState();
-        syncMotoToFirestore();
+        if(motoKm !== prevMotoKm){
+          syncMotoToFirestore();
+        }
         renderMaint();
         renderFaturamento();
         renderDashboard();
@@ -1239,6 +1270,7 @@ export function bootstrapPanel() {
   });
 
   document.getElementById('maintSave').addEventListener('click', () => {
+    if(!ensureMotoInteractive()) return;
     const category = normalizeExpenseCategory(document.getElementById('maintCategory').value);
     const categoryInfo = expenseCategories[category];
     const typedDesc = document.getElementById('maintDesc').value.trim();
@@ -1305,9 +1337,13 @@ export function bootstrapPanel() {
         }).catch(function(){ /* falha remota: mantém o cache local sem fsId */ });
       }
     }
+    const prevMotoKm = motoKm;
     recalculateMotoKmFromRecords();
     saveLocalState();
-    syncMotoToFirestore();
+    // Sincroniza moto somente se a manutenção alterou efetivamente o estado.
+    if(motoKm !== prevMotoKm){
+      syncMotoToFirestore();
+    }
     renderMaint();
     renderFaturamento();
     renderDashboard();
@@ -1899,6 +1935,7 @@ export function bootstrapPanel() {
   }
 
   document.getElementById('btnSaveConsumption').addEventListener('click', () => {
+    if(!ensureMotoInteractive()) return;
     const consumption = parseBrazilianInput(document.getElementById('motoConsumptionInput').value);
     if(!consumption || consumption <= 0){
       showToast('Informe um consumo médio maior que zero.', {kind:'warning'});
@@ -3099,6 +3136,7 @@ export function bootstrapPanel() {
     });
     list.querySelectorAll('[data-cancel-route]').forEach(button => {
       button.addEventListener('click', () => {
+        if(!ensureClientesInteractive()) return;
         const routeId = button.dataset.cancelRoute;
         const bloqueio = routeCancelBlockReason(routeId);
         if(bloqueio){
@@ -3115,6 +3153,8 @@ export function bootstrapPanel() {
   }
 
   document.getElementById('btnConfirmRoute').addEventListener('click', async () => {
+    const hasPending = routeServices.some(s => s.paymentStatus === 'pending');
+    if(hasPending && !ensureClientesInteractive()) return;
     const confirmation = document.getElementById('routeConfirmation');
     confirmation.classList.remove('open');
     const all = allEntregas();
@@ -3199,8 +3239,10 @@ export function bootstrapPanel() {
     }
 
     saveLocalState();
-    syncClientsToFirestore();
-    syncMotoToFirestore();
+    // Sincroniza clientes somente se a rota criou contas pendentes.
+    if(pendenteTotal > 0){
+      syncClientsToFirestore();
+    }
     initRouteHistoryFilters();
     renderRouteHistory();
     renderClientes();
@@ -3451,10 +3493,15 @@ export function bootstrapPanel() {
     }
 
     // 2) remove as contas que esta rota criou nos clientes (nenhuma tem pagamento, já checamos)
+    let clientsChanged = false;
     clientes.forEach(c => {
       if(!Array.isArray(c.contas)) return;
+      const before = c.contas.length;
       c.contas = c.contas.filter(conta => conta.routeId !== routeId);
-      syncClientBalance(c);
+      if(c.contas.length !== before){
+        syncClientBalance(c);
+        clientsChanged = true;
+      }
     });
 
     // 3) remove a própria rota do histórico
@@ -3463,7 +3510,7 @@ export function bootstrapPanel() {
     if(window.__motoboyRotas) window.__motoboyRotas.remove(routeId);
 
     saveLocalState();
-    syncClientsToFirestore();
+    if(clientsChanged) syncClientsToFirestore();
     renderFaturamento();
     renderClientes();
     renderDashboard();
@@ -3534,6 +3581,7 @@ export function bootstrapPanel() {
   }
 
   document.getElementById('recebimentoSave').addEventListener('click', () => {
+    if(!ensureClientesInteractive()) return;
     const cliente = clientes[receiptClientIndex];
     const valor = parseBrazilianInput(document.getElementById('recebimentoValor').value);
     if(!cliente){ receiptModalCtl.close(); return; }
@@ -3584,6 +3632,7 @@ export function bootstrapPanel() {
     document.getElementById('clienteNome').focus();
   }
   function deleteClient(index){
+    if(!ensureClientesInteractive()) return;
     const cliente = clientes[index];
     if(!cliente) return;
     const hasFinancialHistory = cliente.pendente > 0 || (cliente.contas || []).length > 0 || (cliente.recebimentos || []).length > 0;
@@ -3608,6 +3657,7 @@ export function bootstrapPanel() {
   }
   document.getElementById('btnOpenCliente').addEventListener('click', resetClientFormMode);
   document.getElementById('clienteSave').addEventListener('click', () => {
+    if(!ensureClientesInteractive()) return;
     const nome = document.getElementById('clienteNome').value.trim();
     if(!nome){ showToast('Digita o nome do cliente.', {kind:'warning'}); return; }
     if(clientes.find((c, index) => index !== editingClientIndex && c.nome.toLowerCase() === nome.toLowerCase())){

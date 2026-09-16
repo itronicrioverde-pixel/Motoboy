@@ -113,10 +113,11 @@ declare global {
   interface Window {
     __hydrateMoto?: (data: { currentKm: number; consumption: number; consumptionIsManual: boolean }) => void;
     __hydrateClientes?: (entities: Array<{ nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>) => void;
-    __flushHydrationQueue?: () => void;
     __isHydrated?: () => boolean;
     /** Retenta o carregamento de uma feature que falhou. */
     __retryLoadFeature?: (feature: 'clientes' | 'moto') => void;
+    /** true quando a última carga da feature falhou (habilita retry na guarda de interação). */
+    __isFeatureFailed?: (feature: 'clientes' | 'moto') => boolean;
   }
 }
 
@@ -154,12 +155,10 @@ const featureLoaders = {
 /**
  * Retenta o carregamento de uma feature que falhou.
  * Delega ao hydration manager — bloqueia retries concorrentes.
- * Processa fila de mutações após hidratação (bem-sucedida ou não).
+ * Não há fila a processar: a interação permanece bloqueada até a hidratação.
  */
 function retryFeatureLoad(feature: 'clientes' | 'moto'): void {
-  void hydration.retryFeatureLoad(feature, featureLoaders[feature]).then(() => {
-    window.__flushHydrationQueue?.();
-  });
+  void hydration.retryFeatureLoad(feature, featureLoaders[feature]);
 }
 
 /**
@@ -202,8 +201,10 @@ function enterAuthenticatedApp(user: AuthUser): void {
   removeBoot();
 }
 
-// Expõe retry por feature.
+// Expõe retry por feature e a consulta de falha (usada pela guarda de interação
+// do painel legado para oferecer retry quando a carga falhou).
 window.__retryLoadFeature = retryFeatureLoad;
+window.__isFeatureFailed = (feature) => hydration.isFeatureFailed(feature);
 
 // RF-05 / RF-10 / RD-05.
 observeAuth((user) => {
