@@ -132,13 +132,21 @@ const featureLoaders = {
   clientes: {
     load: () => loadCustomersIntoPanel(),
     hydrate: (data: unknown) => {
-      window.__hydrateClientes?.(data as LegacyCliente[]);
+      const hydrate = window.__hydrateClientes;
+      if (typeof hydrate !== 'function') {
+        throw new Error('[Boot] Ponte de hidratação de clientes indisponível.');
+      }
+      hydrate(data as LegacyCliente[]);
     },
   },
   moto: {
     load: () => loadMotoIntoPanel(),
     hydrate: (data: unknown) => {
-      window.__hydrateMoto?.(data as MotoData);
+      const hydrate = window.__hydrateMoto;
+      if (typeof hydrate !== 'function') {
+        throw new Error('[Boot] Ponte de hidratação de moto indisponível.');
+      }
+      hydrate(data as MotoData);
     },
   },
 } as const;

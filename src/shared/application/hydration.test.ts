@@ -325,31 +325,32 @@ describe('createHydrationManager', () => {
   });
 
   describe('função de hidratação ausente', () => {
-    it('hydrate que não faz nada (simula __hydrate ausente) → ok', async () => {
-      // Quando __hydrateClientes não existe, o loader.hydrate chama window.__hydrateClientes?.()
-      // que é undefined — optional chaining retorna undefined, não lança.
-      const mgr = createHydrationManager();
-      const loaders = makeLoaders({
-        hydrate: vi.fn(), // não lança — simula optional chaining em função ausente
-      });
-
-      await mgr.loadFeature('clientes', loaders);
-
-      // Não lança → status ok (o teste real em main.ts verifica a existência da fn)
-      expect(mgr.state.clientes).toEqual({ status: 'ok' });
-    });
-
-    it('hydrate que lança → failed', async () => {
+    it('hydrate que lança (ponte ausente) → failed', async () => {
       const mgr = createHydrationManager();
       const loaders = makeLoaders({
         hydrate: vi.fn().mockImplementation(() => {
-          throw new Error('função não existe');
+          throw new Error('[Boot] Ponte de hidratação de clientes indisponível.');
         }),
       });
 
       await mgr.loadFeature('clientes', loaders);
 
       expect(mgr.state.clientes.status).toBe('failed');
+      expect(loaders.hydrate).toHaveBeenCalledTimes(1);
+    });
+
+    it('hydrate que lança qualquer erro → failed com o erro', async () => {
+      const mgr = createHydrationManager();
+      const customError = new Error('ponte quebrada');
+      const loaders = makeLoaders({
+        hydrate: vi.fn().mockImplementation(() => {
+          throw customError;
+        }),
+      });
+
+      await mgr.loadFeature('clientes', loaders);
+
+      expect(mgr.state.clientes).toEqual({ status: 'failed', error: customError });
     });
   });
 });
