@@ -869,3 +869,75 @@ O painel legado (`panel.js`) inicializa lendo `localStorage` e, ao final de `boo
 - `src/features/payments/presentation/panel-bridge.ts` — remoção de loadPaymentsIntoPanel
 - `src/features/income/presentation/panel-bridge.ts` — remoção de loadIncomeIntoPanel
 - `src/features/receivables/presentation/panel-bridge.ts` — remoção de loadReceivablesIntoPanel
+
+---
+
+## DEC-022 (atualização) — Duas fontes remotas de clientes: customers/{id} + clients/data
+
+**Status:** Atualizada e implementada
+**Data:** 16/09/2026
+
+### Contexto
+
+Existem duas coleções Firestore para clientes:
+- `users/{uid}/customers/{customerId}` — Modelo novo de perfil/identidade (Customer com id, name, phone, etc.)
+- `users/{uid}/clients/data` — Documento agregado legado com projeção financeira (`{ clientes: [...] }`)
+
+Antes desta atualização, `loadCustomersIntoPanel()` apenas lia `customers/{id}` e convertia para o formato legado. A projeção financeira em `clients/data` nunca era lida do Firestore, causando:
+- Dados financeiros de outros dispositivos nunca eram sincronizados
+- `syncClientsToFirestore()` gravava dados potencialmente desatualizados
+- Hidratação de clientes era considerada completa sem ler a fonte financeira remota
+
+### Decisão
+
+**Duas fontes, dois papéis:**
+- `customers/{customerId}` é **fonte de perfil/identidade** (nome, telefone, apelido, notas, status)
+- `clients/data` é **projeção financeira legada temporária** (contas, recebimentos, pendente)
+
+**Carregamento dual antes da hidratação:**
+- `loadCustomersIntoPanel()` carrega **ambas** as fontes em paralelo (`Promise.all`)
+- Falha ao ler `clients/data` (rede/permissão) mantém `clientsHydrated = false` e bloqueia sincronização financeira
+- Documento `clients/data` inexistente, mas consultado com sucesso, é **válido** e representa projeção vazia
+
+**Merge por ID estável:**
+- `mergeLegacyCustomers()` (já existente) faz o merge usando ID como chave primária
+- Nome normalizado é **apenas fallback de migração** para registros legados sem ID
+- `customers/{id}` fornece o `id` no campo LegacyCliente
+- `clients/data` fornece `contas`, `recebimentos`, `pendente`
+
+**Guard de escrita:**
+- `saveClientsToFirestore()` possui guarda `if(!clientsRemoteRead) return;`
+- Impede que dados do localStorage sobrescrevam `clients/data` antes da leitura remota
+
+**Risco de concorrência documentado:**
+- O documento agregado `clients/data` é **escrito por um único dispositivo por vez** (via `setDoc` com `merge: true`)
+- Dois dispositivos escrevendo simultaneamente podem causar perda de dados (último escritor vence)
+- Este risco é **aceito temporariamente** e será resolvido no cutover (DEC-017) quando cada cliente terá seu próprio documento `clients/{clientId}`
+- **Nenhum campo novo** é adicionado ao documento agregado — compatibilidade total com documentos antigos
+
+### Fluxo resultante
+
+```
+loadCustomersIntoPanel():
+  1. Promise.all([
+       customersService.list(),          → customers/{id}[]
+       loadFinancialProjection()          → { clientes: LegacyCliente[] } | null
+     ])
+  2. mergeLegacyCustomers(profile, financial)  → MergeResult
+  3. return loadOk(merged)
+
+hydrateClientes(merged):
+  1. Recebe dados já merged do Firestore
+  2. Faz merge com localStorage (preserva offline mutations)
+  3. syncClientBalance() em cada cliente
+  4. clientsHydrated = true
+  5. saveLocalState()
+```
+
+### Consequências
+
+- Projeção financeira de outros dispositivos é sincronizada no boot
+- `syncClientsToFirestore()` só grava após leitura remota bem-sucedida
+- Compatibilidade total com documentos antigos (sem migração destrutiva)
+- Risco de concorrência entre dispositivos aceito temporariamente, com resolução prevista no cutover
+- Nome normalizado permanece como fallback de migração, não como chave de identidade

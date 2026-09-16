@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { SyncGate } from './sync-gate';
 import {
   createHydrationManager,
   type FeatureLoaders,
@@ -7,28 +8,21 @@ import {
 import { loadOk, loadFail } from './load-result';
 
 /**
- * Testes comportamentais de sincronização duais.
+ * Testes comportamentais de sincronização — porta real.
  *
- * 1. Sincronização é bloqueada antes da leitura remota.
- * 2. Falha remota mantém sincronização bloqueada.
- * 3. Somente hidratação bem-sucedida libera sincronização.
- * 4. Sincronização acontece exatamente uma vez por mutação.
+ * 1. A SyncGate começa fechada.
+ * 2. Falha remota mantém a porta fechada.
+ * 3. Somente hidratação bem-sucedida abre a porta.
+ * 4. Sync acontece somente quando a porta está aberta.
+ *
+ * Estes testes importam e exercitam a implementação real de SyncGate
+ * que é usada pelo panel.js para bloquear/liberar escritas ao Firestore.
  */
-
-interface SyncGate {
-  enabled: boolean;
-}
-
-function createSyncGate(): SyncGate {
-  return { enabled: false };
-}
 
 function makeSyncLoaders(gate: SyncGate): FeatureLoaders {
   return {
     load: vi.fn().mockResolvedValue(loadOk([{ nome: 'Teste' }])),
-    hydrate: vi.fn(() => {
-      gate.enabled = true;
-    }),
+    hydrate: vi.fn(() => { gate.open(); }),
   };
 }
 
@@ -49,198 +43,163 @@ function makeRejectedLoaders(): FeatureLoaders {
 function makeThrowHydrateLoaders(): FeatureLoaders {
   return {
     load: vi.fn().mockResolvedValue(loadOk([1])),
-    hydrate: vi.fn(() => {
-      throw new Error('Ponte indisponível');
-    }),
+    hydrate: vi.fn(() => { throw new Error('Ponte indisponível'); }),
   };
 }
 
-function makeSuccessLoaders(gate: SyncGate): FeatureLoaders {
-  return {
-    load: vi.fn().mockResolvedValue(loadOk([{ currentKm: 100 }])),
-    hydrate: vi.fn(() => { gate.enabled = true; }),
-  };
-}
+describe('SyncGate — implementação real', () => {
+  it('começa fechada por padrão', () => {
+    const gate = new SyncGate();
+    expect(gate.isOpen).toBe(false);
+    expect(gate.check()).toBe(false);
+  });
 
-/**
- * Simula mutação do usuário que tenta sincronizar.
- * Retorna true se agendada, false se bloqueada pelo gate.
- */
-function attemptSync(gate: SyncGate): boolean {
-  if (!gate.enabled) return false;
-  return true;
-}
+  it('open() abre a porta', () => {
+    const gate = new SyncGate();
+    gate.open();
+    expect(gate.isOpen).toBe(true);
+    expect(gate.check()).toBe(true);
+  });
 
-describe('Comportamento de sincronização — gate dual', () => {
+  it('close() fecha a porta', () => {
+    const gate = new SyncGate();
+    gate.open();
+    gate.close();
+    expect(gate.isOpen).toBe(false);
+  });
+
+  it('construtor com initialState=true começa aberta', () => {
+    const gate = new SyncGate(true);
+    expect(gate.isOpen).toBe(true);
+  });
+
+  it('múltiplas instâncias são independentes', () => {
+    const a = new SyncGate();
+    const b = new SyncGate();
+    a.open();
+    expect(a.isOpen).toBe(true);
+    expect(b.isOpen).toBe(false);
+  });
+});
+
+describe('Comportamento de sincronização — gate real + HydrationManager', () => {
   let gate: SyncGate;
   let mgr: HydrationManager;
 
   beforeEach(() => {
-    gate = createSyncGate();
+    gate = new SyncGate();
     mgr = createHydrationManager();
   });
 
   describe('antes da leitura remota', () => {
-    it('sync bloqueado antes de loadFeature ser chamado', () => {
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
+    it('sync bloqueado antes de loadFeature', () => {
+      expect(gate.isOpen).toBe(false);
     });
 
     it('sync permanece bloqueada enquanto hidratação não completou', async () => {
-      const result = attemptSync(gate);
-      expect(result).toBe(false);
-
+      expect(gate.isOpen).toBe(false);
       expect(mgr.state.clientes).toEqual({ status: 'pending' });
-      expect(attemptSync(gate)).toBe(false);
+      expect(gate.isOpen).toBe(false);
     });
   });
 
   describe('falha remota mantém bloqueio', () => {
-    it('loadFail mantém gate disabled', async () => {
-      const loaders = makeFailingLoaders(new Error('Firestore timeout'));
-
-      await mgr.loadFeature('clientes', loaders);
-
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
+    it('loadFail mantém gate fechado', async () => {
+      await mgr.loadFeature('clientes', makeFailingLoaders(new Error('timeout')));
+      expect(gate.isOpen).toBe(false);
     });
 
-    it('load rejeita mantém gate disabled', async () => {
-      const loaders = makeRejectedLoaders();
-
-      await mgr.loadFeature('clientes', loaders);
-
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
+    it('load rejeita mantém gate fechado', async () => {
+      await mgr.loadFeature('clientes', makeRejectedLoaders());
+      expect(gate.isOpen).toBe(false);
     });
 
-    it('hydrate lança erro mantém gate disabled', async () => {
-      const loaders = makeThrowHydrateLoaders();
-
-      await mgr.loadFeature('clientes', loaders);
-
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
+    it('hydrate lança erro mantém gate fechado', async () => {
+      await mgr.loadFeature('clientes', makeThrowHydrateLoaders());
+      expect(gate.isOpen).toBe(false);
     });
   });
 
   describe('sucesso libera sincronização', () => {
-    it('loadOk + hydrate sem erro habilita gate', async () => {
-      const loaders = makeSyncLoaders(gate);
-
-      await mgr.loadFeature('clientes', loaders);
-
-      expect(gate.enabled).toBe(true);
+    it('loadOk + hydrate sem erro abre gate', async () => {
+      await mgr.loadFeature('clientes', makeSyncLoaders(gate));
+      expect(gate.isOpen).toBe(true);
       expect(mgr.state.clientes).toEqual({ status: 'ok' });
-    });
-
-    it('sync funciona após hidratação bem-sucedida', async () => {
-      const loaders = makeSyncLoaders(gate);
-
-      await mgr.loadFeature('clientes', loaders);
-
-      expect(attemptSync(gate)).toBe(true);
     });
   });
 
-  describe('sync exatamente uma vez por mutação', () => {
+  describe('sync somente quando gate aberto', () => {
     it('0 syncs antes da hidratação, N syncs depois', async () => {
       let syncCount = 0;
-      const countingGate: SyncGate = { enabled: false };
-      const loaders: FeatureLoaders = {
-        load: vi.fn().mockResolvedValue(loadOk([{ nome: 'T' }])),
-        hydrate: vi.fn(() => { countingGate.enabled = true; }),
-      };
+      const sync = () => { if (gate.isOpen) syncCount++; };
 
-      // 3 tentativas antes — nenhuma deveria contar
-      for (let i = 0; i < 3; i++) {
-        if (attemptSync(countingGate)) syncCount++;
-      }
+      for (let i = 0; i < 3; i++) sync();
       expect(syncCount).toBe(0);
 
-      await mgr.loadFeature('clientes', loaders);
+      await mgr.loadFeature('clientes', makeSyncLoaders(gate));
 
-      // 3 tentativas depois — todas deveriam contar
-      for (let i = 0; i < 3; i++) {
-        if (attemptSync(countingGate)) syncCount++;
-      }
+      for (let i = 0; i < 3; i++) sync();
       expect(syncCount).toBe(3);
     });
 
-    it('cada mutação gera exatamente 1 sync, não mais', async () => {
+    it('cada mutação gera exatamente 1 sync', async () => {
       let syncCount = 0;
-      const countingGate: SyncGate = { enabled: false };
-      const loaders: FeatureLoaders = {
-        load: vi.fn().mockResolvedValue(loadOk([{ nome: 'T' }])),
-        hydrate: vi.fn(() => { countingGate.enabled = true; }),
-      };
+      const sync = () => { if (gate.isOpen) syncCount++; };
 
-      await mgr.loadFeature('clientes', loaders);
+      await mgr.loadFeature('clientes', makeSyncLoaders(gate));
 
-      for (let i = 0; i < 5; i++) {
-        if (attemptSync(countingGate)) syncCount++;
-      }
+      for (let i = 0; i < 5; i++) sync();
       expect(syncCount).toBe(5);
     });
   });
 
   describe('independência entre features', () => {
     it('falha de clientes não bloqueia sync de moto', async () => {
-      const motoGate = createSyncGate();
-      const clientesLoaders = makeFailingLoaders(new Error('timeout'));
-      const motoLoaders = makeSuccessLoaders(motoGate);
+      const motoGate = new SyncGate();
+      const motoLoaders: FeatureLoaders = {
+        load: vi.fn().mockResolvedValue(loadOk([{ currentKm: 100 }])),
+        hydrate: vi.fn(() => { motoGate.open(); }),
+      };
 
       await Promise.all([
-        mgr.loadFeature('clientes', clientesLoaders),
+        mgr.loadFeature('clientes', makeFailingLoaders(new Error('timeout'))),
         mgr.loadFeature('moto', motoLoaders),
       ]);
 
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
-
-      expect(motoGate.enabled).toBe(true);
-      expect(attemptSync(motoGate)).toBe(true);
+      expect(gate.isOpen).toBe(false);
+      expect(motoGate.isOpen).toBe(true);
     });
 
-    it('ambas hidratadas — sync funciona em ambas', async () => {
-      const motoGate = createSyncGate();
-      const clientesLoaders = makeSyncLoaders(gate);
-      const motoLoaders = makeSuccessLoaders(motoGate);
+    it('ambas hidratadas — ambas gates abertas', async () => {
+      const motoGate = new SyncGate();
+      const motoLoaders: FeatureLoaders = {
+        load: vi.fn().mockResolvedValue(loadOk([{ currentKm: 100 }])),
+        hydrate: vi.fn(() => { motoGate.open(); }),
+      };
 
       await Promise.all([
-        mgr.loadFeature('clientes', clientesLoaders),
+        mgr.loadFeature('clientes', makeSyncLoaders(gate)),
         mgr.loadFeature('moto', motoLoaders),
       ]);
 
-      expect(attemptSync(gate)).toBe(true);
-      expect(attemptSync(motoGate)).toBe(true);
+      expect(gate.isOpen).toBe(true);
+      expect(motoGate.isOpen).toBe(true);
     });
   });
 
   describe('retry libera gate', () => {
-    it('retry com sucesso libera gate', async () => {
-      const failLoaders = makeFailingLoaders(new Error('timeout'));
+    it('retry com sucesso abre gate', async () => {
+      await mgr.loadFeature('clientes', makeFailingLoaders(new Error('timeout')));
+      expect(gate.isOpen).toBe(false);
 
-      await mgr.loadFeature('clientes', failLoaders);
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
-
-      const okLoaders = makeSyncLoaders(gate);
-      await mgr.retryFeatureLoad('clientes', okLoaders);
-
-      expect(gate.enabled).toBe(true);
-      expect(attemptSync(gate)).toBe(true);
+      await mgr.retryFeatureLoad('clientes', makeSyncLoaders(gate));
+      expect(gate.isOpen).toBe(true);
     });
 
-    it('retry com falha mantém gate disabled', async () => {
-      const failLoaders1 = makeFailingLoaders(new Error('e1'));
-      await mgr.loadFeature('clientes', failLoaders1);
-
-      const failLoaders2 = makeFailingLoaders(new Error('e2'));
-      await mgr.retryFeatureLoad('clientes', failLoaders2);
-
-      expect(gate.enabled).toBe(false);
-      expect(attemptSync(gate)).toBe(false);
+    it('retry com falha mantém gate fechado', async () => {
+      await mgr.loadFeature('clientes', makeFailingLoaders(new Error('e1')));
+      await mgr.retryFeatureLoad('clientes', makeFailingLoaders(new Error('e2')));
+      expect(gate.isOpen).toBe(false);
     });
   });
 });
