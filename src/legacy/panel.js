@@ -3,6 +3,8 @@ import { showToast } from '../shared/presentation/notifications/index';
 import { db } from '../config/firebase.js';
 import { doc, setDoc } from 'firebase/firestore';
 import { currentUid } from '../features/auth/application/auth-service';
+import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
+import { SyncGate } from '../shared/application/sync-gate';
 
 export function bootstrapPanel() {
   // ---------- estado local do aplicativo ----------
@@ -289,7 +291,9 @@ export function bootstrapPanel() {
   }
 
   let clientsSaveTimer = null;
+  const clientsRemoteRead = new SyncGate();
   function saveClientsToFirestore(){
+    if(!clientsRemoteRead.isOpen) return;
     if(clientsSaveTimer) clearTimeout(clientsSaveTimer);
     clientsSaveTimer = setTimeout(function(){
       const uid = currentUid();
@@ -305,10 +309,10 @@ export function bootstrapPanel() {
   // Antes da hidratação, ações que ALTERAM esses dados ficam bloqueadas (o cache
   // local segue visível apenas em leitura). Nada é enfileirado: não simulamos
   // suporte offline com uma fila falsa.
-  let motoHydrated = false;
-  let clientsHydrated = false;
+  const motoHydrated = new SyncGate();
+  const clientsHydrated = new SyncGate();
   function saveMotoToFirestore(){
-    if(!motoHydrated) return;
+    if(!motoHydrated.isOpen) return;
     if(motoSaveTimer) clearTimeout(motoSaveTimer);
     motoSaveTimer = setTimeout(function(){
       const uid = currentUid();
@@ -345,18 +349,18 @@ export function bootstrapPanel() {
   // ---------- sincronização explícita com Firestore ----------
   // Só é chamada após mutações reais do usuário, nunca dentro de saveLocalState().
   function syncClientsToFirestore(){
-    if(!clientsHydrated) return;
+    if(!clientsHydrated.isOpen) return;
     saveClientsToFirestore();
   }
   function syncMotoToFirestore(){
-    if(!motoHydrated) return;
+    if(!motoHydrated.isOpen) return;
     saveMotoToFirestore();
   }
 
   // ---------- hidratação individual ----------
   // Chamado por main.ts quando os dados remotos chegam (sucesso ou falha).
   function hydrateMoto(data){
-    if(motoHydrated) return;
+    if(motoHydrated.isOpen) return;
     if(data && typeof data === 'object'){
       if(Number(data.currentKm) > motoKm){
         motoKm = Number(data.currentKm);
@@ -370,23 +374,18 @@ export function bootstrapPanel() {
         consumoManualDefinido = data.consumptionIsManual;
       }
     }
-    motoHydrated = true;
+    motoHydrated.open();
     saveLocalState();
   }
   function hydrateClientes(remoteClientes){
-    if(clientsHydrated) return;
+    if(clientsHydrated.isOpen) return;
     if(Array.isArray(remoteClientes)){
-      var remoteByName = {};
-      remoteClientes.forEach(function(c){ remoteByName[c.nome.toLowerCase()] = c; });
-      // Preserva dados financeiros locais que o remoto não carrega (formato legado).
-      var localOnly = clientes.filter(function(c){
-        if(remoteByName[c.nome.toLowerCase()]) return false;
-        return true;
-      });
-      clientes = remoteClientes.concat(localOnly);
+      const result = mergeLegacyCustomers(remoteClientes, clientes);
+      clientes = result.merged;
       clientes.forEach(syncClientBalance);
     }
-    clientsHydrated = true;
+    clientsRemoteRead.open();
+    clientsHydrated.open();
     saveLocalState();
   }
 
@@ -404,12 +403,12 @@ export function bootstrapPanel() {
   }
   // true quando a ação pode prosseguir; false (e avisa) quando ainda sincronizando.
   function ensureClientesInteractive(){
-    if(clientsHydrated) return true;
+    if(clientsHydrated.isOpen) return true;
     notifySyncing('clientes');
     return false;
   }
   function ensureMotoInteractive(){
-    if(motoHydrated) return true;
+    if(motoHydrated.isOpen) return true;
     notifySyncing('moto');
     return false;
   }
@@ -418,7 +417,7 @@ export function bootstrapPanel() {
   window.__hydrateMoto = hydrateMoto;
   window.__hydrateClientes = hydrateClientes;
   window.__isHydrated = function(){
-    return motoHydrated && clientsHydrated;
+    return motoHydrated.isOpen && clientsHydrated.isOpen;
   };
 
   function renderRefuelList(el, items, withActions){
@@ -3412,23 +3411,11 @@ export function bootstrapPanel() {
   }
 
   // Callback de sincronização: recebe clientes do Firestore e mescla com os locais.
-  // O formato legado mantém contas/recebimentos/pendente que o novo domínio não carrega.
-  // O merge preserva os dados financeiros locais quando o nome coincide.
+  // Usa a mesma função pura de merge que a hidratação.
   window.__applyRemoteClientes = function(remoteClientes){
     if(!Array.isArray(remoteClientes)) return;
-    var remoteByName = {};
-    remoteClientes.forEach(function(c){ remoteByName[c.nome.toLowerCase()] = c; });
-    var localOnly = clientes.filter(function(c){ return !remoteByName[c.nome.toLowerCase()]; });
-    clientes = remoteClientes.map(function(remote){
-      var key = remote.nome.toLowerCase();
-      var local = clientes.find(function(c){ return c.nome.toLowerCase() === key; });
-      if(local){
-        remote.contas = local.contas || [];
-        remote.recebimentos = local.recebimentos || [];
-        remote.pendente = local.pendente || 0;
-      }
-      return remote;
-    }).concat(localOnly);
+    const result = mergeLegacyCustomers(remoteClientes, clientes);
+    clientes = result.merged;
     clientes.forEach(syncClientBalance);
   };
 

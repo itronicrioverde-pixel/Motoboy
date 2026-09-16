@@ -11,6 +11,7 @@ import { resolve } from 'path';
  * - Hidratação sem sincronização remota
  * - Sincronização bloqueada antes da hidratação
  * - Sincronização somente após mutação real
+ * - Uso do SyncGate real para controle de escrita
  */
 
 const PANEL_PATH = resolve(__dirname, './panel.js');
@@ -19,7 +20,6 @@ const panelSource = readFileSync(PANEL_PATH, 'utf-8');
 describe('panel.js — propriedades estáticas', () => {
   describe('ausência de motoRemoteLoaded', () => {
     it('variável motoRemoteLoaded não existe no código', () => {
-      // Verifica declaração: let/const/var motoRemoteLoaded
       const decl = /\b(?:let|const|var)\s+motoRemoteLoaded\b/.test(panelSource);
       expect(decl).toBe(false);
     });
@@ -63,9 +63,9 @@ describe('panel.js — propriedades estáticas', () => {
   });
 
   describe('__applyRemoteMoto não habilita persistência', () => {
-    it('__applyRemoteMoto não contém motoHydrated', () => {
+    it('__applyRemoteMoto não contém motoHydrated.open', () => {
       const block = extractWindowAssignment(panelSource, '__applyRemoteMoto');
-      expect(block).not.toMatch(/motoHydrated\s*=\s*true/);
+      expect(block).not.toMatch(/motoHydrated\.open\s*\(/);
     });
 
     it('__applyRemoteMoto não contém syncMotoToFirestore', () => {
@@ -80,9 +80,9 @@ describe('panel.js — propriedades estáticas', () => {
   });
 
   describe('__applyRemoteClientes não habilita persistência', () => {
-    it('__applyRemoteClientes não contém clientsHydrated', () => {
+    it('__applyRemoteClientes não contém clientsHydrated.open', () => {
       const block = extractWindowAssignment(panelSource, '__applyRemoteClientes');
-      expect(block).not.toMatch(/clientsHydrated\s*=\s*true/);
+      expect(block).not.toMatch(/clientsHydrated\.open\s*\(/);
     });
 
     it('__applyRemoteClientes não contém syncClientsToFirestore', () => {
@@ -91,27 +91,30 @@ describe('panel.js — propriedades estáticas', () => {
     });
   });
 
-  describe('sync bloqueado antes da hidratação', () => {
-    it('syncMotoToFirestore tem guarda if(!motoHydrated) return', () => {
+  describe('sync bloqueado antes da hidratação via SyncGate', () => {
+    it('syncMotoToFirestore tem guarda if(!motoHydrated.isOpen) return', () => {
       const block = extractFunction(panelSource, 'syncMotoToFirestore');
-      expect(block).toMatch(/if\s*\(\s*!motoHydrated\s*\)\s*return/);
+      expect(block).toMatch(/if\s*\(\s*!motoHydrated\.isOpen\s*\)\s*return/);
     });
 
-    it('syncClientsToFirestore tem guarda if(!clientsHydrated) return', () => {
+    it('syncClientsToFirestore tem guarda if(!clientsHydrated.isOpen) return', () => {
       const block = extractFunction(panelSource, 'syncClientsToFirestore');
-      expect(block).toMatch(/if\s*\(\s*!clientsHydrated\s*\)\s*return/);
+      expect(block).toMatch(/if\s*\(\s*!clientsHydrated\.isOpen\s*\)\s*return/);
     });
 
-    it('saveMotoToFirestore tem guarda if(!motoHydrated) return', () => {
+    it('saveMotoToFirestore tem guarda if(!motoHydrated.isOpen) return', () => {
       const block = extractFunction(panelSource, 'saveMotoToFirestore');
-      expect(block).toMatch(/if\s*\(\s*!motoHydrated\s*\)\s*return/);
+      expect(block).toMatch(/if\s*\(\s*!motoHydrated\.isOpen\s*\)\s*return/);
+    });
+
+    it('saveClientsToFirestore tem guarda if(!clientsRemoteRead.isOpen) return', () => {
+      const block = extractFunction(panelSource, 'saveClientsToFirestore');
+      expect(block).toMatch(/if\s*\(\s*!clientsRemoteRead\.isOpen\s*\)\s*return/);
     });
   });
 
   describe('confirmação de rota — sem sync de moto', () => {
     it('fluxo de confirmação não chama syncMotoToFirestore', () => {
-      // O bloco de confirmação começa com "confirmedRoutes.unshift(novaRota)"
-      // e vai até "const confirmationMessage"
       const confirmStart = panelSource.indexOf('confirmedRoutes.unshift(novaRota)');
       const confirmEnd = panelSource.indexOf('const confirmationMessage', confirmStart);
       expect(confirmStart).toBeGreaterThan(-1);
@@ -124,7 +127,6 @@ describe('panel.js — propriedades estáticas', () => {
       const confirmStart = panelSource.indexOf('confirmedRoutes.unshift(novaRota)');
       const confirmEnd = panelSource.indexOf('const confirmationMessage', confirmStart);
       const confirmBlock = panelSource.slice(confirmStart, confirmEnd);
-      // Deve ter a condição if(pendenteTotal > 0) antes de syncClientsToFirestore
       expect(confirmBlock).toMatch(/if\s*\(\s*pendenteTotal\s*>\s*0\s*\)/);
       expect(confirmBlock).toContain('syncClientsToFirestore');
     });
@@ -145,31 +147,78 @@ describe('panel.js — propriedades estáticas', () => {
 
     it('nenhuma conta corresponde ao routeId: não altera clientes e não sincroniza', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
-      // Se nenhum filter removeu contas, before === c.contas.length → clientsChanged = false
-      // O bloco só marca clientsChanged = true quando lengths divergem
       expect(body).toMatch(/const before\s*=\s*c\.contas\.length/);
       expect(body).toMatch(/if\s*\(\s*c\.contas\.length\s*!==\s*before\s*\)/);
-      // syncClientsToFirestore nunca é chamado incondicionalmente
       expect(body).not.toMatch(/saveLocalState\(\);\s*syncClientsToFirestore\(\)/);
     });
 
     it('existe correspondência: remove contas da rota, preserva demais e sincroniza uma vez', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
-      // O filter preserva contas que NÃO têm o routeId cancelado
       expect(body).toMatch(/c\.contas\s*=\s*c\.contas\.filter\(\s*conta\s*=>\s*conta\.routeId\s*!==\s*routeId\s*\)/);
-      // Sync acontece exatamente uma vez (só na condição)
       const syncCalls = body.match(/syncClientsToFirestore/g) || [];
       expect(syncCalls).toHaveLength(1);
+    });
+  });
+
+  describe('dual source — SyncGate import e uso', () => {
+    it('panel.js importa SyncGate', () => {
+      expect(panelSource).toContain("import { SyncGate } from");
+    });
+
+    it('clientsRemoteRead é instância de SyncGate', () => {
+      const decl = panelSource.match(/const\s+clientsRemoteRead\s*=\s*new\s+SyncGate\s*\(/);
+      expect(decl).not.toBeNull();
+    });
+
+    it('motoHydrated é instância de SyncGate', () => {
+      const decl = panelSource.match(/const\s+motoHydrated\s*=\s*new\s+SyncGate\s*\(/);
+      expect(decl).not.toBeNull();
+    });
+
+    it('clientsHydrated é instância de SyncGate', () => {
+      const decl = panelSource.match(/const\s+clientsHydrated\s*=\s*new\s+SyncGate\s*\(/);
+      expect(decl).not.toBeNull();
+    });
+
+    it('hydrateClientes abre clientsRemoteRead e clientsHydrated', () => {
+      const block = extractFunction(panelSource, 'hydrateClientes');
+      expect(block).toContain('clientsRemoteRead.open()');
+      expect(block).toContain('clientsHydrated.open()');
+    });
+
+    it('hydrateClientes abre clientsRemoteRead antes de clientsHydrated', () => {
+      const block = extractFunction(panelSource, 'hydrateClientes');
+      const readIdx = block.indexOf('clientsRemoteRead.open()');
+      const hydratedIdx = block.indexOf('clientsHydrated.open()');
+      expect(readIdx).toBeGreaterThan(-1);
+      expect(hydratedIdx).toBeGreaterThan(readIdx);
+    });
+
+    it('hydrateMoto abre motoHydrated', () => {
+      const block = extractFunction(panelSource, 'hydrateMoto');
+      expect(block).toContain('motoHydrated.open()');
+    });
+
+    it('__applyRemoteClientes NÃO abre gates', () => {
+      const block = extractWindowAssignment(panelSource, '__applyRemoteClientes');
+      expect(block).not.toMatch(/\.(open|close)\s*\(/);
+    });
+  });
+
+  describe('dual source — merge por ID estável', () => {
+    it('hydrateClientes chama mergeLegacyCustomers', () => {
+      const block = extractFunction(panelSource, 'hydrateClientes');
+      expect(block).toContain('mergeLegacyCustomers');
+    });
+
+    it('panel.js importa mergeLegacyCustomers', () => {
+      expect(panelSource).toContain("import { mergeLegacyCustomers } from");
     });
   });
 });
 
 // ---------- Helpers ----------
 
-/**
- * Extrai o bloco de uma função declarada com function name() { ... }
- * Retorna o conteúdo entre as chaves (nível 0).
- */
 function extractFunction(source: string, name: string): string {
   const regex = new RegExp(`function\\s+${name}\\s*\\(`);
   const match = regex.exec(source);
@@ -178,9 +227,6 @@ function extractFunction(source: string, name: string): string {
   return extractBracedBlock(source, startIdx);
 }
 
-/**
- * Extrai o bloco atribuído a window.__applyRemoteXxx = function(data){ ... }
- */
 function extractWindowAssignment(source: string, propName: string): string {
   const regex = new RegExp(`window\\.__${propName}\\s*=\\s*function`);
   const match = regex.exec(source);
@@ -189,9 +235,6 @@ function extractWindowAssignment(source: string, propName: string): string {
   return extractBracedBlock(source, startIdx);
 }
 
-/**
- * Extrai o conteúdo entre chaves no nível 0 a partir de uma posição.
- */
 function extractBracedBlock(source: string, startIdx: number): string {
   if (startIdx < 0) return '';
   let depth = 0;

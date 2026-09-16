@@ -112,7 +112,7 @@ const hydration = createHydrationManager();
 declare global {
   interface Window {
     __hydrateMoto?: (data: { currentKm: number; consumption: number; consumptionIsManual: boolean }) => void;
-    __hydrateClientes?: (entities: Array<{ nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>) => void;
+    __hydrateClientes?: (entities: Array<{ id?: string; nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] }>) => void;
     __isHydrated?: () => boolean;
     /** Retenta o carregamento de uma feature que falhou. */
     __retryLoadFeature?: (feature: 'clientes' | 'moto') => void;
@@ -122,7 +122,7 @@ declare global {
 }
 
 // Tipo legado de clientes que o painel espera.
-type LegacyCliente = { nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] };
+type LegacyCliente = { id?: string; nome: string; pendente: number; contas: unknown[]; recebimentos: unknown[] };
 
 // Tipo de dados da moto que o painel espera.
 type MotoData = { currentKm: number; consumption: number; consumptionIsManual: boolean };
