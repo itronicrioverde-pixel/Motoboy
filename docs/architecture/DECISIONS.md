@@ -830,114 +830,327 @@ Não existem solicitações externas de clientes; não existe carteira; não exi
 ## DEC-022 — Separação entre persistência local e sincronização remota no bootstrap
 
 **Status:** Aprovada e implementada
-**Data:** 14/09/2026
+**Data:** 14/09/2026 (atualizada 17/09/2026)
 
 ### Contexto
 
 O painel legado (`panel.js`) inicializa lendo `localStorage` e, ao final de `bootstrapPanel()`, chama `saveLocalState()` que escrevia de volta no localStorage E chamava `saveClientsToFirestore()` e `saveMotoToFirestore()`. Isso criava um race condition: dados potencialmente antigos eram gravados no Firestore antes da leitura remota completar. O `saveClientsToFirestore()` não possuía guarda (diferente de `saveMotoToFirestore()` que já tinha `motoRemoteLoaded`), permitindo que dados antigos de clientes sobrescrevessem dados atuais do Firestore. Além disso, `loadPaymentsIntoPanel`, `loadIncomeIntoPanel` e `loadReceivablesIntoPanel` eram chamadas no boot mas o painel legado não consumia seus resultados (não possuía `__applyRemote*` correspondentes).
 
-### Decisão
-
-- `saveLocalState()` escreve **exclusivamente** no localStorage. Não há chamadas automáticas ao Firestore dentro dela.
-- Sincronização Firestore (`saveClientsToFirestore`, `saveMotoToFirestore`) ocorre **somente após mutações reais do usuário**, por meio de `syncClientsToFirestore()` e `syncMotoToFirestore()`.
-- Ambas as funções de sync possuem guarda: só executam após a hidratação individual respectiva.
-- **Hidratação individual** para clientes (`__hydrateClientes`) e moto (`__hydrateMoto`): funções dedicadas no painel legado que recebem dados remotos, mesclam com o estado local (preservando dados financeiros legados) e marcam a hidratação como concluída.
-- `main.ts` orquestra a hidratação com `Promise.allSettled`, aguardando todas as cargas antes de chamar as funções de hidratação.
-- Loaders das bridges retornam `LoadResult<T>` (sucesso com dados, ou erro propagado). Erro capturado **não** é considerado carregamento concluído.
-- `saveLocalState()` é removida do final de `bootstrapPanel()`.
-- Removidos do boot: `loadPaymentsIntoPanel`, `loadIncomeIntoPanel`, `loadReceivablesIntoPanel` (o painel não consome seus resultados).
-- Merge financeiro de clientes preserva `contas`, `recebimentos` e `pendente` do estado local quando o nome do cliente coincide com o remoto.
-
-### Consequências
-
-- Dados antigos do localStorage não podem mais sobrescrever dados atuais do Firestore durante o bootstrap.
-- Sincronização Firestore só ocorre após hidratação + mutação real do usuário.
-- Comportamento offline preservado: cache local continua funcionando; sincronização remota é desbloqueada pela hidratação.
-- `__applyRemoteMoto` e `__applyRemoteClientes` não chamam `saveLocalState()` — a persistência é feita pelas funções de hidratação.
-- Nenhuma alteração de schema, rules, Functions, deploy ou contratos públicos.
-
-### Arquivos alterados
-
-- `src/legacy/panel.js` — saveLocalState(), hidratação, guards, sync explícito
-- `src/main.ts` — orquestração de hidratação, imports, tipagem
-- `src/features/abastecimentos/presentation/panel-bridge.ts` — LoadResult
-- `src/features/manutencoes/presentation/panel-bridge.ts` — LoadResult
-- `src/features/faturamento/presentation/panel-bridge.ts` — LoadResult
-- `src/features/rotas/presentation/panel-bridge.ts` — LoadResult
-- `src/features/customers/presentation/panel-bridge.ts` — LoadResult, retorno de dados
-- `src/features/moto/presentation/panel-bridge.ts` — LoadResult, retorno de dados
-- `src/features/payments/presentation/panel-bridge.ts` — remoção de loadPaymentsIntoPanel
-- `src/features/income/presentation/panel-bridge.ts` — remoção de loadIncomeIntoPanel
-- `src/features/receivables/presentation/panel-bridge.ts` — remoção de loadReceivablesIntoPanel
-
----
-
-## DEC-022 (atualização) — Duas fontes remotas de clientes: customers/{id} + clients/data
-
-**Status:** Atualizada e implementada
-**Data:** 16/09/2026
-
-### Contexto
-
 Existem duas coleções Firestore para clientes:
 - `users/{uid}/customers/{customerId}` — Modelo novo de perfil/identidade (Customer com id, name, phone, etc.)
 - `users/{uid}/clients/data` — Documento agregado legado com projeção financeira (`{ clientes: [...] }`)
 
-Antes desta atualização, `loadCustomersIntoPanel()` apenas lia `customers/{id}` e convertia para o formato legado. A projeção financeira em `clients/data` nunca era lida do Firestore, causando:
-- Dados financeiros de outros dispositivos nunca eram sincronizados
-- `syncClientsToFirestore()` gravava dados potencialmente desatualizados
-- Hidratação de clientes era considerada completa sem ler a fonte financeira remota
+Antes desta decisão, `loadCustomersIntoPanel()` apenas lia `customers/{id}` e convertia para o formato legado. A projeção financeira em `clients/data` nunca era lida do Firestore, causando dados financeiros desatualizados entre dispositivos.
 
 ### Decisão
 
-**Duas fontes, dois papéis:**
+#### Persistência local vs. sincronização remota
+
+- `saveLocalState()` escreve **exclusivamente** no localStorage. Não há chamadas automáticas ao Firestore dentro dela.
+- Sincronização Firestore (`saveClientsToFirestore`, `saveMotoToFirestore`) ocorre **somente após mutações reais do usuário**, por meio de `syncClientsToFirestore()` e `syncMotoToFirestore()`.
+- Ambas as funções de sync possuem guarda via `SyncGate`: só executam após a hidratação individual respectiva.
+- `saveLocalState()` é removida do final de `bootstrapPanel()`.
+- Removidos do boot: `loadPaymentsIntoPanel`, `loadIncomeIntoPanel`, `loadReceivablesIntoPanel` (o painel não consome seus resultados).
+
+#### Estados por feature: loading, hydrated, failed
+
+Cada feature (clientes, moto) possui três estados gerenciados pelo `HydrationManager` (`src/shared/application/hydration.ts`):
+
+| Estado | Significado | Interação do usuário |
+|--------|-------------|---------------------|
+| `loading` (pending) | Carga remota em andamento | Bloqueada — guards impedem mutações |
+| `hydrated` (ok) | Dados remotos aplicados ao estado local | Liberada — mutações e sync habilitados |
+| `failed` | Carga remota falhou (rede, permissão) | Bloqueada — toast com opção de retry |
+
+- Guards (`ensureClientesInteractive()`, `ensureMotoInteractive()`) bloqueiam 10 handlers de mutação antes da hidratação.
+- Handlers protegidos: clienteSave, deleteClient, recebimentoSave, btnSaveConsumption, btnConfirmRoute (condicional: só quando há pendentes), cancelConfirmedRoute, btnSaveRefuel, deleteRefuel, maintSave, deleteMaintenance.
+
+#### Mecanismo de retry
+
+- Quando uma feature está em estado `failed`, o guard de interação exibe um toast de aviso e chama `notifySyncing()`.
+- `notifySyncing()` detecta o estado `failed` via `window.__isFeatureFailed(feature)` e invoca `window.__retryLoadFeature(feature)`.
+- O `HydrationManager` garante que não há retries concorrentes (ignora chamadas enquanto um retry está em andamento).
+- Retry bem-sucedido transiciona a feature para `hydrated`; falha mantém em `failed` para nova tentativa manual.
+- Não há retry automático periódico — o retry é sempre disparado pela interação do usuário.
+
+#### Duas fontes de clientes
+
+**Dois caminhos, dois papéis (projeção financeira é temporária):**
 - `customers/{customerId}` é **fonte de perfil/identidade** (nome, telefone, apelido, notas, status)
-- `clients/data` é **projeção financeira legada temporária** (contas, recebimentos, pendente)
+- `clients/data` é **projeção financeira legada temporária** (contas, recebimentos, pendente) — será eliminada no cutover (DEC-017) quando cada cliente terá seu próprio documento
 
 **Carregamento dual antes da hidratação:**
 - `loadCustomersIntoPanel()` carrega **ambas** as fontes em paralelo (`Promise.all`)
-- Falha ao ler `clients/data` (rede/permissão) mantém `clientsHydrated = false` e bloqueia sincronização financeira
+- Falha ao ler `clients/data` (rede/permissão) propaga erro e impede hidratação
 - Documento `clients/data` inexistente, mas consultado com sucesso, é **válido** e representa projeção vazia
 
-**Merge por ID estável:**
-- `mergeLegacyCustomers()` (já existente) faz o merge usando ID como chave primária
-- Nome normalizado é **apenas fallback de migração** para registros legados sem ID
+**Merge por ID estável (`mergeLegacyCustomers`):**
+- ID é chave primária; nome normalizado é **apenas fallback** para registros legados sem ID
 - `customers/{id}` fornece o `id` no campo LegacyCliente
 - `clients/data` fornece `contas`, `recebimentos`, `pendente`
+- Função pura, imutável — nunca altera os arrays de entrada
+- Rastreia objetos matched (não strings de nome) para evitar falsos positivos com nomes duplicados
 
-**Guard de escrita:**
-- `saveClientsToFirestore()` possui guarda `if(!clientsRemoteRead) return;`
-- Impede que dados do localStorage sobrescrevam `clients/data` antes da leitura remota
+**Guards de escrita (SyncGate):**
+- `saveClientsToFirestore()` possui guarda `if(!clientsRemoteRead.isOpen) return;` — impede escrita antes da leitura remota
+- `syncClientsToFirestore()` possui guarda `if(!clientsHydrated.isOpen) return;`
+- `syncMotoToFirestore()` possui guarda `if(!motoHydrated.isOpen) return;`
+- `saveMotoToFirestore()` possui guarda `if(!motoHydrated.isOpen) return;`
 
 **Risco de concorrência documentado:**
-- O documento agregado `clients/data` é **escrito por um único dispositivo por vez** (via `setDoc` com `merge: true`)
+- O documento agregado `clients/data` é escrito por um único dispositivo por vez (via `setDoc` com `merge: true`)
 - Dois dispositivos escrevendo simultaneamente podem causar perda de dados (último escritor vence)
-- Este risco é **aceito temporariamente** e será resolvido no cutover (DEC-017) quando cada cliente terá seu próprio documento `clients/{clientId}`
-- **Nenhum campo novo** é adicionado ao documento agregado — compatibilidade total com documentos antigos
+- Este risco é aceito temporariamente e será resolvido no cutover (DEC-017)
+- Nenhum campo novo é adicionado ao documento agregado — compatibilidade total com documentos antigos
+
+#### Precedência das fontes de verdade
+
+Hierarquia de dados (DEC-006, DEC-012):
+
+| Fonte | Conteúdo | Papel |
+|-------|----------|-------|
+| `customers/{id}` | nome, telefone, apelido, notas, status | Identidade/perfil |
+| `clients/data` | contas, recebimentos, pendente | Projeção financeira legada |
+| `localStorage` | todos os campos | Cache visual — **nunca** prevalece após leitura remota |
+
+- Após leitura remota bem-sucedida, os dados remotos prevalecem.
+- Em falha remota, o cache local (`localStorage`) é mantido visível, mutações são bloqueadas e nenhuma escrita é feita no Firestore.
+- `hydrateClientes()` NÃO faz um segundo merge com `localStorage` — substitui diretamente com o resultado do Firestore. Isso garante que valores remotos vazios (`contas:[]`, `recebimentos:[]`, `pendente:0`) prevaleçam sobre cache antigo.
+- `__applyRemoteClientes()` também substitui diretamente (sem merge com `localStorage`).
+- O merge via `mergeLegacyCustomers()` é usado apenas em `loadCustomersIntoPanel()` para combinar `customers/{id}` (perfil) com `clients/data` (financeiro) antes da hidratação.
+
+#### Escrita debounced no Firestore
+
+- `createFirestoreWriter()` (`src/shared/infrastructure/firestore-writer.ts`) é um módulo reutilizável extraído do `panel.js`.
+- Captura UID e snapshot imutável no agendamento (`schedule()`).
+- Antes de escrever, confirma que o UID atual ainda é o mesmo (previne escrita com UID errado após logout/troca de usuário).
+- Gate-aware: não escreve se o `SyncGate` estiver fechado.
+- Chamadas consecutivas do mesmo usuário resultam em apenas uma gravação com o snapshot mais recente (debounce 500ms).
+- `cancel()` interrompe escrita pendente.
+- Erros de `setDoc` são logados mas não propagados (não bloqueiam a UI).
+
+#### CRUD de clientes em duas fontes
+
+- `clienteSave` (criar/editar) escreve em `customers/{id}` via `window.__motoboyCustomers` (bridge) **antes** de atualizar o array local.
+- `deleteClient` remove de `customers/{id}` via bridge **antes** de remover do array local.
+- Em falha remota, a operação é abortada, o estado anterior é preservado e uma mensagem de erro é exibida ao usuário.
+- `newClient()` gera um ID estável (`cli-{timestamp}-{random}`) para registros locais.
+- Bridge (`panel-bridge.ts`) propaga erros — o chamador é responsável por tratar falhas.
+- `addPendingToClient()` agora chama `saveLocalState()` e `syncClientsToFirestore()` para garantir persistência.
+
+#### Modo offline
+
+- **Offline é somente leitura**: o cache local (`localStorage`) permite visualizar dados sem conexão, mas mutações são bloqueadas pelos guards até a hidratação concluir.
+- **Suporte offline com outbox (edição offline + sincronização posterior) é trabalho futuro** — não está implementado nesta decisão.
 
 ### Fluxo resultante
 
 ```
+main.ts → enterAuthenticatedApp():
+  1. bootstrapPanel()                             → inicializa com localStorage
+  2. hydration.loadFeature('clientes', loader)    → loading
+  3. hydration.loadFeature('moto', loader)        → loading (concorrente)
+
 loadCustomersIntoPanel():
   1. Promise.all([
        customersService.list(),          → customers/{id}[]
-       loadFinancialProjection()          → { clientes: LegacyCliente[] } | null
+       loadFinancialProjection()          → { clientes: LegacyCliente[] } | []
      ])
   2. mergeLegacyCustomers(profile, financial)  → MergeResult
   3. return loadOk(merged)
 
 hydrateClientes(merged):
   1. Recebe dados já merged do Firestore
-  2. Faz merge com localStorage (preserva offline mutations)
+  2. Substitui clientes diretamente (SEM merge com localStorage)
+     → garante que valores remotos vazios prevalecem sobre cache antigo
   3. syncClientBalance() em cada cliente
-  4. clientsHydrated = true
-  5. saveLocalState()
+  4. clientsRemoteRead.open() → habilita saveClientsToFirestore
+  5. clientsHydrated.open()   → habilita syncClientsToFirestore + interação
+  6. saveLocalState()
+
+Escrita debounced (após mutação do usuário):
+  1. createFirestoreWriter().schedule(snapshot)
+     → captura UID + snapshot no agendamento
+     → debounce 500ms consolida chamadas consecutivas
+  2. Timer dispara: confirma UID == uidNow
+  3. setDoc(doc(db, path), snapshot, { merge: true })
+  4. Em falha: loga erro, não propaga
+
+CRUD de clientes (criar/editar/excluir):
+  1. Bridge grava em customers/{id} via customersService
+  2. Em sucesso: atualiza array local + saveLocalState + syncClientsToFirestore
+  3. Em falha: aborta, preserva estado anterior, exibe toast de erro
+
+Retry (feature em estado failed):
+  1. Usuário tenta interagir → guard bloqueia
+  2. notifySyncing() detecta failed → __retryLoadFeature(feature)
+  3. HydrationManager.retryFeatureLoad() → re-executa loader
+  4. Sucesso: hidrata e transiciona para ok
+  5. Falha: mantém failed, próxima interação dispara novo retry
 ```
 
 ### Consequências
 
-- Projeção financeira de outros dispositivos é sincronizada no boot
-- `syncClientsToFirestore()` só grava após leitura remota bem-sucedida
-- Compatibilidade total com documentos antigos (sem migração destrutiva)
-- Risco de concorrência entre dispositivos aceito temporariamente, com resolução prevista no cutover
-- Nome normalizado permanece como fallback de migração, não como chave de identidade
+- Dados antigos do localStorage não podem mais sobrescrever dados atuais do Firestore durante o bootstrap.
+- Sincronização Firestore só ocorre após hidratação + mutação real do usuário.
+- Projeção financeira de outros dispositivos é sincronizada no boot.
+- `__applyRemoteMoto` e `__applyRemoteClientes` substituem diretamente (sem merge com `localStorage`) — a persistência é feita pelas funções de hidratação.
+- Modo offline é somente leitura — sem suporte a edição offline com outbox nesta fase.
+- Nenhuma alteração de schema, rules ou Functions. **Frontend requer build e deploy** (Vite build + hosting).
+- Risco de concorrência entre dispositivos aceito temporariamente, com resolução prevista no cutover (DEC-017).
+- Nome normalizado permanece como fallback de migração, não como chave de identidade.
+- Escrita debounced captura UID no agendamento e confirma antes de executar — impede escrita com UID errado após logout/troca de usuário.
+- CRUD de clientes propaga erros e preserva estado anterior em falha — sem dados corrompidos.
+- `newClient()` gera ID estável para migração futura de registros legados.
+- **Risco de concorrência não resolvido**: dois dispositivos escrevendo simultaneamente em `clients/data` causam perda de dados (último escritor vence). Outbox, operações atômicas ou transações ficam para o cutover (DEC-017).
+
+### Testes adicionados
+
+| Arquivo | Testes | Cobertura |
+|---------|--------|-----------|
+| `src/legacy/hydration-guards.test.ts` | 22 | Símbolos removidos, guards em todos os 10 handlers de mutação, padrão de retry (failed→retry, pending→no retry, ok→no retry) |
+| `src/legacy/panel-sync.test.ts` | 31 | Hidratação sem sync remoto, guards de sync, confirmação de rota, cancelamento condicional, SyncGate import/uso, merge por ID, clientsRemoteRead, substituição direta em hydrateClientes |
+| `src/features/customers/application/merge-legacy-customers.test.ts` | 17 | Associação por ID, fallback por nome, rename sem duplicação, desambiguação de nomes iguais, preservação de dados financeiros, imutabilidade, edge cases |
+| `src/shared/application/sync-gate.test.ts` | 17 | Estados do SyncGate, open/close, isOpen, integração com HydrationManager |
+| `src/features/customers/presentation/panel-bridge.test.ts` | 14 | customerToLegacy, loadCustomersIntoPanel com dual source, falha em clients/data, falha em customers, merge por ID, uid ausente |
+| `src/shared/infrastructure/firestore-writer.test.ts` | 13 | Debounce, consolidação, capture de UID, cancelamento, gate-aware, pathBuilder, erro de gravação |
+
+**P0 (race condition de dados):** Resolvido — todos os 660 testes passam (30 arquivos).
+
+### Arquivos alterados
+
+- `src/legacy/panel.js` — saveLocalState(), hidratação (substituição direta), guards, sync explícito, SyncGate, CRUD dual fonte, newClient com ID estável, writer debounced
+- `src/main.ts` — orquestração de hidratação via HydrationManager, bridges de retry/failed
+- `src/shared/application/hydration.ts` — HydrationManager (loadFeature, retryFeatureLoad, estado por feature)
+- `src/shared/application/sync-gate.ts` — SyncGate (controle de escrita open/close)
+- `src/shared/infrastructure/firestore-writer.ts` — **Novo**: writer debounced reutilizável (captura UID+snapshot, cancel, gate-aware)
+- `src/features/customers/application/merge-legacy-customers.ts` — função pura de merge por ID estável (usada apenas em loadCustomersIntoPanel)
+- `src/features/customers/presentation/panel-bridge.ts` — LoadResult, dual source, customerToLegacy com id, propagação de erros
+- `src/features/moto/presentation/panel-bridge.ts` — LoadResult, retorno de dados
+- `src/features/abastecimentos/presentation/panel-bridge.ts` — LoadResult
+- `src/features/manutencoes/presentation/panel-bridge.ts` — LoadResult
+- `src/features/faturamento/presentation/panel-bridge.ts` — LoadResult
+- `src/features/rotas/presentation/panel-bridge.ts` — LoadResult
+- `src/features/payments/presentation/panel-bridge.ts` — remoção de loadPaymentsIntoPanel
+- `src/features/income/presentation/panel-bridge.ts` — remoção de loadIncomeIntoPanel
+- `src/features/receivables/presentation/panel-bridge.ts` — remoção de loadReceivablesIntoPanel
+
+---
+
+## DEC-023 — Atomicidade e idempotência da confirmação de rota
+
+**Status:** Aprovada e implementada
+**Data:** 17/09/2026 (atualizada 18/09/2026 — transação atômica, upsert, UUID, ciclo de vida completo)
+
+### Contexto
+
+A confirmação de rota no `panel.js` (handler de `btnConfirmRoute`) executava um `for...of` + `await addPendingToClient()` que disparava uma `runTransaction` **separada** para cada serviço com pagamento pendente. Isso criava três problemas:
+
+1. **Confirmação parcial**: Se a transação N falhava após N-1 terem sido commitadas, pendências parciais ficavam no Firestore. Uma nova tentativa poderia duplicar as pendências já gravadas.
+2. **IDs não determinísticos**: `generateId()` era chamado *dentro* do callback da transação. O Firestore pode re-executar o callback em caso de contenção, gerando IDs diferentes a cada tentativa.
+3. **Sem mecanismo de retry real**: O `firestore-writer.ts` descartava o snapshot após falha, forçando uma nova mutação do usuário para reagendar.
+
+### Decisão
+
+#### Confirmação atômica (`applyRoutePendingsDual`)
+
+- Nova função `applyRoutePendingsDual(items, routeId)` em `client-writer.ts`:
+  - Executa **uma única `runTransaction`** para todas as pendências.
+  - Lê `clients/data` **uma vez**.
+  - Para cada item: encontra ou cria cliente, adiciona conta.
+  - Grava todos os perfis novos (`customers/{id}`) e `clients/data` **uma vez**.
+  - Retorna o array completo de clientes atualizados.
+- O `panel.js` substitui o `for...of` + `await addPendingToClient()` por uma chamada `await applyRoutePendingsDual(pendings, routeId)`.
+- Atualização de memória e interface ocorre **somente após o commit**.
+
+#### `serviceId` permanente por serviço
+
+- `newService()` gera um `serviceId` no formato `svc-{UUIDv4}` (UUID completo) uma única vez na criação do serviço.
+- `ensureServiceId(s)` gera e persiste o `serviceId` para serviços legados que ainda não possuem um — chamado antes de usar o `serviceId`.
+- O `serviceId` é estável: sobrevive a reordenação, remoção de outros serviços e reabertura do painel.
+- Incluído no `servicesSnapshot` persistido na rota confirmada.
+- Usado no `operationId` para idempotência.
+
+#### Idempotência por `operationId`
+
+- Cada pendência possui um `operationId` estritamente imutável: `${routeId}:${serviceId}`.
+- Nome, valor e descrição são **dados da operação**, não parte da identidade.
+- Dentro da transação, o writer verifica se já existe uma conta com o mesmo `operationId` no cliente:
+  - **Mesmo operationId + mesmo conteúdo**: ignorado (idempotente, sem duplicata).
+  - **Mesmo operationId + conteúdo diferente**: **conflito** — a operação é rejeitada com erro. Nunca cria duplicata nem sobrescreve silenciosamente.
+- `operationId` é pré-calculado *antes* de entrar no callback da transação.
+
+#### IDs pré-gerados
+
+- `generateId()` é chamado **antes** de `runTransaction`. O Firestore pode re-executar o callback; pré-gerar garante que o mesmo ID é usado em todas as tentativas.
+- Para múltiplos clientes novos no batch, cada nome único recebe um ID candidato pré-gerado. Se o mesmo nome aparece duas vezes, o mesmo ID é reutilizado.
+
+#### Retry do writer (`firestore-writer.ts`)
+
+- `FirestoreWriteHandle` agora inclui `retry()`.
+- Após falha de `setDoc`, o snapshot e UID são **preservados** (não são limpos).
+- `retry()` reenvia o snapshot preservado, verificando UID e gate.
+- `retry()` não executa se: UID mudou, gate fechado, ou há retry pendente.
+- Flag `retryPending` impede duas chamadas de `retry()` de criarem duas gravações.
+- `schedule()` com novo snapshot substitui o que falhou.
+- Sucesso limpa snapshot e estado de erro.
+
+#### Escopo da transação — pendências, não rota completa
+
+- Apenas as **pendências** (contas a receber) são atômicas via `applyRoutePendingsDual`.
+- A persistência da rota usa **duas fases** para garantir consistência:
+
+```
+Fase 1: Salvar rota como status:'pending' (persiste serviceIds)
+Fase 2: Executar applyRoutePendingsDual()
+Fase 3: Atualizar rota para status:'confirmed'
+```
+
+- **Fase 1** (save como pending): Se falha, a operação é abortada — nenhuma pendência é criada. Nenhum estado parcial.
+- **Fase 2** (pendências): Se falha, a rota permanece `pending` e pode ser retomada. As pendências NÃO foram criadas.
+- **Fase 3** (marcação confirmed): Se falha, as pendências já foram commitadas. A rota permanece `pending` — o retry re-executa Fase 2 com os mesmos `operationId`s (idempotente) e depois Fase 3.
+- `status` é um campo `'pending' | 'confirmed'` adicionado à interface `Rota` e à entidade Firestore.
+- Legado: rotas antigas sem `status` são tratadas como `'confirmed'` (default no `firestore-rota-repository.ts`).
+- A `Rota` interface agora inclui `status` obrigatório. `createRota()` retorna `status: 'confirmed'` (factory legada). `validateRota()` valida `status`.
+- **Intervalo de inconsistência residual**: Se Fase 3 falhar, a rota fica `pending` com pendências já gravadas. Retry re-executa Fase 2 (idempotente, sem duplicata) e Fase 3. O sistema sempre pode se recuperar.
+
+#### Localização do código
+
+- `client-writer.ts` movido de `src/shared/infrastructure/` para `src/features/customers/infrastructure/`, pois contém regras específicas de clientes (CRUD dual-fonte, pendências) e não é infraestrutura compartilhada.
+- `addPendingDual` removida — sem consumidores. A função de pendências individuais pode ser recriada futuramente se necessário, recebendo `operationId` ou `serviceId` explicitamente.
+- Ponte Rotas (`panel-bridge.ts`) agora propaga erros (não mais `catch` silencioso) — necessário para que o painel possa abortar pendências se a persistência da rota falhar.
+
+#### Ciclo de vida pending/confirmed
+
+- **Duplo clique**: `isConfirmingRoute` lock impede execução concorrente. Setado `true` antes do primeiro `await`, liberado no `finally`.
+- **Rota pendente salva localmente**: Após Fase 1 (save pending), upsert em `confirmedRoutes` + `saveLocalState()` são executados **antes** de Fase 2. Se Fase 2 falhar, a rota já está no array local e pode ser retomada.
+- **Upsert por routeId**: `confirmedRoutes.findIndex(r => r.id === routeId)` — se já existe, atualiza; se não, insere. Previne duplicatas em retries.
+- **Após Fase 3**: `confirmedRoutes[routeIdx].status = 'confirmed'` atualiza o mesmo registro no array local. `saveLocalState()` persiste a mudança no localStorage.
+- **Rota pending visível no histórico**: Card recebe classe `pending` (opaco, borda tracejada) e badge `Pendente`. `routeHistoryYears()` inclui rotas pending (visíveis no histórico).
+- **Rota pending excluída do dashboard**: Filtro `item.status !== 'pending'` na contagem de entregas do dia.
+- **Transição confirmed→pending rejeitada transacionalmente**: `firestore-rota-repository.ts` usa `runTransaction` para ler status existente e rejeitar downgrade atomicamente. Sem condição de corrida.
+- **routeId com UUID**: `rota-${crypto.randomUUID()}` — ID globalmente único, não depende de timing.
+- **Legado**: Rotas antigas sem `status` são tratadas como `confirmed` (default no `toEntity`).
+
+### Consequências
+
+- Pendências de rota são atômicas: ou todas são gravadas, ou nenhuma é.
+- Reexecução da mesma confirmação não duplica pendências (idempotência por `operationId` imutável).
+- Conflito entre confirmações é detectado e rejeitado (nunca sobrescreve silenciosamente).
+- IDs são estáveis mesmo com reexecução do callback da transação.
+- `serviceId` é UUID completo, permanente e incluído na rota persistida.
+- Serviços legados recebem `serviceId` via `ensureServiceId()` antes da confirmação.
+- Writer oferece retry real sem necessidade de nova mutação do usuário.
+- `client-writer.ts` vive na feature que o consome (`customers`).
+
+### Nota sobre contagem de testes
+
+O relatório original desta DEC-023 informou 18 testes para `firestore-writer.test.ts`. O baseline real era **15** (os 3 testes extras foram contados incorretamente). `addPendingDual` foi removida (7 testes removidos). Total: **720 testes** (31 arquivos). Contagem por arquivo: `client-writer.test.ts` 26, `firestore-writer.test.ts` 23, `panel-sync.test.ts` 55, outros 28 arquivos 616.
+
+### Testes adicionados
+
+| Arquivo | Testes | Cobertura |
+|---------|--------|-----------|
+| `client-writer.test.ts` | +9 | CRUD atômico, applyRoutePendingsDual: 1 tx, acumulação, falha, IDs estáveis, operationId duplicado ignorado, conflito detectado, retry sem duplicata, retry com valor alterado rejeitado, mistura existentes/novos, preservação de contas |
+| `firestore-writer.test.ts` | +8 | retry reenvia após falha, retry sem snapshot não faz nada, retry com UID mudado/gate fechado descartado, retry duplo 1 escrita, sucesso limpa estado, novo schedule substitui snapshot |
+| `panel-sync.test.ts` | +22 | confirmação usa applyRoutePendingsDual, sem addPendingToClient/addPendingDual, operationId imutável, UUID completo, servicesSnapshot com serviceId, ensureServiceId legado, rota salva como pending antes das pendências, falha ao salvar rota impede pendências, status atualizado para confirmed após sucesso, falha nas pendências mantém rota pending, marcação confirmed é feita somente após sucesso, isConfirmingRoute lock, finally libera lock, upsert por routeId, rota pending salva em confirmedRoutes antes das pendências (upsert), status atualizado no array após Fase 3, dashboard exclui pending, badge visual pending no histórico, transação runTransaction rejeita downgrade, UUID não usa Date.now(), routeHistoryYears inclui pending, retry persiste em saveLocalState |

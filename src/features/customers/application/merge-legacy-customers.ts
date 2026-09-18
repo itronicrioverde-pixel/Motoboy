@@ -1,14 +1,24 @@
 /**
- * Merge puro entre clientes remotos (Firestore) e clientes locais (localStorage).
+ * Merge puro entre clientes remotos (Firestore) e clientes locais.
+ *
+ * Fontes de verdade (DEC-022):
+ * - customers/{id}: identidade e perfil.
+ * - clients/data: contas, recebimentos e saldo pendente.
+ * - localStorage: somente cache visual.
  *
  * Regras:
  * - ID estável é a chave primária de associação.
  * - Nome normalizado é fallback apenas para registros legados sem ID.
  * - Dados financeiros locais (contas, recebimentos, pendente) são preservados
- *   quando o remoto não os carrega.
+ *   quando o remoto não os carrega (hasFinancialData = arrays não-vazios).
  * - Cliente remoto novo inicia sem dados financeiros locais.
- * - Cliente local sem correspondência remota é preservado intacto.
  * - Objetos recebidos nunca são mutados; novos objetos são criados.
+ *
+ * NOTA: Após leitura remota bem-sucedida, o resultado deste merge é
+ * considerado a verdade definitiva. A hidratação (hydrateClientes) NÃO
+ * deve fazer um segundo merge com localStorage — apenas substitui.
+ * Isso garante que valores remotos vazios (contas:[], recebimentos:[],
+ * pendente:0) prevaleçam sobre cache antigo.
  */
 
 export interface LegacyCliente {

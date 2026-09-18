@@ -6,12 +6,12 @@
 import {
   collection,
   doc,
-  setDoc,
   deleteDoc,
   getDocs,
   onSnapshot,
   query,
   orderBy,
+  runTransaction,
   type CollectionReference,
   type DocumentData,
   type QueryDocumentSnapshot,
@@ -73,6 +73,7 @@ function toEntity(snapshot: QueryDocumentSnapshot<DocumentData>): Rota {
     precoLitro: toNumber(d.precoLitro),
     aproximada: Boolean(d.aproximada),
     services: Array.isArray(d.services) ? d.services.map(toService) : [],
+    status: d.status === 'pending' ? 'pending' : 'confirmed',
   };
 }
 
@@ -97,8 +98,17 @@ export class FirestoreRotaRepository implements RotaRepository {
   }
 
   async save(rota: Rota): Promise<void> {
-    // grava o objeto inteiro; o id da rota vira o id do documento.
-    await setDoc(doc(this.collectionRef(), rota.id), rota);
+    const ref = doc(this.collectionRef(), rota.id);
+    await runTransaction(db, async (tx) => {
+      const existing = await tx.get(ref);
+      if(existing.exists()){
+        const data = existing.data();
+        if(rota.status === 'pending' && data.status === 'confirmed'){
+          throw new Error(`Rota ${rota.id} já está confirmada — não pode voltar para pending.`);
+        }
+      }
+      tx.set(ref, rota);
+    });
   }
 
   async remove(id: string): Promise<void> {

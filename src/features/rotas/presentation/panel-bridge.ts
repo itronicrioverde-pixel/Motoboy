@@ -22,20 +22,10 @@ declare global {
 export function installRotasBridge(): void {
   window.__motoboyRotas = {
     async save(rota) {
-      try {
-        await rotasService.save(rota);
-      } catch (error) {
-        console.error('[Rotas] Erro ao salvar:', error);
-        /* offline/erro: mantém o cache local */
-      }
+      await rotasService.save(rota);
     },
     async remove(id) {
-      try {
-        await rotasService.remove(id);
-      } catch (error) {
-        console.error('[Rotas] Erro ao remover:', error);
-        /* offline/erro: mantém o cache local */
-      }
+      await rotasService.remove(id);
     },
   };
 }

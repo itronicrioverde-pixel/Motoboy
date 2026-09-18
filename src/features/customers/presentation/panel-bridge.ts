@@ -9,6 +9,8 @@
  * loadCustomersIntoPanel() carrega ambas em paralelo, merge por ID estável,
  * e retorna o resultado unificado. Hidratação do painel é feita por main.ts
  * via __hydrateClientes.
+ *
+ * CRUD propaga erros — o chamador é responsável por tratar falhas.
  */
 
 import { doc, getDoc } from 'firebase/firestore';
@@ -36,45 +38,20 @@ declare global {
 export function installCustomersBridge(): void {
   window.__motoboyCustomers = {
     async list() {
-      try {
-        return await customersService.list();
-      } catch (error) {
-        console.error('[Clientes] Erro ao listar:', error);
-        return [];
-      }
+      return customersService.list();
     },
     async create(data) {
-      try {
-        const created = await customersService.create(data);
-        return created.id;
-      } catch (error) {
-        console.error('[Clientes] Erro ao criar:', error);
-        return '';
-      }
+      const created = await customersService.create(data);
+      return created.id;
     },
     async update(id, data) {
-      try {
-        await customersService.update(id, data);
-      } catch (error) {
-        console.error('[Clientes] Erro ao atualizar:', error);
-        /* offline/erro */
-      }
+      await customersService.update(id, data);
     },
     async archive(id) {
-      try {
-        await customersService.archive(id);
-      } catch (error) {
-        console.error('[Clientes] Erro ao arquivar:', error);
-        /* offline/erro */
-      }
+      await customersService.archive(id);
     },
     async remove(id) {
-      try {
-        await customersService.remove(id);
-      } catch (error) {
-        console.error('[Clientes] Erro ao remover:', error);
-        /* offline/erro */
-      }
+      await customersService.remove(id);
     },
   };
 }
@@ -123,7 +100,6 @@ export async function loadCustomersIntoPanel(): Promise<LoadResult<LegacyCliente
       customersService.list(),
       loadFinancialProjection().catch((error) => {
         console.error('[Clientes] Erro ao ler projeção financeira:', error);
-        // Falha ao ler clients/data propaga erro — impede hidratação.
         throw error;
       }),
     ]);

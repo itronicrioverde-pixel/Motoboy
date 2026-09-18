@@ -46,6 +46,7 @@ export interface Rota {
   precoLitro: number;
   aproximada: boolean;
   services: RotaService[];
+  status: 'pending' | 'confirmed';
 }
 
 export interface RotaRepository {
@@ -126,7 +127,8 @@ export type RotaErrorCode =
   | 'RECEBIDO_MISMATCH'
   | 'PENDENTE_MISMATCH'
   | 'RECEBIDO_PENDENTE_SUM_MISMATCH'
-  | 'RESULTADO_MISMATCH';
+  | 'RESULTADO_MISMATCH'
+  | 'INVALID_STATUS';
 
 export type RotaResult =
   | { readonly ok: true; readonly value: Rota }
@@ -442,6 +444,7 @@ export function createRota(input: NewRota): RotaResult {
         aproximada: Boolean(e.aproximada),
       })),
     })),
+    status: 'confirmed',
   };
   return { ok: true, value: rota };
 }
@@ -498,6 +501,9 @@ export function validateRota(rota: Rota): RotaValidation {
 
   if (!Array.isArray(rota.services) || rota.services.length === 0) {
     return err('EMPTY_SERVICES', 'Rota precisa de pelo menos um serviço.');
+  }
+  if (rota.status !== 'pending' && rota.status !== 'confirmed') {
+    return err('INVALID_STATUS', 'status deve ser "pending" ou "confirmed".');
   }
   if (rota.count !== countAllEntregas(rota.services)) {
     return err('COUNT_MISMATCH', `count não coincide com o total de entregas.`);

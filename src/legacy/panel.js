@@ -4,7 +4,9 @@ import { db } from '../config/firebase.js';
 import { doc, setDoc } from 'firebase/firestore';
 import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
-import { SyncGate } from '../shared/application/sync-gate';
+import { clientsRemoteRead, clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
+import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
+import { createClientDual, updateClientDual, removeClientDual, applyRoutePendingsDual } from '../features/customers/infrastructure/client-writer';
 
 export function bootstrapPanel() {
   // ---------- estado local do aplicativo ----------
@@ -290,41 +292,26 @@ export function bootstrapPanel() {
       : 'O navegador bloqueou o armazenamento local. Os dados durarão somente enquanto esta página estiver aberta.';
   }
 
-  let clientsSaveTimer = null;
-  const clientsRemoteRead = new SyncGate();
+  const clientsWriter = createFirestoreWriter(
+    (uid) => ['users', uid, 'clients', 'data'],
+    { gate: clientsRemoteRead, onError(err){ showToast('Erro ao sincronizar clientes no servidor.', {kind:'error'}); } },
+  );
   function saveClientsToFirestore(){
     if(!clientsRemoteRead.isOpen) return;
-    if(clientsSaveTimer) clearTimeout(clientsSaveTimer);
-    clientsSaveTimer = setTimeout(function(){
-      const uid = currentUid();
-      if(!uid || !Array.isArray(clientes)) return;
-      setDoc(doc(db, 'users', uid, 'clients', 'data'), { clientes: clientes }, { merge: true }).catch(function(err){
-        console.error('[Clientes] Erro ao salvar no Firestore:', err);
-      });
-    }, 500);
+    clientsWriter.schedule({ clientes: clientes });
   }
 
-  let motoSaveTimer = null;
-  // Hidratação: controla quando os dados remotos já foram aplicados ao estado.
-  // Antes da hidratação, ações que ALTERAM esses dados ficam bloqueadas (o cache
-  // local segue visível apenas em leitura). Nada é enfileirado: não simulamos
-  // suporte offline com uma fila falsa.
-  const motoHydrated = new SyncGate();
-  const clientsHydrated = new SyncGate();
+  const motoWriter = createFirestoreWriter(
+    (uid) => ['users', uid, 'moto', 'data'],
+    { gate: motoHydrated, onError(err){ showToast('Erro ao sincronizar dados da moto no servidor.', {kind:'error'}); } },
+  );
   function saveMotoToFirestore(){
     if(!motoHydrated.isOpen) return;
-    if(motoSaveTimer) clearTimeout(motoSaveTimer);
-    motoSaveTimer = setTimeout(function(){
-      const uid = currentUid();
-      if(!uid) return;
-      setDoc(doc(db, 'users', uid, 'moto', 'data'), {
-        currentKm: motoKm,
-        consumption: CONSUMO_ATUAL,
-        consumptionIsManual: consumoManualDefinido
-      }, { merge: true }).catch(function(err){
-        console.error('[Moto] Erro ao salvar no Firestore:', err);
-      });
-    }, 500);
+    motoWriter.schedule({
+      currentKm: motoKm,
+      consumption: CONSUMO_ATUAL,
+      consumptionIsManual: consumoManualDefinido
+    });
   }
 
   function saveLocalState(){
@@ -374,18 +361,14 @@ export function bootstrapPanel() {
         consumoManualDefinido = data.consumptionIsManual;
       }
     }
-    motoHydrated.open();
     saveLocalState();
   }
   function hydrateClientes(remoteClientes){
     if(clientsHydrated.isOpen) return;
     if(Array.isArray(remoteClientes)){
-      const result = mergeLegacyCustomers(remoteClientes, clientes);
-      clientes = result.merged;
+      clientes = remoteClientes;
       clientes.forEach(syncClientBalance);
     }
-    clientsRemoteRead.open();
-    clientsHydrated.open();
     saveLocalState();
   }
 
@@ -1951,7 +1934,8 @@ export function bootstrapPanel() {
   });
 
   function newEntrega(){ return { entrega:'', entregaCoords:null, distancia:null, tempo:null, valor:null, status:'idle', errorMsg:'', approx:false, approxConfirmed:false }; }
-  function newService(){ return { coleta:'', coletaCoords:null, cliente:'', paymentStatus:'received', entregas:[ newEntrega() ] }; }
+  function newService(){ return { serviceId:'svc-'+crypto.randomUUID(), coleta:'', coletaCoords:null, cliente:'', paymentStatus:'received', entregas:[ newEntrega() ] }; }
+  function ensureServiceId(s){ if(!s.serviceId) s.serviceId='svc-'+crypto.randomUUID(); return s; }
   let routeServices = [ newService() ];
   let confirmedRoutes = Array.isArray(localState.confirmedRoutes) ? localState.confirmedRoutes : [];
   let dragSrcIndex = null;
@@ -3106,11 +3090,11 @@ export function bootstrapPanel() {
       const result = routeHistoryResult(route);
       const resultClass = result === null ? '' : result > 0 ? 'positive' : result < 0 ? 'negative' : '';
       const detailsId = `route-history-details-${index}`;
-      return `<article class="route-history-card">
+      return `<article class="route-history-card${route.status === 'pending' ? ' pending' : ''}">
         <button type="button" class="route-history-summary" data-route-history-toggle aria-expanded="false" aria-controls="${detailsId}">
           <div class="route-history-head">
             <div>
-              <div class="route-history-title">${route.count || 0} entrega${route.count === 1 ? '' : 's'}</div>
+              <div class="route-history-title">${route.count || 0} entrega${route.count === 1 ? '' : 's'}${route.status === 'pending' ? ' · <span class="route-pending-badge">Pendente</span>' : ''}</div>
               <div class="route-history-date">${routeHistoryDate(route)}</div>
             </div>
             <span class="route-history-chevron" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></span>
@@ -3151,7 +3135,9 @@ export function bootstrapPanel() {
     });
   }
 
+  let isConfirmingRoute = false;
   document.getElementById('btnConfirmRoute').addEventListener('click', async () => {
+    if(isConfirmingRoute) return;
     const hasPending = routeServices.some(s => s.paymentStatus === 'pending');
     if(hasPending && !ensureClientesInteractive()) return;
     const confirmation = document.getElementById('routeConfirmation');
@@ -3173,6 +3159,7 @@ export function bootstrapPanel() {
       return;
     }
 
+    isConfirmingRoute = true;
     // distância real da rota inteira (cadeia sequencial), não a soma de trechos soltos
     const chain = await computeRouteChain();
     const totalKm = chain ? chain.totalKm : all.reduce((s, x) => s + (x.distancia || 0), 0);
@@ -3184,9 +3171,10 @@ export function bootstrapPanel() {
     const resultadoRota = custoCombustivel === null ? null : round2(valorTotal - custoCombustivel);
     let recebidoNaHora = 0;
     let pendenteTotal = 0;
-    const routeId = `rota-${Date.now()}`;
+    const routeId = `rota-${crypto.randomUUID()}`;
     const confirmedAt = new Date();
     const servicesSnapshot = routeServices.map(service => ({
+      serviceId:service.serviceId,
       coleta:service.coleta,
       cliente:service.cliente,
       paymentStatus:service.paymentStatus,
@@ -3200,16 +3188,22 @@ export function bootstrapPanel() {
       }))
     }));
 
-    routeServices.forEach(s => {
+    const pendingsToApply = [];
+    for(let si = 0; si < routeServices.length; si++){
+      const s = ensureServiceId(routeServices[si]);
       const totalServico = s.entregas.reduce((sum, e) => sum + (e.valor || 0), 0);
       if(s.paymentStatus === 'received'){
         recebidoNaHora += totalServico;
       }else{
         pendenteTotal += totalServico;
-        const nomeCliente = s.cliente.trim();
-        addPendingToClient(nomeCliente, totalServico, `Rota · ${s.entregas.length} entrega(s)`, routeId);
+        pendingsToApply.push({
+          operationId: `${routeId}:${s.serviceId}`,
+          nome: s.cliente.trim(),
+          valor: totalServico,
+          desc: `Rota · ${s.entregas.length} entrega(s)`,
+        });
       }
-    });
+    }
 
     const novaRota = {
       id:routeId,
@@ -3228,34 +3222,74 @@ export function bootstrapPanel() {
       consumoKmL:CONSUMO_ATUAL,
       precoLitro:PRECO_ATUAL,
       aproximada:Boolean(chain && chain.approx),
-      services:servicesSnapshot
+      services:servicesSnapshot,
+      status:'pending'
     };
-    confirmedRoutes.unshift(novaRota);
-    // Ponte: grava a rota no Firestore (por uid).
-    if(window.__motoboyRotas) window.__motoboyRotas.save(novaRota);
-    if(recebidoNaHora > 0){
-      entradas.unshift({ desc: `Rota confirmada · ${all.length} entrega(s)`, valor: recebidoNaHora, data: 'Hoje', dateISO:daysAgoISO(0), routeId });
-    }
 
-    saveLocalState();
-    // Sincroniza clientes somente se a rota criou contas pendentes.
-    if(pendenteTotal > 0){
-      syncClientsToFirestore();
-    }
-    initRouteHistoryFilters();
-    renderRouteHistory();
-    renderClientes();
-    renderFaturamento();
-    renderDashboard();
-    routeServices = [ newService() ];
-    renderServices();
-    renderRouteSummary();
+    try{
+      if(window.__motoboyRotas){
+        try{
+          await window.__motoboyRotas.save(novaRota);
+        }catch(err){
+          console.error('[Rota] Erro ao salvar rota (pending) no servidor:', err);
+          showToast('Erro ao salvar a rota no servidor. Tente novamente.', {kind:'error'});
+          return;
+        }
+      }
 
-    const confirmationMessage = document.getElementById('routeConfirmationMessage');
-    const viewClientsButton = document.getElementById('btnViewPendingClients');
-    confirmationMessage.innerHTML = pendenteTotal > 0
-      ? `<b>Rota confirmada</b>${fmtBRL(recebidoNaHora)} recebido e ${fmtBRL(pendenteTotal)} enviado para Clientes.`
-      : '<b>Rota confirmada</b>O valor recebido já entrou no resultado do mês.';
+      const existingIdx = confirmedRoutes.findIndex(r => r.id === routeId);
+      if(existingIdx >= 0){
+        confirmedRoutes[existingIdx] = novaRota;
+      }else{
+        confirmedRoutes.unshift(novaRota);
+      }
+      saveLocalState();
+
+      if(pendingsToApply.length > 0){
+        try{
+          const updatedClientes = await applyRoutePendingsDual(pendingsToApply, routeId);
+          clientes = updatedClientes;
+        }catch(err){
+          console.error('[Rota] Erro ao criar pendências:', err);
+          showToast('Erro ao salvar pendências no servidor. A rota ficou pendente e pode ser retomada.', {kind:'error'});
+          return;
+        }
+      }
+
+      novaRota.status = 'confirmed';
+      if(window.__motoboyRotas){
+        try{
+          await window.__motoboyRotas.save(novaRota);
+        }catch(err){
+          console.error('[Rota] Erro ao marcar rota como confirmada:', err);
+          showToast('Erro ao confirmar rota. Pendências já foram salvas — tentando novamente...', {kind:'error'});
+        }
+      }
+
+      const routeIdx = confirmedRoutes.findIndex(r => r.id === routeId);
+      if(routeIdx >= 0){
+        confirmedRoutes[routeIdx].status = 'confirmed';
+      }
+
+      if(recebidoNaHora > 0){
+        entradas.unshift({ desc: `Rota confirmada · ${all.length} entrega(s)`, valor: recebidoNaHora, data: 'Hoje', dateISO:daysAgoISO(0), routeId });
+      }
+
+      saveLocalState();
+      initRouteHistoryFilters();
+      renderRouteHistory();
+      renderClientes();
+      renderFaturamento();
+      renderDashboard();
+      routeServices = [ newService() ];
+      renderServices();
+      renderRouteSummary();
+
+      const confirmationMessage = document.getElementById('routeConfirmationMessage');
+      const viewClientsButton = document.getElementById('btnViewPendingClients');
+      confirmationMessage.innerHTML = pendenteTotal > 0
+        ? `<b>Rota confirmada</b>${fmtBRL(recebidoNaHora)} recebido e ${fmtBRL(pendenteTotal)} enviado para Clientes.`
+        : '<b>Rota confirmada</b>O valor recebido já entrou no resultado do mês.';
     viewClientsButton.style.display = pendenteTotal > 0 ? 'block' : 'none';
     // Botão "Iniciar Rota" na confirmação
     let startRouteBtn = document.getElementById('btnStartActiveRoute');
@@ -3274,6 +3308,9 @@ export function bootstrapPanel() {
       startActiveRouteMode();
     };
     confirmation.classList.add('open');
+    }finally{
+      isConfirmingRoute = false;
+    }
   });
 
   document.getElementById('btnViewPendingClients').addEventListener('click', () => setView('clientes'));
@@ -3400,10 +3437,6 @@ export function bootstrapPanel() {
   // ---------- clientes de coleta (saldo a receber / fiado) ----------
   let clientes = Array.isArray(localState.clientes) ? localState.clientes : [];
 
-  function newClient(nome){
-    return { nome, pendente:0, contas:[], recebimentos:[] };
-  }
-
   function syncClientBalance(cliente){
     cliente.contas = cliente.contas || [];
     cliente.recebimentos = cliente.recebimentos || [];
@@ -3414,28 +3447,10 @@ export function bootstrapPanel() {
   // Usa a mesma função pura de merge que a hidratação.
   window.__applyRemoteClientes = function(remoteClientes){
     if(!Array.isArray(remoteClientes)) return;
-    const result = mergeLegacyCustomers(remoteClientes, clientes);
-    clientes = result.merged;
+    clientes = remoteClientes;
     clientes.forEach(syncClientBalance);
+    saveLocalState();
   };
-
-  function addPendingToClient(nome, valor, desc, routeId){
-    let c = clientes.find(c => c.nome.toLowerCase() === nome.toLowerCase());
-    if(!c){ c = newClient(nome); clientes.push(c); }
-    c.contas = c.contas || [];
-    c.contas.unshift({
-      id:`conta-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      routeId,
-      desc,
-      valorOriginal:valor,
-      recebido:0,
-      saldo:valor,
-      status:'open',
-      data:'Hoje',
-      dateISO:daysAgoISO(0)
-    });
-    syncClientBalance(c);
-  }
 
   function clientesTotal(){ return clientes.reduce((s, c) => s + c.pendente, 0); }
 
@@ -3630,20 +3645,27 @@ export function bootstrapPanel() {
     requestDeleteConfirmation(
       'Excluir cliente?',
       `${cliente.nome} será removido da lista de clientes.`,
-      () => {
+      async () => {
         const currentIndex = clientes.indexOf(cliente);
         if(currentIndex < 0) return;
+        if(cliente.id){
+          try { await removeClientDual(cliente.id); }
+          catch(err){
+            console.error('[Clientes] Erro ao remover:', err);
+            showToast('Erro ao excluir no servidor. Tente novamente.', {kind:'error'});
+            return;
+          }
+        }
         clientes.splice(currentIndex, 1);
         if(editingClientIndex === currentIndex) resetClientFormMode();
         saveLocalState();
-        syncClientsToFirestore();
         renderClientes();
         renderDashboard();
       }
     );
   }
   document.getElementById('btnOpenCliente').addEventListener('click', resetClientFormMode);
-  document.getElementById('clienteSave').addEventListener('click', () => {
+  document.getElementById('clienteSave').addEventListener('click', async () => {
     if(!ensureClientesInteractive()) return;
     const nome = document.getElementById('clienteNome').value.trim();
     if(!nome){ showToast('Digita o nome do cliente.', {kind:'warning'}); return; }
@@ -3654,6 +3676,14 @@ export function bootstrapPanel() {
     const previous = editingClientIndex === null ? null : clientes[editingClientIndex];
     if(previous){
       const oldName = previous.nome;
+      if(previous.id){
+        try { await updateClientDual(previous.id, { name: nome }); }
+        catch(err){
+          console.error('[Clientes] Erro ao atualizar:', err);
+          showToast('Erro ao salvar no servidor. Tente novamente.', {kind:'error'});
+          return;
+        }
+      }
       previous.nome = nome;
       entradas.forEach(entry => {
         if(entry.clientName !== oldName) return;
@@ -3664,10 +3694,17 @@ export function bootstrapPanel() {
         if(service.cliente === oldName) service.cliente = nome;
       });
     }else{
-      clientes.push(newClient(nome));
+      let remoteId = '';
+      try { remoteId = await createClientDual({ name: nome }); }
+      catch(err){
+        console.error('[Clientes] Erro ao criar:', err);
+        showToast('Erro ao salvar no servidor. Tente novamente.', {kind:'error'});
+        return;
+      }
+      const newC = { id: remoteId, nome, pendente:0, contas:[], recebimentos:[] };
+      clientes.push(newC);
     }
     saveLocalState();
-    syncClientsToFirestore();
     renderClientes();
     renderFaturamento();
     renderDashboard();
@@ -3728,7 +3765,7 @@ export function bootstrapPanel() {
     chartStatusEl.className = 'dashboard-chart-status' + (result < 0 ? ' negative' : result === 0 ? ' balanced' : '');
 
     const todayKey = toISODateLocal(APP_NOW);
-    const routesToday = confirmedRoutes.filter(item => item.dateISO === todayKey);
+    const routesToday = confirmedRoutes.filter(item => item.dateISO === todayKey && item.status !== 'pending');
     document.getElementById('dashboardDeliveriesToday').textContent = routesToday.reduce((total, item) => total + item.count, 0);
 
     const [year, month] = monthKey.split('-').map(Number);

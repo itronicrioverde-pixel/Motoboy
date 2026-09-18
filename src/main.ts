@@ -33,7 +33,7 @@ import {
 } from './features/moto/presentation/panel-bridge';
 import { bootstrapPanel } from './legacy/panel.js';
 import type { AuthUser } from './features/auth/domain/auth-user';
-import { createHydrationManager } from './shared/application/hydration';
+import { createPanelHydration } from './shared/application/panel-hydration';
 
 // Chaves de estado local do painel (hoje ele guarda os dados em localStorage).
 const PANEL_STATE_KEYS = ['motoboy-front-etapa1-v2-clean'];
@@ -106,7 +106,24 @@ installMotoBridge();
 let panelStarted = false;
 
 // ---------- Hidratação por feature ----------
-const hydration = createHydrationManager();
+const { hydration, featureLoaders, retryFeatureLoad } = createPanelHydration(
+  () => loadCustomersIntoPanel(),
+  () => loadMotoIntoPanel(),
+  (data) => {
+    const hydrate = window.__hydrateClientes;
+    if (typeof hydrate !== 'function') {
+      throw new Error('[Boot] Ponte de hidratação de clientes indisponível.');
+    }
+    hydrate(data as LegacyCliente[]);
+  },
+  (data) => {
+    const hydrate = window.__hydrateMoto;
+    if (typeof hydrate !== 'function') {
+      throw new Error('[Boot] Ponte de hidratação de moto indisponível.');
+    }
+    hydrate(data as MotoData);
+  },
+);
 
 // Ponte para o painel legado: hidratação individual e controle de estado.
 declare global {
@@ -126,40 +143,6 @@ type LegacyCliente = { id?: string; nome: string; pendente: number; contas: unkn
 
 // Tipo de dados da moto que o painel espera.
 type MotoData = { currentKm: number; consumption: number; consumptionIsManual: boolean };
-
-// Mapa de loaders: cada feature tem seu loader e sua função de hidratação.
-// Sem índices mágicos — cada resultado é acessado por nome claro.
-const featureLoaders = {
-  clientes: {
-    load: () => loadCustomersIntoPanel(),
-    hydrate: (data: unknown) => {
-      const hydrate = window.__hydrateClientes;
-      if (typeof hydrate !== 'function') {
-        throw new Error('[Boot] Ponte de hidratação de clientes indisponível.');
-      }
-      hydrate(data as LegacyCliente[]);
-    },
-  },
-  moto: {
-    load: () => loadMotoIntoPanel(),
-    hydrate: (data: unknown) => {
-      const hydrate = window.__hydrateMoto;
-      if (typeof hydrate !== 'function') {
-        throw new Error('[Boot] Ponte de hidratação de moto indisponível.');
-      }
-      hydrate(data as MotoData);
-    },
-  },
-} as const;
-
-/**
- * Retenta o carregamento de uma feature que falhou.
- * Delega ao hydration manager — bloqueia retries concorrentes.
- * Não há fila a processar: a interação permanece bloqueada até a hidratação.
- */
-function retryFeatureLoad(feature: 'clientes' | 'moto'): void {
-  void hydration.retryFeatureLoad(feature, featureLoaders[feature]);
-}
 
 /**
  * Entrada autenticada única. Inicializa o painel legado uma só vez, apenas para
