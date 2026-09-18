@@ -71,7 +71,7 @@ describe('guardas de interação presentes em todos os handlers de mutação', (
   });
 
   it('btnConfirmRoute com pendentes bloqueado por ensureClientesInteractive', () => {
-    const match = panelSrc.match(/btnConfirmRoute.*?addEventListener\('click',\s*async\s*\(\)\s*=>\s*\{([^}]{0,400})/s);
+    const match = panelSrc.match(/document\.getElementById\('btnConfirmRoute'\)\.addEventListener\('click',\s*async\s*\(\)\s*=>\s*\{([^}]{0,1000})/s);
     expect(match).not.toBeNull();
     expect(match![1]).toContain('ensureClientesInteractive');
   });

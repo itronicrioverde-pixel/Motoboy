@@ -20,38 +20,12 @@ import { db } from '../../../config/firebase.js';
 import type {
   Rota,
   RotaRepository,
-  RotaService,
-  RotaEntrega,
 } from '../domain/rota';
-
-function toNumber(value: unknown, fallback = 0): number {
-  const n = typeof value === 'number' ? value : Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-function toNumberOrNull(value: unknown): number | null {
-  if (value === null || value === undefined || value === '') return null;
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function toEntrega(raw: DocumentData): RotaEntrega {
-  return {
-    endereco: String(raw?.endereco ?? ''),
-    valor: toNumber(raw?.valor),
-    distancia: toNumberOrNull(raw?.distancia),
-    tempo: toNumberOrNull(raw?.tempo),
-    aproximada: Boolean(raw?.aproximada),
-  };
-}
-function toService(raw: DocumentData): RotaService {
-  return {
-    coleta: String(raw?.coleta ?? ''),
-    cliente: String(raw?.cliente ?? ''),
-    paymentStatus: String(raw?.paymentStatus ?? ''),
-    valorTotal: toNumber(raw?.valorTotal),
-    entregas: Array.isArray(raw?.entregas) ? raw.entregas.map(toEntrega) : [],
-  };
-}
+import {
+  toNumber,
+  toNumberOrNull,
+  toRotaService,
+} from './firestore-rota-mappers';
 
 function toEntity(snapshot: QueryDocumentSnapshot<DocumentData>): Rota {
   const d = snapshot.data();
@@ -72,7 +46,7 @@ function toEntity(snapshot: QueryDocumentSnapshot<DocumentData>): Rota {
     consumoKmL: toNumber(d.consumoKmL),
     precoLitro: toNumber(d.precoLitro),
     aproximada: Boolean(d.aproximada),
-    services: Array.isArray(d.services) ? d.services.map(toService) : [],
+    services: Array.isArray(d.services) ? d.services.map(toRotaService) : [],
     status: d.status === 'pending' ? 'pending' : 'confirmed',
   };
 }

@@ -21,14 +21,18 @@
  * Se o mesmo operationId aparece com conteúdo diferente, a operação
  * é rejeitada como conflito — nunca cria duplicata nem sobrescreve
  * silenciosamente.
+ *
+ * Regras de CRUD:
+ * - Todas as leituras acontecem antes das escritas no callback.
+ * - Nenhuma Promise Firestore fica sem await.
+ * - Operações de escrita usam tx.set/tx.update/tx.delete (nunca funções externas).
+ * - Callback pode ser repetido pelo Firestore sem gerar IDs ou efeitos diferentes.
  */
 
 import {
   doc,
   collection,
   runTransaction,
-  updateDoc,
-  deleteDoc,
 } from 'firebase/firestore';
 import { db } from '../../../config/firebase.js';
 import { currentUid } from '../../auth/application/auth-service';
@@ -46,6 +50,13 @@ export interface UpdateClientInput {
   readonly phone?: string;
   readonly nickname?: string;
   readonly notes?: string;
+  /** Nome antigo para localizar cliente legado sem ID. Obrigatório quando id é vazio. */
+  readonly legacyLookupName?: string;
+}
+
+export interface RemoveClientOptions {
+  /** Nome do cliente legado para localizar. Obrigatório quando id é vazio. */
+  readonly legacyLookupName?: string;
 }
 
 export interface RoutePendingItem {
@@ -150,43 +161,106 @@ export async function createClientDual(input: CreateClientInput): Promise<string
 /**
  * Atualiza perfil em customers/{id} e nome na projeção financeira.
  * Ambas as escritas são atômicas.
+ *
+ * Se o cliente não tem ID (legado), executa migração transacional:
+ * - Gera um ID estável (pré-gerado antes da transação)
+ * - Cria customers/{id}
+ * - Atualiza clients/data com o novo ID
+ *
+ * Para localizar legado sem ID, use legacyLookupName (nome antigo).
+ * Rejeita se múltiplos clientes legados compartilham o mesmo nome.
+ * Retorna o ID resolvido (original ou migrado).
  */
 export async function updateClientDual(
   id: string,
   input: UpdateClientInput,
-): Promise<void> {
+): Promise<string> {
   const uid = currentUid();
   if (!uid) throw new Error('Sem usuário autenticado.');
+
+  if (!id && !input.legacyLookupName) {
+    throw new Error('legacyLookupName é obrigatório para edição de cliente sem ID.');
+  }
+
+  const migrationId = !id ? generateId(uid) : null;
+  let resolvedId = id;
 
   await runTransaction(db, async (tx) => {
     const clientsSnap = await tx.get(clientsDoc(uid));
     const existing: LegacyCliente[] = clientsSnap.exists()
       ? (clientsSnap.data().clientes as LegacyCliente[] ?? [])
       : [];
+
+    const lookupName = (input.legacyLookupName || input.name || '').toLowerCase();
+    const matchedLegacy = !id
+      ? existing.filter((c) => !c.id && c.nome.toLowerCase() === lookupName)
+      : [];
+
+    if (!id && matchedLegacy.length === 0) {
+      throw new Error(`Nenhum cliente legado encontrado com nome "${input.legacyLookupName}".`);
+    }
+    if (!id && matchedLegacy.length > 1) {
+      throw new Error(
+        `Conflito: existem ${matchedLegacy.length} clientes legados com nome "${input.legacyLookupName}". ` +
+        `Edição não é possível — resolva manualmente no Firestore.`,
+      );
+    }
 
     const patch: Record<string, unknown> = {};
     if (input.name !== undefined) patch.name = input.name;
     if (input.phone !== undefined) patch.phone = input.phone ?? null;
     if (input.nickname !== undefined) patch.nickname = input.nickname ?? null;
     if (input.notes !== undefined) patch.notes = input.notes ?? null;
-    if (Object.keys(patch).length > 0) {
-      updateDoc(doc(usersCol(uid), id), patch);
+
+    if (id) {
+      if (Object.keys(patch).length > 0) {
+        tx.update(doc(usersCol(uid), id), patch);
+      }
+    } else {
+      const rid = migrationId!;
+      resolvedId = rid;
+      tx.set(doc(usersCol(uid), rid), {
+        name: input.name ?? '',
+        phone: input.phone ?? null,
+        nickname: input.nickname ?? null,
+        notes: input.notes ?? null,
+        status: 'active',
+      });
     }
 
-    const updated = existing.map((c) =>
-      c.id === id && input.name !== undefined ? { ...c, nome: input.name } : c,
-    );
+    const currentId = id || migrationId!;
+    const updated = existing.map((c) => {
+      const matchesId = id && c.id === id;
+      const matchesLegacy = !id && !c.id && c.nome.toLowerCase() === lookupName;
+      if (matchesId || matchesLegacy) {
+        const merged = { ...c, id: currentId };
+        if (input.name !== undefined) merged.nome = input.name;
+        return merged;
+      }
+      return c;
+    });
 
     tx.set(clientsDoc(uid), { clientes: updated }, { merge: true });
   });
+
+  return resolvedId!;
 }
 
 /**
  * Remove cliente de ambas as fontes atomicamente.
+ *
+ * Se o cliente não tem ID (legado), use options.legacyLookupName para localizar.
+ * Rejeita se nenhum ou múltiplos clientes legados correspondem.
+ * Remove a entrada financeira em clients/data.
+ * Se existir customers/{id}, remove também.
  */
-export async function removeClientDual(id: string): Promise<void> {
+export async function removeClientDual(id: string, options?: RemoveClientOptions): Promise<void> {
   const uid = currentUid();
   if (!uid) throw new Error('Sem usuário autenticado.');
+
+  if (!id && !options?.legacyLookupName) {
+    throw new Error('legacyLookupName é obrigatório para exclusão de cliente sem ID.');
+  }
 
   await runTransaction(db, async (tx) => {
     const clientsSnap = await tx.get(clientsDoc(uid));
@@ -194,9 +268,35 @@ export async function removeClientDual(id: string): Promise<void> {
       ? (clientsSnap.data().clientes as LegacyCliente[] ?? [])
       : [];
 
-    deleteDoc(doc(usersCol(uid), id));
+    let resolvedId = id;
+    let target: LegacyCliente | undefined;
 
-    const filtered = existing.filter((c) => c.id !== id);
+    if (id) {
+      target = existing.find((c) => c.id === id);
+    } else {
+      const lookupName = options!.legacyLookupName!.toLowerCase();
+      const matched = existing.filter((c) => !c.id && c.nome.toLowerCase() === lookupName);
+      if (matched.length === 0) {
+        throw new Error(`Nenhum cliente legado encontrado com nome "${options!.legacyLookupName}".`);
+      }
+      if (matched.length > 1) {
+        throw new Error(
+          `Conflito: existem ${matched.length} clientes legados com nome "${options!.legacyLookupName}". ` +
+          `Exclusão não é possível — resolva manualmente no Firestore.`,
+        );
+      }
+      target = matched[0];
+      resolvedId = target.id || '';
+    }
+
+    if (resolvedId) {
+      tx.delete(doc(usersCol(uid), resolvedId));
+    }
+
+    const filtered = existing.filter((c) => {
+      if (id) return c.id !== id;
+      return !(c.nome.toLowerCase() === options!.legacyLookupName!.toLowerCase() && !c.id);
+    });
     tx.set(clientsDoc(uid), { clientes: filtered }, { merge: true });
   });
 }

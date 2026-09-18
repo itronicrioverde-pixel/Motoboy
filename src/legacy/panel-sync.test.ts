@@ -20,6 +20,12 @@ const panelSource = readFileSync(PANEL_PATH, 'utf-8');
 const REPO_PATH = resolve(__dirname, '../features/rotas/infrastructure/firestore-rota-repository.ts');
 const repoSource = readFileSync(REPO_PATH, 'utf-8');
 
+const ORCHESTRATOR_PATH = resolve(
+  __dirname,
+  '../features/rotas/application/route-confirmation-orchestrator.ts',
+);
+const orchestratorSource = readFileSync(ORCHESTRATOR_PATH, 'utf-8');
+
 describe('panel.js — propriedades estáticas', () => {
   describe('ausência de motoRemoteLoaded', () => {
     it('variável motoRemoteLoaded não existe no código', () => {
@@ -116,181 +122,111 @@ describe('panel.js — propriedades estáticas', () => {
     });
   });
 
-  describe('confirmação de rota — sem sync de moto', () => {
-    it('fluxo de confirmação não chama syncMotoToFirestore', () => {
-      const confirmStart = panelSource.indexOf('confirmedRoutes.unshift(novaRota)');
-      const confirmEnd = panelSource.indexOf('const confirmationMessage', confirmStart);
-      expect(confirmStart).toBeGreaterThan(-1);
-      expect(confirmEnd).toBeGreaterThan(confirmStart);
-      const confirmBlock = panelSource.slice(confirmStart, confirmEnd);
-      expect(confirmBlock).not.toContain('syncMotoToFirestore');
+  describe('confirmação de rota — orquestrador de produção', () => {
+    it('panel delega a máquina de estados ao módulo application', () => {
+      expect(panelSource).toContain('createRouteConfirmationOrchestrator');
+      expect(panelSource).toContain('routeConfirmationOrchestrator.confirm(request)');
+      expect(panelSource).not.toContain('isConfirmingRoute');
     });
 
-    it('confirmação de rota não chama syncClientsToFirestore (applyRoutePendingsDual é atômico)', () => {
-      const confirmStart = panelSource.indexOf('confirmedRoutes.unshift(novaRota)');
-      const confirmEnd = panelSource.indexOf('const confirmationMessage', confirmStart);
-      const confirmBlock = panelSource.slice(confirmStart, confirmEnd);
-      expect(confirmBlock).not.toContain('syncClientsToFirestore');
+    it('orquestrador não depende de Firebase, DOM ou localStorage', () => {
+      expect(orchestratorSource).not.toContain('firebase');
+      expect(orchestratorSource).not.toContain('document.');
+      expect(orchestratorSource).not.toContain('window.');
+      expect(orchestratorSource).not.toContain('localStorage');
     });
 
-    it('confirmação de rota usa applyRoutePendingsDual para pendências', () => {
-      const confirmStart = panelSource.indexOf('btnConfirmRoute');
-      const confirmEnd = panelSource.indexOf('const confirmationMessage', confirmStart);
-      const confirmBlock = panelSource.slice(confirmStart, confirmEnd);
-      expect(confirmBlock).toContain('applyRoutePendingsDual');
+    it('lock é adquirido no módulo e liberado em finally', () => {
+      expect(orchestratorSource).toContain('if (locked)');
+      expect(orchestratorSource).toContain('locked = true');
+      expect(orchestratorSource).toMatch(/finally\s*\{\s*locked = false/);
     });
 
-    it('confirmação de rota não usa addPendingToClient nem addPendingDual', () => {
-      const confirmStart = panelSource.indexOf('btnConfirmRoute');
-      const confirmEnd = panelSource.indexOf('const confirmationMessage', confirmStart);
-      const confirmBlock = panelSource.slice(confirmStart, confirmEnd);
-      expect(confirmBlock).not.toContain('addPendingToClient');
-      expect(confirmBlock).not.toContain('addPendingDual');
+    it('operationId usa somente routeId + serviceId', () => {
+      expect(orchestratorSource).toContain('`${route.id}:${serviceId}`');
+      expect(orchestratorSource).not.toMatch(/operationId:\s*`[^`]*cliente/);
+      expect(orchestratorSource).not.toMatch(/operationId:\s*`[^`]*valor/);
     });
 
-    it('confirmação de rota gera operationId estável por serviço (usa serviceId, não índice)', () => {
-      expect(panelSource).toContain('s.serviceId');
-      expect(panelSource).not.toContain(':svc-${si}');
-    });
-
-    it('newService() gera serviceId com UUID completo', () => {
+    it('newService gera serviceId permanente com UUID', () => {
       expect(panelSource).toMatch(/function\s+newService\s*\(\)\s*\{.*svc-.*crypto\.randomUUID\(\)/);
+      expect(panelSource).toContain('generateServiceId: () => `svc-${crypto.randomUUID()}`');
     });
 
-    it('servicesSnapshot inclui serviceId', () => {
-      const snapshotStart = panelSource.indexOf('const servicesSnapshot');
-      const snapshotEnd = panelSource.indexOf('};', snapshotStart);
-      const snapshotBlock = panelSource.slice(snapshotStart, snapshotEnd);
-      expect(snapshotBlock).toContain('serviceId:service.serviceId');
-    });
-
-    it('ensureServiceId gera serviceId para serviços legados', () => {
-      expect(panelSource).toContain('function ensureServiceId');
-      expect(panelSource).toMatch(/if\s*\(\s*!\s*s\.serviceId\s*\)/);
-    });
-
-    it('operationId usa apenas routeId:serviceId (imutável)', () => {
-      const pendingsBlock = panelSource.indexOf('pendingsToApply.push');
-      const pendingsEnd = panelSource.indexOf('});', pendingsBlock);
-      const pushBlock = panelSource.slice(pendingsBlock, pendingsEnd);
-      expect(pushBlock).toContain('`${routeId}:${s.serviceId}`');
-      expect(pushBlock).not.toMatch(/:\$\{.*\.cliente/);
-      expect(pushBlock).not.toMatch(/:\$\{.*\.valor/);
-    });
-
-    it('rota é salva como pending antes das pendências (serviceId persistido antes da transação)', () => {
-      const pendingSaveIdx = panelSource.indexOf("status:'pending'");
-      expect(pendingSaveIdx).toBeGreaterThan(-1);
-      const pendingsPos = panelSource.indexOf('await applyRoutePendingsDual(');
-      expect(pendingsPos).toBeGreaterThan(-1);
-      expect(pendingSaveIdx).toBeLessThan(pendingsPos);
-    });
-
-    it('após pendências bem-sucedidas, rota é atualizada como confirmed', () => {
-      const pendingsPos = panelSource.indexOf('await applyRoutePendingsDual(');
-      const confirmUpdateIdx = panelSource.indexOf("status = 'confirmed'", pendingsPos);
-      expect(confirmUpdateIdx).toBeGreaterThan(pendingsPos);
-      const secondSaveIdx = panelSource.indexOf('await window.__motoboyRotas.save(novaRota)', confirmUpdateIdx);
-      expect(secondSaveIdx).toBeGreaterThan(confirmUpdateIdx);
-    });
-
-    it('falha ao salvar rota (pending) impede criação de pendências', () => {
-      const pendingsIdx = panelSource.indexOf('applyRoutePendingsDual(');
-      const firstSaveIdx = panelSource.indexOf('window.__motoboyRotas.save(novaRota)');
-      expect(firstSaveIdx).toBeGreaterThan(-1);
-      expect(pendingsIdx).toBeGreaterThan(firstSaveIdx);
-      const region = panelSource.slice(firstSaveIdx, pendingsIdx);
-      expect(region).toContain('return;');
-    });
-
-    it('falha nas pendências mantém rota como pending (não marked confirmed)', () => {
-      const pendingsIdx = panelSource.indexOf('applyRoutePendingsDual(');
-      const tryPendings = panelSource.lastIndexOf('try{', pendingsIdx) !== -1
-        ? panelSource.lastIndexOf('try{', pendingsIdx)
-        : panelSource.lastIndexOf('try {', pendingsIdx);
-      expect(tryPendings).toBeGreaterThan(-1);
-      const catchPendings = panelSource.indexOf('}catch(err){', tryPendings);
-      const confirmIdx = panelSource.indexOf("novaRota.status = 'confirmed'");
-      expect(catchPendings).toBeGreaterThan(tryPendings);
-      expect(confirmIdx).toBeGreaterThan(catchPendings);
-    });
-
-    it('marcação confirmed é feita somente após sucesso das pendências', () => {
-      const pendingsEnd = panelSource.indexOf('applyRoutePendingsDual(pendingsToApply, routeId)');
-      const confirmIdx = panelSource.indexOf("novaRota.status = 'confirmed'", pendingsEnd);
-      expect(confirmIdx).toBeGreaterThan(pendingsEnd);
-    });
-
-    it('rota já confirmada não reaplica pendências (idempotência)', () => {
-      expect(panelSource).toContain("novaRota.status = 'confirmed'");
-      expect(panelSource).toContain("status:'pending'");
-    });
-
-    it('duplo clique gera uma única confirmação (isConfirmingRoute lock)', () => {
-      expect(panelSource).toContain('isConfirmingRoute');
-      expect(panelSource).toMatch(/if\s*\(\s*isConfirmingRoute\s*\)\s*return/);
-    });
-
-    it('isConfirmingRoute é liberado no finally', () => {
-      const finallyIdx = panelSource.indexOf('}finally{');
-      expect(finallyIdx).toBeGreaterThan(-1);
-      const finallyBlock = panelSource.slice(finallyIdx, finallyIdx + 100);
-      expect(finallyBlock).toContain('isConfirmingRoute = false');
-    });
-
-    it('rota pending é salva em confirmedRoutes antes das pendências (upsert)', () => {
-      const pendingsIdx = panelSource.indexOf('applyRoutePendingsDual(');
-      const upsertIdx = panelSource.indexOf('confirmedRoutes.findIndex(r => r.id === routeId)', pendingsIdx - 600);
-      expect(upsertIdx).toBeGreaterThan(-1);
-      expect(upsertIdx).toBeLessThan(pendingsIdx);
-    });
-
-    it('upsert por routeId evita duplicatas no array', () => {
-      expect(panelSource).toContain('confirmedRoutes.findIndex(r => r.id === routeId)');
-      expect(panelSource).toContain('confirmedRoutes[existingIdx] = novaRota');
-    });
-
-    it('após Fase 3, status é atualizado no array local', () => {
-      const fase3Idx = panelSource.indexOf("novaRota.status = 'confirmed'");
-      const arrayUpdateIdx = panelSource.indexOf("confirmedRoutes[routeIdx].status = 'confirmed'", fase3Idx);
-      expect(arrayUpdateIdx).toBeGreaterThan(fase3Idx);
-    });
-
-    it('rota pending não entra na contagem de entregas do dashboard', () => {
-      const dashIdx = panelSource.indexOf("routesToday = confirmedRoutes.filter");
-      expect(dashIdx).toBeGreaterThan(-1);
-      const filterBlock = panelSource.slice(dashIdx, dashIdx + 120);
-      expect(filterBlock).toContain("status !== 'pending'");
-    });
-
-    it('rota pending recebe badge visual no histórico', () => {
-      expect(panelSource).toContain('route-pending-badge');
-      expect(panelSource).toContain("Pendente");
-    });
-
-    it('transição confirmed→pending é rejeitada transacionalmente no Firestore', () => {
-      expect(repoSource).toContain('runTransaction');
-      expect(repoSource).toContain("já está confirmada — não pode voltar para pending");
-    });
-
-    it('routeId usa crypto.randomUUID() (não Date.now())', () => {
-      expect(panelSource).toContain('rota-${crypto.randomUUID()}');
+    it('routeId usa UUID e não Date.now', () => {
+      expect(panelSource).toContain('generateRouteId: () => `rota-${crypto.randomUUID()}`');
       expect(panelSource).not.toContain('rota-${Date.now()}');
     });
 
-    it('rota pending persiste em saveLocalState para retry após recarga', () => {
-      const pendingsIdx = panelSource.indexOf('applyRoutePendingsDual(');
-      const saveIdx = panelSource.indexOf('saveLocalState()', pendingsIdx - 300);
-      expect(saveIdx).toBeGreaterThan(-1);
-      expect(saveIdx).toBeLessThan(pendingsIdx);
+    it('retry do botão principal reutiliza tentativa pending', () => {
+      expect(panelSource).toContain('activePendingRouteId');
+      expect(panelSource).toContain("route.status === 'pending'");
+      expect(panelSource).toContain("kind:'pending', route");
     });
 
-    it('routeHistoryYears inclui rotas pending (visíveis no histórico)', () => {
-      const yearsFn = panelSource.indexOf('function routeHistoryYears');
-      expect(yearsFn).toBeGreaterThan(-1);
-      const yearsBlock = panelSource.slice(yearsFn, yearsFn + 300);
-      expect(yearsBlock).toContain('confirmedRoutes.forEach');
-      expect(yearsBlock).not.toContain("status !== 'pending'");
+    it('histórico pending oferece Retomar confirmação pelo mesmo orquestrador', () => {
+      expect(panelSource).toContain('data-resume-route');
+      expect(panelSource).toContain('Retomar confirmação');
+      expect(panelSource).toContain('resumePendingRoute(route)');
+    });
+
+    it('botão Retomar confirmação aparece somente para status pending', () => {
+      expect(panelSource).toMatch(
+        /route\.id\s*&&\s*route\.status\s*===\s*'pending'\s*\?\s*`<button[^`]*data-resume-route/,
+      );
+      expect(panelSource.match(/data-resume-route/g)).toHaveLength(2);
+    });
+
+    it('panel não mantém caminho antigo de persistência fora do orquestrador', () => {
+      expect(panelSource).not.toContain('applyRoutePendingsDual');
+      expect(panelSource).not.toContain('novaRota');
+      expect(panelSource).not.toContain('isConfirmingRoute');
+
+      const compositionStart = panelSource.indexOf(
+        'const routeConfirmationOrchestrator = createRouteConfirmationOrchestrator',
+      );
+      const compositionEnd = panelSource.indexOf(
+        'function reportRouteConfirmationFailure',
+        compositionStart,
+      );
+      const composition = panelSource.slice(compositionStart, compositionEnd);
+      expect(composition.match(/window\.__motoboyRotas\.save\(/g)).toHaveLength(1);
+      expect(composition.match(/applyRouteFinancialPendings\(/g)).toHaveLength(1);
+
+      const outsideComposition =
+        panelSource.slice(0, compositionStart) + panelSource.slice(compositionEnd);
+      expect(outsideComposition).not.toContain('window.__motoboyRotas.save(');
+      expect(outsideComposition).not.toContain('applyRouteFinancialPendings(');
+    });
+
+    it('efeitos de sucesso ficam concentrados em completeLocally', () => {
+      const completion = extractFunction(panelSource, 'completeRouteConfirmationLocally');
+      expect(completion).toContain('upsertRouteLocally(route)');
+      expect(completion).toContain('entradas.unshift');
+      expect(completion).toContain('routeServices = [ newService() ]');
+      expect(completion).toContain('showRouteConfirmationSuccess(route)');
+      expect(orchestratorSource).toContain('dependencies.completeLocally(confirmedRoute)');
+    });
+
+    it('confirmação não dispara sync legado de moto ou clientes', () => {
+      const run = extractFunction(panelSource, 'runRouteConfirmation');
+      const completion = extractFunction(panelSource, 'completeRouteConfirmationLocally');
+      expect(run + completion).not.toContain('syncMotoToFirestore');
+      expect(run + completion).not.toContain('syncClientsToFirestore');
+    });
+
+    it('rota pending não entra no dashboard e permanece visível no histórico', () => {
+      const dashIdx = panelSource.indexOf('routesToday = confirmedRoutes.filter');
+      expect(panelSource.slice(dashIdx, dashIdx + 140)).toContain("status !== 'pending'");
+      const years = extractFunction(panelSource, 'routeHistoryYears');
+      expect(years).toContain('confirmedRoutes.forEach');
+      expect(years).not.toContain("status !== 'pending'");
+      expect(panelSource).toContain('route-pending-badge');
+    });
+
+    it('transição confirmed→pending continua rejeitada no Firestore', () => {
+      expect(repoSource).toContain('runTransaction');
+      expect(repoSource).toContain('já está confirmada — não pode voltar para pending');
     });
   });
 

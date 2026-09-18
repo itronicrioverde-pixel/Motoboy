@@ -6,7 +6,9 @@ import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
 import { clientsRemoteRead, clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
 import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
-import { createClientDual, updateClientDual, removeClientDual, applyRoutePendingsDual } from '../features/customers/infrastructure/client-writer';
+import { createClientDual, updateClientDual, removeClientDual } from '../features/customers/infrastructure/client-writer';
+import { createRouteConfirmationOrchestrator } from '../features/rotas/application/route-confirmation-orchestrator';
+import { applyRouteFinancialPendings } from '../features/rotas/infrastructure/client-pendings-gateway';
 
 export function bootstrapPanel() {
   // ---------- estado local do aplicativo ----------
@@ -1935,7 +1937,6 @@ export function bootstrapPanel() {
 
   function newEntrega(){ return { entrega:'', entregaCoords:null, distancia:null, tempo:null, valor:null, status:'idle', errorMsg:'', approx:false, approxConfirmed:false }; }
   function newService(){ return { serviceId:'svc-'+crypto.randomUUID(), coleta:'', coletaCoords:null, cliente:'', paymentStatus:'received', entregas:[ newEntrega() ] }; }
-  function ensureServiceId(s){ if(!s.serviceId) s.serviceId='svc-'+crypto.randomUUID(); return s; }
   let routeServices = [ newService() ];
   let confirmedRoutes = Array.isArray(localState.confirmedRoutes) ? localState.confirmedRoutes : [];
   let dragSrcIndex = null;
@@ -3068,6 +3069,7 @@ export function bootstrapPanel() {
         <div class="route-history-finance-row"><span>Recebido na hora</span><b>${fmtBRL(routeHistoryNumber(route.recebidoNaHora) || 0)}</b></div>
         <div class="route-history-finance-row"><span>A receber</span><b>${fmtBRL(routeHistoryNumber(route.pendente) || 0)}</b></div>
       </div>
+      ${route.id && route.status === 'pending' ? `<button type="button" class="route-resume-btn" data-resume-route="${safeText(route.id)}">Retomar confirmação</button>` : ''}
       ${route.id ? `<button type="button" class="route-cancel-btn" data-cancel-route="${safeText(route.id)}">Cancelar esta rota</button>
       <div class="route-cancel-note">Cancelar desfaz o que entrou no faturamento e a conta criada no cliente. Não dá pra desfazer o cancelamento.</div>` : ''}`;
   }
@@ -3117,6 +3119,12 @@ export function bootstrapPanel() {
         details.hidden = !opening;
       });
     });
+    list.querySelectorAll('[data-resume-route]').forEach(button => {
+      button.addEventListener('click', async () => {
+        const route = confirmedRoutes.find(item => item.id === button.dataset.resumeRoute);
+        await resumePendingRoute(route);
+      });
+    });
     list.querySelectorAll('[data-cancel-route]').forEach(button => {
       button.addEventListener('click', () => {
         if(!ensureClientesInteractive()) return;
@@ -3135,13 +3143,154 @@ export function bootstrapPanel() {
     });
   }
 
-  let isConfirmingRoute = false;
+  let activePendingRouteId = null;
+
+  function upsertRouteLocally(route){
+    const existingIdx = confirmedRoutes.findIndex(item => item.id === route.id);
+    if(existingIdx >= 0) confirmedRoutes[existingIdx] = route;
+    else confirmedRoutes.unshift(route);
+    saveLocalState();
+    initRouteHistoryFilters();
+    renderRouteHistory();
+    renderDashboard();
+  }
+
+  function showRouteConfirmationSuccess(route){
+    const confirmation = document.getElementById('routeConfirmation');
+    const confirmationMessage = document.getElementById('routeConfirmationMessage');
+    const viewClientsButton = document.getElementById('btnViewPendingClients');
+    if(!confirmation || !confirmationMessage || !viewClientsButton) return;
+
+    confirmationMessage.innerHTML = route.pendente > 0
+      ? `<b>Rota confirmada</b>${fmtBRL(route.recebidoNaHora)} recebido e ${fmtBRL(route.pendente)} enviado para Clientes.`
+      : '<b>Rota confirmada</b>O valor recebido já entrou no resultado do mês.';
+    viewClientsButton.style.display = route.pendente > 0 ? 'block' : 'none';
+
+    let startRouteBtn = document.getElementById('btnStartActiveRoute');
+    if(!startRouteBtn){
+      startRouteBtn = document.createElement('button');
+      startRouteBtn.type = 'button';
+      startRouteBtn.id = 'btnStartActiveRoute';
+      startRouteBtn.className = 'view-clients';
+      startRouteBtn.style.cssText = 'background:var(--green);color:#fff;margin-top:8px;display:block;width:100%;';
+      startRouteBtn.textContent = '📍 Iniciar Rota (Navegação)';
+      confirmation.appendChild(startRouteBtn);
+    }
+    startRouteBtn.style.display = 'block';
+    startRouteBtn.onclick = function(){
+      confirmation.classList.remove('open');
+      startActiveRouteMode();
+    };
+    confirmation.classList.add('open');
+  }
+
+  function completeRouteConfirmationLocally(route){
+    activePendingRouteId = null;
+    upsertRouteLocally(route);
+
+    const billingAlreadyExists = entradas.some(entry => entry.routeId === route.id);
+    if(route.recebidoNaHora > 0 && !billingAlreadyExists){
+      entradas.unshift({
+        desc:`Rota confirmada · ${route.count} entrega(s)`,
+        valor:route.recebidoNaHora,
+        data:'Hoje',
+        dateISO:route.dateISO,
+        routeId:route.id
+      });
+    }
+
+    routeServices = [ newService() ];
+    saveLocalState();
+    renderRouteHistory();
+    renderClientes();
+    renderFaturamento();
+    renderDashboard();
+    renderServices();
+    renderRouteSummary();
+    showRouteConfirmationSuccess(route);
+  }
+
+  const routeConfirmationOrchestrator = createRouteConfirmationOrchestrator({
+    generateRouteId: () => `rota-${crypto.randomUUID()}`,
+    generateServiceId: () => `svc-${crypto.randomUUID()}`,
+    async saveRoute(route){
+      if(!window.__motoboyRotas) throw new Error('Ponte de rotas indisponível.');
+      await window.__motoboyRotas.save(route);
+    },
+    persistPendingLocally(route){
+      upsertRouteLocally(route);
+    },
+    async applyFinancialPendings(items, routeId){
+      clientes = await applyRouteFinancialPendings(items, routeId);
+      saveLocalState();
+      renderClientes();
+      renderDashboard();
+    },
+    completeLocally(route){
+      completeRouteConfirmationLocally(route);
+    }
+  });
+
+  function reportRouteConfirmationFailure(result){
+    if(result.outcome === 'busy') return;
+    if(result.outcome === 'terminal'){
+      showToast('Esta rota já foi confirmada.', {kind:'warning'});
+      return;
+    }
+    if(result.outcome === 'confirmed') return;
+
+    console.error(`[Rota] Falha na confirmação (${result.failedPhase}):`, result.error);
+    if(result.outcome === 'pending') activePendingRouteId = result.route.id;
+
+    if(result.outcome === 'confirmed-local-failure'){
+      showToast('A rota foi confirmada, mas a tela não concluiu a atualização local. Recarregue o aplicativo.', {kind:'error'});
+      return;
+    }
+
+    if(result.failedPhase === 'financial-pendings'){
+      showToast('Erro ao salvar pendências no servidor. A rota ficou pendente e pode ser retomada.', {kind:'error'});
+      return;
+    }
+    if(result.failedPhase === 'confirmed-route'){
+      showToast('Erro ao concluir a confirmação. A rota ficou pendente e pode ser retomada.', {kind:'error'});
+      return;
+    }
+    if(result.failedPhase === 'preparation'){
+      showToast('Não foi possível preparar a rota para confirmação.', {kind:'error'});
+      return;
+    }
+    showToast('Erro ao salvar a rota. Tente novamente.', {kind:'error'});
+  }
+
+  async function runRouteConfirmation(request){
+    const confirmation = document.getElementById('routeConfirmation');
+    if(confirmation) confirmation.classList.remove('open');
+    const result = await routeConfirmationOrchestrator.confirm(request);
+    reportRouteConfirmationFailure(result);
+    return result;
+  }
+
+  async function resumePendingRoute(route){
+    if(!route || route.status !== 'pending') return;
+    const hasPending = Array.isArray(route.services)
+      && route.services.some(service => service.paymentStatus !== 'received');
+    if(hasPending && !ensureClientesInteractive()) return;
+    activePendingRouteId = route.id;
+    await runRouteConfirmation({ kind:'pending', route });
+  }
+
   document.getElementById('btnConfirmRoute').addEventListener('click', async () => {
-    if(isConfirmingRoute) return;
     const hasPending = routeServices.some(s => s.paymentStatus === 'pending');
     if(hasPending && !ensureClientesInteractive()) return;
-    const confirmation = document.getElementById('routeConfirmation');
-    confirmation.classList.remove('open');
+
+    const pendingAttempt = activePendingRouteId
+      ? confirmedRoutes.find(route => route.id === activePendingRouteId && route.status === 'pending')
+      : null;
+    if(pendingAttempt){
+      await resumePendingRoute(pendingAttempt);
+      return;
+    }
+
     const all = allEntregas();
     const invalido = all.some(e => e.status !== 'ok' || !e.valor || e.valor <= 0);
     if(invalido || all.length === 0){
@@ -3159,158 +3308,47 @@ export function bootstrapPanel() {
       return;
     }
 
-    isConfirmingRoute = true;
-    // distância real da rota inteira (cadeia sequencial), não a soma de trechos soltos
-    const chain = await computeRouteChain();
-    const totalKm = chain ? chain.totalKm : all.reduce((s, x) => s + (x.distancia || 0), 0);
-    const totalMin = chain ? chain.totalMin : all.reduce((s, x) => s + (x.tempo || 0), 0);
-    const valorTotal = round2(all.reduce((sum, entrega) => sum + (entrega.valor || 0), 0));
-    const custoCombustivel = CONSUMO_ATUAL > 0 && PRECO_ATUAL > 0
-      ? round2((totalKm / CONSUMO_ATUAL) * PRECO_ATUAL)
-      : null;
-    const resultadoRota = custoCombustivel === null ? null : round2(valorTotal - custoCombustivel);
-    let recebidoNaHora = 0;
-    let pendenteTotal = 0;
-    const routeId = `rota-${crypto.randomUUID()}`;
-    const confirmedAt = new Date();
-    const servicesSnapshot = routeServices.map(service => ({
-      serviceId:service.serviceId,
-      coleta:service.coleta,
-      cliente:service.cliente,
-      paymentStatus:service.paymentStatus,
-      valorTotal:round2(service.entregas.reduce((sum, entrega) => sum + (entrega.valor || 0), 0)),
-      entregas:service.entregas.map(entrega => ({
-        endereco:entrega.entrega,
-        valor:entrega.valor || 0,
-        distancia:entrega.distancia,
-        tempo:entrega.tempo,
-        aproximada:Boolean(entrega.approx)
-      }))
-    }));
-
-    const pendingsToApply = [];
-    for(let si = 0; si < routeServices.length; si++){
-      const s = ensureServiceId(routeServices[si]);
-      const totalServico = s.entregas.reduce((sum, e) => sum + (e.valor || 0), 0);
-      if(s.paymentStatus === 'received'){
-        recebidoNaHora += totalServico;
-      }else{
-        pendenteTotal += totalServico;
-        pendingsToApply.push({
-          operationId: `${routeId}:${s.serviceId}`,
-          nome: s.cliente.trim(),
-          valor: totalServico,
-          desc: `Rota · ${s.entregas.length} entrega(s)`,
+    await runRouteConfirmation({
+      kind:'draft',
+      services:routeServices,
+      async buildRouteData(servicesSnapshot){
+        // distância real da rota inteira (cadeia sequencial), não soma de trechos soltos
+        const chain = await computeRouteChain();
+        const deliveries = servicesSnapshot.flatMap(service => service.entregas);
+        const totalKm = chain ? chain.totalKm : deliveries.reduce((sum, item) => sum + (item.distancia || 0), 0);
+        const totalMin = chain ? chain.totalMin : deliveries.reduce((sum, item) => sum + (item.tempo || 0), 0);
+        const valorTotal = round2(servicesSnapshot.reduce((sum, service) => sum + service.valorTotal, 0));
+        let recebidoNaHora = 0;
+        let pendenteTotal = 0;
+        servicesSnapshot.forEach(service => {
+          if(service.paymentStatus === 'received') recebidoNaHora += service.valorTotal;
+          else pendenteTotal += service.valorTotal;
         });
+        recebidoNaHora = round2(recebidoNaHora);
+        pendenteTotal = round2(pendenteTotal);
+        const custoCombustivel = CONSUMO_ATUAL > 0 && PRECO_ATUAL > 0
+          ? round2((totalKm / CONSUMO_ATUAL) * PRECO_ATUAL)
+          : null;
+        const confirmedAt = new Date();
+        return {
+          count:deliveries.length,
+          distancia:totalKm,
+          tempoMin:totalMin,
+          valorTotal,
+          custoCombustivel,
+          resultado:custoCombustivel === null ? null : round2(valorTotal - custoCombustivel),
+          recebidoNaHora,
+          pendente:pendenteTotal,
+          data:'Hoje',
+          dateISO:toISODateLocal(confirmedAt),
+          hora:confirmedAt.toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' }),
+          createdAt:confirmedAt.toISOString(),
+          consumoKmL:CONSUMO_ATUAL,
+          precoLitro:PRECO_ATUAL,
+          aproximada:Boolean(chain && chain.approx)
+        };
       }
-    }
-
-    const novaRota = {
-      id:routeId,
-      count:all.length,
-      distancia:totalKm,
-      tempoMin:totalMin,
-      valorTotal,
-      custoCombustivel,
-      resultado:resultadoRota,
-      recebidoNaHora,
-      pendente:pendenteTotal,
-      data:'Hoje',
-      dateISO:toISODateLocal(confirmedAt),
-      hora:confirmedAt.toLocaleTimeString('pt-BR', { hour:'2-digit', minute:'2-digit' }),
-      createdAt:confirmedAt.toISOString(),
-      consumoKmL:CONSUMO_ATUAL,
-      precoLitro:PRECO_ATUAL,
-      aproximada:Boolean(chain && chain.approx),
-      services:servicesSnapshot,
-      status:'pending'
-    };
-
-    try{
-      if(window.__motoboyRotas){
-        try{
-          await window.__motoboyRotas.save(novaRota);
-        }catch(err){
-          console.error('[Rota] Erro ao salvar rota (pending) no servidor:', err);
-          showToast('Erro ao salvar a rota no servidor. Tente novamente.', {kind:'error'});
-          return;
-        }
-      }
-
-      const existingIdx = confirmedRoutes.findIndex(r => r.id === routeId);
-      if(existingIdx >= 0){
-        confirmedRoutes[existingIdx] = novaRota;
-      }else{
-        confirmedRoutes.unshift(novaRota);
-      }
-      saveLocalState();
-
-      if(pendingsToApply.length > 0){
-        try{
-          const updatedClientes = await applyRoutePendingsDual(pendingsToApply, routeId);
-          clientes = updatedClientes;
-        }catch(err){
-          console.error('[Rota] Erro ao criar pendências:', err);
-          showToast('Erro ao salvar pendências no servidor. A rota ficou pendente e pode ser retomada.', {kind:'error'});
-          return;
-        }
-      }
-
-      novaRota.status = 'confirmed';
-      if(window.__motoboyRotas){
-        try{
-          await window.__motoboyRotas.save(novaRota);
-        }catch(err){
-          console.error('[Rota] Erro ao marcar rota como confirmada:', err);
-          showToast('Erro ao confirmar rota. Pendências já foram salvas — tentando novamente...', {kind:'error'});
-        }
-      }
-
-      const routeIdx = confirmedRoutes.findIndex(r => r.id === routeId);
-      if(routeIdx >= 0){
-        confirmedRoutes[routeIdx].status = 'confirmed';
-      }
-
-      if(recebidoNaHora > 0){
-        entradas.unshift({ desc: `Rota confirmada · ${all.length} entrega(s)`, valor: recebidoNaHora, data: 'Hoje', dateISO:daysAgoISO(0), routeId });
-      }
-
-      saveLocalState();
-      initRouteHistoryFilters();
-      renderRouteHistory();
-      renderClientes();
-      renderFaturamento();
-      renderDashboard();
-      routeServices = [ newService() ];
-      renderServices();
-      renderRouteSummary();
-
-      const confirmationMessage = document.getElementById('routeConfirmationMessage');
-      const viewClientsButton = document.getElementById('btnViewPendingClients');
-      confirmationMessage.innerHTML = pendenteTotal > 0
-        ? `<b>Rota confirmada</b>${fmtBRL(recebidoNaHora)} recebido e ${fmtBRL(pendenteTotal)} enviado para Clientes.`
-        : '<b>Rota confirmada</b>O valor recebido já entrou no resultado do mês.';
-    viewClientsButton.style.display = pendenteTotal > 0 ? 'block' : 'none';
-    // Botão "Iniciar Rota" na confirmação
-    let startRouteBtn = document.getElementById('btnStartActiveRoute');
-    if(!startRouteBtn){
-      startRouteBtn = document.createElement('button');
-      startRouteBtn.type = 'button';
-      startRouteBtn.id = 'btnStartActiveRoute';
-      startRouteBtn.className = 'view-clients';
-      startRouteBtn.style.cssText = 'background:var(--green);color:#fff;margin-top:8px;display:block;width:100%;';
-      startRouteBtn.textContent = '📍 Iniciar Rota (Navegação)';
-      confirmation.appendChild(startRouteBtn);
-    }
-    startRouteBtn.style.display = 'block';
-    startRouteBtn.onclick = function(){
-      confirmation.classList.remove('open');
-      startActiveRouteMode();
-    };
-    confirmation.classList.add('open');
-    }finally{
-      isConfirmingRoute = false;
-    }
+    });
   });
 
   document.getElementById('btnViewPendingClients').addEventListener('click', () => setView('clientes'));
@@ -3648,13 +3686,11 @@ export function bootstrapPanel() {
       async () => {
         const currentIndex = clientes.indexOf(cliente);
         if(currentIndex < 0) return;
-        if(cliente.id){
-          try { await removeClientDual(cliente.id); }
-          catch(err){
-            console.error('[Clientes] Erro ao remover:', err);
-            showToast('Erro ao excluir no servidor. Tente novamente.', {kind:'error'});
-            return;
-          }
+        try { await removeClientDual(cliente.id || '', { legacyLookupName: cliente.nome }); }
+        catch(err){
+          console.error('[Clientes] Erro ao remover:', err);
+          showToast('Erro ao excluir no servidor. Tente novamente.', {kind:'error'});
+          return;
         }
         clientes.splice(currentIndex, 1);
         if(editingClientIndex === currentIndex) resetClientFormMode();
@@ -3676,14 +3712,14 @@ export function bootstrapPanel() {
     const previous = editingClientIndex === null ? null : clientes[editingClientIndex];
     if(previous){
       const oldName = previous.nome;
-      if(previous.id){
-        try { await updateClientDual(previous.id, { name: nome }); }
-        catch(err){
-          console.error('[Clientes] Erro ao atualizar:', err);
-          showToast('Erro ao salvar no servidor. Tente novamente.', {kind:'error'});
-          return;
-        }
+      let resolvedId = previous.id;
+      try { resolvedId = await updateClientDual(previous.id || '', { name: nome, legacyLookupName: oldName }); }
+      catch(err){
+        console.error('[Clientes] Erro ao atualizar:', err);
+        showToast('Erro ao salvar no servidor. Tente novamente.', {kind:'error'});
+        return;
       }
+      if(resolvedId && !previous.id) previous.id = resolvedId;
       previous.nome = nome;
       entradas.forEach(entry => {
         if(entry.clientName !== oldName) return;

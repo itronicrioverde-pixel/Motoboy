@@ -1132,6 +1132,26 @@ Fase 3: Atualizar rota para status:'confirmed'
 - **routeId com UUID**: `rota-${crypto.randomUUID()}` — ID globalmente único, não depende de timing.
 - **Legado**: Rotas antigas sem `status` são tratadas como `confirmed` (default no `toEntity`).
 
+#### Atomicidade do CRUD de clientes (`client-writer.ts`)
+
+- **Operações transacionais**: `updateClientDual` e `removeClientDual` usam `tx.update()` e `tx.delete()` dentro de `runTransaction` — nunca `updateDoc()` ou `deleteDoc()` externos.
+- **Leituras antes de escritas**: Todas as leituras (`tx.get`)发生在escritas (`tx.set`, `tx.update`, `tx.delete`) no callback da transação.
+- **Reversibilidade**: Em falha, nenhuma das duas fontes (`customers/{id}`, `clients/data`) é alterada.
+- **Idempotência**: IDs são pré-gerados antes da transação. O callback pode ser repetido pelo Firestore sem gerar IDs diferentes.
+- **Migração de legado (editar sem ID)**:
+  - `updateClientDual('', { name })` gera um ID estável via `crypto.randomUUID()`.
+  - Cria `customers/{id}` e atualiza `clients/data` com o novo ID — atomicamente.
+  - Retorna o ID resolvido para o painel atualizar o array local.
+- **Exclusão de legado (sem ID)**:
+  - `removeClientDual('')` busca o cliente por nome em `clients/data`.
+  - Remove a entrada financeira em `clients/data`.
+  - Se existir `customers/{id}`, remove também.
+- **Conflito de nomes duplicados**:
+  - Edição: se múltiplos clientes legados sem ID compartilham o mesmo nome, `updateClientDual` lança erro de conflito.
+  - Exclusão: mesma regra — `removeClientDual` rejeita se houver duplicatas.
+  - Resolução manual no Firestore é exigida antes de editar/excluir.
+- **Imports limpos**: `updateDoc` e `deleteDoc` foram removidos do `client-writer.ts`.
+
 ### Consequências
 
 - Pendências de rota são atômicas: ou todas são gravadas, ou nenhuma é.
@@ -1145,12 +1165,50 @@ Fase 3: Atualizar rota para status:'confirmed'
 
 ### Nota sobre contagem de testes
 
-O relatório original desta DEC-023 informou 18 testes para `firestore-writer.test.ts`. O baseline real era **15** (os 3 testes extras foram contados incorretamente). `addPendingDual` foi removida (7 testes removidos). Total: **720 testes** (31 arquivos). Contagem por arquivo: `client-writer.test.ts` 26, `firestore-writer.test.ts` 23, `panel-sync.test.ts` 55, outros 28 arquivos 616.
+O relatório original desta DEC-023 informou 18 testes para `firestore-writer.test.ts`. O baseline real era **15** (os 3 testes extras foram contados incorretamente). `addPendingDual` foi removida (7 testes removidos). Total: **724 testes** (31 arquivos). Contagem por arquivo: `client-writer.test.ts` 30, `firestore-writer.test.ts` 23, `panel-sync.test.ts` 55, outros 28 arquivos 616.
 
 ### Testes adicionados
 
 | Arquivo | Testes | Cobertura |
 |---------|--------|-----------|
-| `client-writer.test.ts` | +9 | CRUD atômico, applyRoutePendingsDual: 1 tx, acumulação, falha, IDs estáveis, operationId duplicado ignorado, conflito detectado, retry sem duplicata, retry com valor alterado rejeitado, mistura existentes/novos, preservação de contas |
+| `client-writer.test.ts` | +13 | CRUD atômico, applyRoutePendingsDual: 1 tx, acumulação, falha, IDs estáveis, operationId duplicado ignorado, conflito detectado, retry sem duplicata, retry com valor alterado rejeitado, mistura existentes/novos, preservação de contas, migração legado com novo ID, conflito nomes duplicados (editar), exclusão legado sem ID, conflito nomes duplicados (excluir) |
 | `firestore-writer.test.ts` | +8 | retry reenvia após falha, retry sem snapshot não faz nada, retry com UID mudado/gate fechado descartado, retry duplo 1 escrita, sucesso limpa estado, novo schedule substitui snapshot |
 | `panel-sync.test.ts` | +22 | confirmação usa applyRoutePendingsDual, sem addPendingToClient/addPendingDual, operationId imutável, UUID completo, servicesSnapshot com serviceId, ensureServiceId legado, rota salva como pending antes das pendências, falha ao salvar rota impede pendências, status atualizado para confirmed após sucesso, falha nas pendências mantém rota pending, marcação confirmed é feita somente após sucesso, isConfirmingRoute lock, finally libera lock, upsert por routeId, rota pending salva em confirmedRoutes antes das pendências (upsert), status atualizado no array após Fase 3, dashboard exclui pending, badge visual pending no histórico, transação runTransaction rejeita downgrade, UUID não usa Date.now(), routeHistoryYears inclui pending, retry persiste em saveLocalState |
+
+---
+
+## DEC-024 — Orquestrador testável da confirmação de rota
+
+**Status:** Aprovada e implementada
+**Data:** 18/09/2026
+**Relação:** Refina e substitui a seção **“Ciclo de vida pending/confirmed”** da DEC-023. A DEC-023 continua válida para atomicidade das pendências, `operationId`, transação financeira e persistência em três fases; em caso de divergência sobre lock, retry, transições ou efeitos de interface, prevalece a DEC-024.
+
+### Contexto
+
+A confirmação de rota executava sua máquina de estados, lock, geração de identificadores, persistência em três fases e efeitos de interface dentro de `panel.js`. O retry preservava a rota `pending`, mas não havia uma ação capaz de reconstruir as pendências do snapshot depois de recarregar a página.
+
+### Decisão
+
+- A máquina `draft → pending → confirmed` passa a viver em `src/features/rotas/application/route-confirmation-orchestrator.ts`.
+- O módulo application recebe portas injetadas para persistir rota, aplicar pendências financeiras, salvar a tentativa local e executar os efeitos locais de sucesso. Não importa Firebase, DOM ou `localStorage`.
+- Um adapter TypeScript em `rotas/infrastructure/client-pendings-gateway.ts` integra a porta financeira ao contrato vigente de `client-writer`; alterações incompatíveis passam a falhar no typecheck ou no teste do adapter.
+- O lock pertence ao orquestrador e é sempre liberado em `finally`.
+- Para uma tentativa nova, a ordem é: gerar `serviceId` ausente, montar o snapshot, gerar um único `routeId`, salvar `pending`, fazer upsert local, aplicar pendências e salvar a mesma rota como `confirmed`.
+- O snapshot de `RotaService` passa a preservar `serviceId` no Firestore. Rotas históricas continuam aceitando sua ausência, mas uma rota `pending` sem `serviceId` não pode ser retomada com identificadores inventados.
+- Retry recebe a rota `pending` persistida e reconstrói cada `operationId` exclusivamente como `${routeId}:${serviceId}`.
+- `confirmed` é terminal. Efeitos locais de sucesso — status local, faturamento, limpeza do formulário e mensagem — só executam depois da gravação da Fase 3.
+- O histórico oferece a ação **Retomar confirmação** para rotas `pending`, usando o mesmo orquestrador da confirmação inicial.
+
+### Consequências
+
+- Falhas nas Fases 2 ou 3 mantêm a tentativa `pending`, sem faturamento, limpeza do formulário ou mensagem de sucesso.
+- A tentativa pode ser retomada após recarregar a aplicação sem trocar `routeId`, `serviceId` ou `operationId`.
+- O painel legado mantém apenas validação de formulário, composição dos dados calculados e renderização.
+- Nenhuma alteração em Firestore Rules, índices, Cloud Functions ou deploy.
+
+### Testes
+
+- `route-confirmation-orchestrator.test.ts`: ordem das fases, falha da Fase 1 sem efeitos, falhas nas Fases 2/3, retomada após reload, retry sem duplicação, lock compartilhado, duplo clique, estado terminal, efeitos de sucesso exatamente uma vez e rejeição de snapshot sem `serviceId`.
+- `client-pendings-gateway.test.ts`: compatibilidade do contrato entre o orquestrador e `client-writer`.
+- `firestore-rota-mappers.test.ts`: preservação de `serviceId` ao reconstruir o snapshot persistido.
+- `panel-sync.test.ts`: ausência do caminho legado fora do orquestrador e ação de retomada exclusiva para rotas `pending`.
