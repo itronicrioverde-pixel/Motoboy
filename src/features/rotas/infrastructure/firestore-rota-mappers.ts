@@ -27,6 +27,9 @@ export function toRotaService(raw: DocumentData): RotaService {
     ...(typeof raw?.serviceId === 'string' && raw.serviceId.trim()
       ? { serviceId: raw.serviceId }
       : {}),
+    ...(typeof raw?.clientId === 'string' && raw.clientId.trim()
+      ? { clientId: raw.clientId }
+      : {}),
     coleta: String(raw?.coleta ?? ''),
     cliente: String(raw?.cliente ?? ''),
     paymentStatus: String(raw?.paymentStatus ?? ''),

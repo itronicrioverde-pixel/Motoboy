@@ -23,6 +23,8 @@ export interface RotaEntrega {
 export interface RotaService {
   /** Presente nas rotas novas; rotas históricas anteriores podem não possuir. */
   serviceId?: string;
+  /** ID estável do cliente; rotas legadas podem não possuir. */
+  clientId?: string;
   coleta: string;
   cliente: string;
   paymentStatus: string;
@@ -72,6 +74,7 @@ export interface NewRotaEntrega {
 
 export interface NewRotaService {
   readonly serviceId?: string;
+  readonly clientId?: string;
   readonly coleta: string;
   readonly cliente: string;
   readonly paymentStatus: string;
@@ -436,6 +439,7 @@ export function createRota(input: NewRota): RotaResult {
     aproximada: Boolean(input.aproximada),
     services: services.map((s) => ({
       ...(s.serviceId ? { serviceId: s.serviceId } : {}),
+      ...(s.clientId ? { clientId: s.clientId } : {}),
       coleta: s.coleta,
       cliente: s.cliente,
       paymentStatus: s.paymentStatus,

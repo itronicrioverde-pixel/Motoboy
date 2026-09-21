@@ -61,6 +61,7 @@ export interface RemoveClientOptions {
 
 export interface RoutePendingItem {
   readonly operationId: string;
+  readonly clientId?: string;
   readonly nome: string;
   readonly valor: number;
   readonly desc: string;
@@ -331,12 +332,15 @@ export async function applyRoutePendingsDual(
   if (!uid) throw new Error('Sem usuário autenticado.');
   if (items.length === 0) return [];
 
-  const pendingItems = items.map((item) => ({
-    ...item,
-    operationId: item.operationId || `${routeId}:${item.nome.toLowerCase()}`,
-  }));
+  for (const item of items) {
+    if (!item.operationId) {
+      throw new Error(`operationId obrigatório para pendência do cliente "${item.nome}".`);
+    }
+  }
 
-  const uniqueNames = [...new Set(pendingItems.map((i) => i.nome.toLowerCase()))];
+  const uniqueNames = [...new Set(
+    items.filter((i) => !i.clientId).map((i) => i.nome.toLowerCase()),
+  )];
   const idMap = new Map<string, string>();
   for (const name of uniqueNames) {
     idMap.set(name, generateId(uid));
@@ -353,9 +357,52 @@ export async function applyRoutePendingsDual(
     let clientes = [...existing];
     const newProfiles: Array<{ id: string; nome: string }> = [];
 
-    for (const item of pendingItems) {
+    for (const item of items) {
       const nomeLower = item.nome.toLowerCase();
-      let client = clientes.find((c) => c.nome.toLowerCase() === nomeLower);
+
+      // Busca global por operationId — protege contra contaminação cruzada
+      let globalOwner: LegacyCliente | undefined;
+      for (const c of clientes) {
+        const globalHit = (c.contas ?? []).find(
+          (ct) => (ct as { operationId?: string }).operationId === item.operationId,
+        ) as { operationId?: string; valorOriginal?: number; desc?: string } | undefined;
+        if (globalHit) {
+          globalOwner = c;
+          assertNoConflict(globalHit, { valor: item.valor, desc: item.desc }, item.operationId);
+        }
+      }
+      if (globalOwner) {
+        const expectedId = item.clientId || null;
+        if (expectedId && globalOwner.id !== expectedId) {
+          throw new Error(
+            `Conflito de operationId "${item.operationId}": ` +
+            `conta pertence ao cliente "${globalOwner.nome}" (${globalOwner.id}), ` +
+            `mas item aponta para clientId "${expectedId}".`,
+          );
+        }
+        continue;
+      }
+
+      // Identidade: clientId primeiro, nome como fallback legado
+      let client: LegacyCliente | undefined;
+      if (item.clientId) {
+        client = clientes.find((c) => c.id === item.clientId);
+        if (!client) {
+          throw new Error(
+            `Cliente não encontrado para clientId "${item.clientId}". ` +
+            `Não é permitido criar cliente por nome quando clientId é fornecido.`,
+          );
+        }
+      } else {
+        const nameMatches = clientes.filter((c) => c.nome.toLowerCase() === nomeLower);
+        if (nameMatches.length > 1) {
+          throw new Error(
+            `Ambiguidade: ${nameMatches.length} clientes com nome "${item.nome}". ` +
+            `Informe clientId para identificar corretamente.`,
+          );
+        }
+        client = nameMatches[0];
+      }
 
       if (!client) {
         const newId = idMap.get(nomeLower)!;
@@ -371,17 +418,9 @@ export async function applyRoutePendingsDual(
         clientes = [...clientes, client];
       }
 
-      const existingConta = (client.contas ?? []).find(
-        (c) => (c as { operationId?: string }).operationId === item.operationId,
-      ) as { operationId?: string; valorOriginal?: number; desc?: string } | undefined;
-
-      if (existingConta) {
-        assertNoConflict(existingConta, { valor: item.valor, desc: item.desc }, item.operationId);
-        continue;
-      }
-
       const newConta = createConta(item.valor, item.desc, routeId, item.operationId);
 
+      const matchId = client.id;
       const updatedClient: LegacyCliente = {
         ...client,
         contas: [newConta, ...(client.contas ?? [])],
@@ -391,7 +430,7 @@ export async function applyRoutePendingsDual(
       };
 
       clientes = clientes.map((c) =>
-        c === client || c.nome.toLowerCase() === nomeLower
+        (matchId && c.id === matchId) || c === client
           ? updatedClient
           : c,
       );
@@ -408,6 +447,72 @@ export async function applyRoutePendingsDual(
     }
 
     tx.set(clientsDoc(uid), { clientes }, { merge: true });
+
+    resultClientes = clientes;
+  });
+
+  return resultClientes;
+}
+
+/**
+ * Cancela uma rota e remove atomicamente todas as contas associadas dos clientes.
+ *
+ * Dentro de uma única runTransaction:
+ * 1. Lê clients/data.
+ * 2. Verifica no dado remoto que nenhuma conta da rota possui recebido > 0.
+ * 3. Filtra as contas com routeId correspondente de todos os clientes.
+ * 4. Recalcula pendente de cada cliente afetado.
+ * 5. Grava clients/data atualizado.
+ * 6. Remove o documento da rota (users/{uid}/rotas/{routeId}).
+ *
+ * Em falha, nenhuma fonte é alterada.
+ *
+ * Retorna o array de clientes atualizado.
+ */
+export async function cancelRouteDual(
+  routeId: string,
+): Promise<LegacyCliente[]> {
+  const uid = currentUid();
+  if (!uid) throw new Error('Sem usuário autenticado.');
+  if (!routeId) throw new Error('routeId obrigatório para cancelamento.');
+
+  let resultClientes: LegacyCliente[] = [];
+
+  const rotaRef = doc(collection(db, 'users', uid, 'rotas'), routeId);
+
+  await runTransaction(db, async (tx) => {
+    const clientsSnap = await tx.get(clientsDoc(uid));
+    const existing: LegacyCliente[] = clientsSnap.exists()
+      ? (clientsSnap.data().clientes as LegacyCliente[] ?? [])
+      : [];
+
+    for (const c of existing) {
+      for (const conta of (c.contas ?? []) as Array<Record<string, unknown>>) {
+        if (conta.routeId === routeId && (Number(conta.recebido) || 0) > 0) {
+          throw new Error(
+            `O cliente ${c.nome} já recebeu pagamento referente a esta rota. ` +
+            `Trate o recebimento antes de cancelar.`,
+          );
+        }
+      }
+    }
+
+    const clientes = existing.map((c) => {
+      const contas = (c.contas ?? []) as Array<Record<string, unknown>>;
+      const filtered = contas.filter(
+        (conta) => conta.routeId !== routeId,
+      );
+      if (filtered.length === contas.length) return c;
+
+      const pendente = filtered.reduce(
+        (sum, conta) => sum + Math.max(0, Number(conta.saldo) || 0),
+        0,
+      );
+      return { ...c, contas: filtered, pendente };
+    });
+
+    tx.set(clientsDoc(uid), { clientes }, { merge: true });
+    tx.delete(rotaRef);
 
     resultClientes = clientes;
   });

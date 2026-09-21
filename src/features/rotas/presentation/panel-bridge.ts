@@ -8,12 +8,15 @@ import { rotasService } from '../index';
 import type { Rota } from '../index';
 import type { LoadResult } from '../../../shared/application/load-result';
 import { loadOk, loadFail } from '../../../shared/application/load-result';
+import { cancelRouteDual } from '../../customers/infrastructure/client-writer';
+import type { LegacyCliente } from '../../customers/application/merge-legacy-customers';
 
 declare global {
   interface Window {
     __motoboyRotas?: {
       save(rota: Rota): Promise<void>;
       remove(id: string): Promise<void>;
+      cancelAtomic(routeId: string): Promise<LegacyCliente[]>;
     };
     __applyRemoteRotas?: (entities: Rota[]) => void;
   }
@@ -26,6 +29,9 @@ export function installRotasBridge(): void {
     },
     async remove(id) {
       await rotasService.remove(id);
+    },
+    async cancelAtomic(routeId) {
+      return cancelRouteDual(routeId);
     },
   };
 }

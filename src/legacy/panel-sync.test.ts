@@ -228,33 +228,55 @@ describe('panel.js — propriedades estáticas', () => {
       expect(repoSource).toContain('runTransaction');
       expect(repoSource).toContain('já está confirmada — não pode voltar para pending');
     });
+
+    it('resolução de clientId rejeita ambiguidade de nomes no painel', () => {
+      expect(panelSource).toContain('matches.length > 1');
+      expect(panelSource).toContain('Renomeie um deles');
+      expect(panelSource).toContain('s.clientId = matches[0].id');
+    });
   });
 
-  describe('rota de cancelamento — sync de clientes condicional', () => {
-    it('cancelConfirmedRoute usa flag clientsChanged para decidir sync', () => {
+  describe('rota de cancelamento — cancelamento atômico', () => {
+    it('cancelConfirmedRoute é async e usa cancelAtomic', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
-      expect(body).toContain('clientsChanged');
-      expect(body).toMatch(/if\s*\(\s*clientsChanged\s*\)\s*syncClientsToFirestore/);
+      expect(body).toContain('cancelAtomic');
+      expect(body).toContain('await');
     });
 
-    it('recalcula saldo somente dos clientes cujas contas foram removidas', () => {
+    it('aplica estado atômico do Firestore localmente após commit', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
-      expect(body).toContain('c.contas.length !== before');
-      expect(body).toMatch(/syncClientBalance\(c\)/);
+      expect(body).toContain('updatedClientes');
+      expect(body).toContain('local.contas = updated.contas');
     });
 
-    it('nenhuma conta corresponde ao routeId: não altera clientes e não sincroniza', () => {
+    it('trata erro e mostra toast', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
-      expect(body).toMatch(/const before\s*=\s*c\.contas\.length/);
-      expect(body).toMatch(/if\s*\(\s*c\.contas\.length\s*!==\s*before\s*\)/);
-      expect(body).not.toMatch(/saveLocalState\(\);\s*syncClientsToFirestore\(\)/);
+      expect(body).toContain('catch(err)');
+      expect(body).toContain("showToast('Erro ao cancelar rota no servidor");
     });
 
-    it('existe correspondência: remove contas da rota, preserva demais e sincroniza uma vez', () => {
+    it('ponte ausente aborta com toast em vez de fallback', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
-      expect(body).toMatch(/c\.contas\s*=\s*c\.contas\.filter\(\s*conta\s*=>\s*conta\.routeId\s*!==\s*routeId\s*\)/);
-      const syncCalls = body.match(/syncClientsToFirestore/g) || [];
-      expect(syncCalls).toHaveLength(1);
+      expect(body).toContain('Ponte de cancelamento atômico indisponível');
+      expect(body).not.toMatch(/syncClientsToFirestore/);
+    });
+
+    it('nenhum estado local é alterado antes do commit remoto', () => {
+      const body = extractFunction(panelSource, 'cancelConfirmedRoute');
+      const awaitPos = body.indexOf('await window.__motoboyRotas.cancelAtomic');
+      const splicePos = body.indexOf('confirmedRoutes.splice');
+      const entradasPos = body.indexOf('entradas[i].routeId');
+      expect(awaitPos).toBeGreaterThan(-1);
+      expect(splicePos).toBeGreaterThan(awaitPos);
+      expect(entradasPos).toBeGreaterThan(awaitPos);
+    });
+
+    it('lock cancellingRoute impede duplo-clique', () => {
+      expect(panelSource).toContain('cancellingRoute');
+      const body = extractFunction(panelSource, 'cancelConfirmedRoute');
+      expect(body).toContain('if(cancellingRoute) return');
+      expect(body).toContain('cancellingRoute = true');
+      expect(body).toMatch(/finally\s*\{[^}]*cancellingRoute\s*=\s*false/);
     });
   });
 

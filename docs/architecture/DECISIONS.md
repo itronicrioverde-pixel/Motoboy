@@ -934,9 +934,9 @@ Hierarquia de dados (DEC-006, DEC-012):
 - `clienteSave` (criar/editar) escreve em `customers/{id}` via `window.__motoboyCustomers` (bridge) **antes** de atualizar o array local.
 - `deleteClient` remove de `customers/{id}` via bridge **antes** de remover do array local.
 - Em falha remota, a operação é abortada, o estado anterior é preservado e uma mensagem de erro é exibida ao usuário.
-- `newClient()` gera um ID estável (`cli-{timestamp}-{random}`) para registros locais.
+- IDs de novos clientes são gerados via `crypto.randomUUID()` dentro de `createClientDual`/`applyRoutePendingsDual` — pré-gerados antes da transação para estabilidade.
 - Bridge (`panel-bridge.ts`) propaga erros — o chamador é responsável por tratar falhas.
-- `addPendingToClient()` agora chama `saveLocalState()` e `syncClientsToFirestore()` para garantir persistência.
+- Pendências financeiras de rota são aplicadas atomicamente via `applyRoutePendingsDual` (uma transação para todos os serviços).
 
 #### Modo offline
 
@@ -1001,7 +1001,7 @@ Retry (feature em estado failed):
 - Nome normalizado permanece como fallback de migração, não como chave de identidade.
 - Escrita debounced captura UID no agendamento e confirma antes de executar — impede escrita com UID errado após logout/troca de usuário.
 - CRUD de clientes propaga erros e preserva estado anterior em falha — sem dados corrompidos.
-- `newClient()` gera ID estável para migração futura de registros legados.
+- IDs de clientes são gerados por `crypto.randomUUID()` — estáveis e únicos para migração de registros legados.
 - **Risco de concorrência não resolvido**: dois dispositivos escrevendo simultaneamente em `clients/data` causam perda de dados (último escritor vence). Outbox, operações atômicas ou transações ficam para o cutover (DEC-017).
 
 ### Testes adicionados
@@ -1009,17 +1009,17 @@ Retry (feature em estado failed):
 | Arquivo | Testes | Cobertura |
 |---------|--------|-----------|
 | `src/legacy/hydration-guards.test.ts` | 22 | Símbolos removidos, guards em todos os 10 handlers de mutação, padrão de retry (failed→retry, pending→no retry, ok→no retry) |
-| `src/legacy/panel-sync.test.ts` | 31 | Hidratação sem sync remoto, guards de sync, confirmação de rota, cancelamento condicional, SyncGate import/uso, merge por ID, clientsRemoteRead, substituição direta em hydrateClientes |
+| `src/legacy/panel-sync.test.ts` | 46 | Hidratação sem sync remoto, guards de sync, confirmação de rota, cancelamento atômico fail-closed, SyncGate import/uso, merge por ID, clientsRemoteRead, substituição direta em hydrateClientes, ambiguidade de clientId, lock duplo-clique, ponte ausente |
 | `src/features/customers/application/merge-legacy-customers.test.ts` | 17 | Associação por ID, fallback por nome, rename sem duplicação, desambiguação de nomes iguais, preservação de dados financeiros, imutabilidade, edge cases |
 | `src/shared/application/sync-gate.test.ts` | 17 | Estados do SyncGate, open/close, isOpen, integração com HydrationManager |
 | `src/features/customers/presentation/panel-bridge.test.ts` | 14 | customerToLegacy, loadCustomersIntoPanel com dual source, falha em clients/data, falha em customers, merge por ID, uid ausente |
 | `src/shared/infrastructure/firestore-writer.test.ts` | 13 | Debounce, consolidação, capture de UID, cancelamento, gate-aware, pathBuilder, erro de gravação |
 
-**P0 (race condition de dados):** Resolvido — todos os 660 testes passam (30 arquivos).
+**P0 (race condition de dados):** Resolvido — todos os 750 testes passam (34 arquivos).
 
 ### Arquivos alterados
 
-- `src/legacy/panel.js` — saveLocalState(), hidratação (substituição direta), guards, sync explícito, SyncGate, CRUD dual fonte, newClient com ID estável, writer debounced
+- `src/legacy/panel.js` — saveLocalState(), hidratação (substituição direta), guards, sync explícito, SyncGate, CRUD dual fonte, writer debounced, resolução de clientId antes da confirmação, cancelamento atômico via `cancelRouteDual`
 - `src/main.ts` — orquestração de hidratação via HydrationManager, bridges de retry/failed
 - `src/shared/application/hydration.ts` — HydrationManager (loadFeature, retryFeatureLoad, estado por feature)
 - `src/shared/application/sync-gate.ts` — SyncGate (controle de escrita open/close)
@@ -1165,15 +1165,15 @@ Fase 3: Atualizar rota para status:'confirmed'
 
 ### Nota sobre contagem de testes
 
-O relatório original desta DEC-023 informou 18 testes para `firestore-writer.test.ts`. O baseline real era **15** (os 3 testes extras foram contados incorretamente). `addPendingDual` foi removida (7 testes removidos). Total: **724 testes** (31 arquivos). Contagem por arquivo: `client-writer.test.ts` 30, `firestore-writer.test.ts` 23, `panel-sync.test.ts` 55, outros 28 arquivos 616.
+O relatório original desta DEC-023 informou 18 testes para `firestore-writer.test.ts`. O baseline real era **15** (os 3 testes extras foram contados incorretamente). `addPendingDual` foi removida (7 testes removidos). Contratos adicionais aplicados: identidade por clientId (8 testes), cancelamento atômico fail-closed (6 testes no painel). Total atualizado: **750 testes** (34 arquivos). Contagem atualizada: `client-writer.test.ts` 50, `panel-sync.test.ts` 46, outros arquivos 654.
 
 ### Testes adicionados
 
 | Arquivo | Testes | Cobertura |
 |---------|--------|-----------|
-| `client-writer.test.ts` | +13 | CRUD atômico, applyRoutePendingsDual: 1 tx, acumulação, falha, IDs estáveis, operationId duplicado ignorado, conflito detectado, retry sem duplicata, retry com valor alterado rejeitado, mistura existentes/novos, preservação de contas, migração legado com novo ID, conflito nomes duplicados (editar), exclusão legado sem ID, conflito nomes duplicados (excluir) |
+| `client-writer.test.ts` | +21 | CRUD atômico, applyRoutePendingsDual: 1 tx, acumulação, falha, IDs estáveis, operationId duplicado ignorado, conflito detectado, retry sem duplicata, retry com valor alterado rejeitado, mistura existentes/novos, preservação de contas, migração legado com novo ID, conflito nomes duplicados (editar), exclusão legado sem ID, conflito nomes duplicados (excluir), identidade por clientId, ambiguidade sem clientId, operationId global em outro cliente, duas "Ana" com IDs separados, cliente renomeado sem duplicata, clientId desconhecido erro, operationId idempotente, cancelRouteDual atômico + recebido bloqueia + routeId vazio + propagação |
 | `firestore-writer.test.ts` | +8 | retry reenvia após falha, retry sem snapshot não faz nada, retry com UID mudado/gate fechado descartado, retry duplo 1 escrita, sucesso limpa estado, novo schedule substitui snapshot |
-| `panel-sync.test.ts` | +22 | confirmação usa applyRoutePendingsDual, sem addPendingToClient/addPendingDual, operationId imutável, UUID completo, servicesSnapshot com serviceId, ensureServiceId legado, rota salva como pending antes das pendências, falha ao salvar rota impede pendências, status atualizado para confirmed após sucesso, falha nas pendências mantém rota pending, marcação confirmed é feita somente após sucesso, isConfirmingRoute lock, finally libera lock, upsert por routeId, rota pending salva em confirmedRoutes antes das pendências (upsert), status atualizado no array após Fase 3, dashboard exclui pending, badge visual pending no histórico, transação runTransaction rejeita downgrade, UUID não usa Date.now(), routeHistoryYears inclui pending, retry persiste em saveLocalState |
+| `panel-sync.test.ts` | +25 | confirmação usa applyRoutePendingsDual, sem addPendingToClient/addPendingDual, operationId imutável, UUID completo, servicesSnapshot com serviceId, ensureServiceId legado, rota salva como pending antes das pendências, falha ao salvar rota impede pendências, status atualizado para confirmed após sucesso, falha nas pendências mantém rota pending, marcação confirmed é feita somente após sucesso, isConfirmingRoute lock, finally libera lock, upsert por routeId, rota pending salva em confirmedRoutes antes das pendências (upsert), status atualizado no array após Fase 3, dashboard exclui pending, badge visual pending no histórico, transação runTransaction rejeita downgrade, UUID não usa Date.now(), routeHistoryYears inclui pending, retry persiste em saveLocalState, ambiguidade clientId rejeita, cancelamento atômico via cancelAtomic, aplica estado após commit, ponte ausente aborta, nenhum estado local antes de commit, lock cancellingRoute |
 
 ---
 

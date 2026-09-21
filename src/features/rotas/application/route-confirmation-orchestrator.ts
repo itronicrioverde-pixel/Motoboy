@@ -12,6 +12,7 @@ export interface RouteConfirmationDraftDelivery {
 
 export interface RouteConfirmationDraftService {
   serviceId?: string;
+  readonly clientId?: string;
   readonly coleta: string;
   readonly cliente: string;
   readonly paymentStatus: string;
@@ -20,6 +21,7 @@ export interface RouteConfirmationDraftService {
 
 export interface RoutePendingItem {
   readonly operationId: string;
+  readonly clientId?: string;
   readonly nome: string;
   readonly valor: number;
   readonly desc: string;
@@ -130,6 +132,7 @@ export function createServicesSnapshot(
 ): RotaService[] {
   return services.map((service) => ({
     serviceId: requiredId(service.serviceId ?? '', 'serviceId'),
+    ...(service.clientId ? { clientId: service.clientId } : {}),
     coleta: service.coleta,
     cliente: service.cliente,
     paymentStatus: service.paymentStatus,
@@ -173,6 +176,7 @@ export function createPendingItemsFromRoute(route: Rota): RoutePendingItem[] {
 
     return [{
       operationId: `${route.id}:${serviceId}`,
+      ...(service.clientId ? { clientId: service.clientId } : {}),
       nome: service.cliente.trim(),
       valor: service.valorTotal,
       desc: `Rota · ${service.entregas.length} entrega(s)`,

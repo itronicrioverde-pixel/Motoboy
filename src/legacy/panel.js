@@ -1144,11 +1144,11 @@ export function bootstrapPanel() {
     deleteModalCtl.open();
     document.getElementById('deleteConfirm').focus();
   }
-  document.getElementById('deleteConfirm').addEventListener('click', () => {
+  document.getElementById('deleteConfirm').addEventListener('click', async () => {
     const action = pendingDeleteAction;
     clearPendingDelete();
     deleteModalCtl.close();
-    if(typeof action === 'function') action();
+    if(typeof action === 'function') await action();
   });
   ['deleteCancel', 'deleteClose', 'deleteBackdrop'].forEach(id => {
     document.getElementById(id).addEventListener('click', clearPendingDelete);
@@ -3308,6 +3308,21 @@ export function bootstrapPanel() {
       return;
     }
 
+    // Resolve clientId para serviços pendentes antes de enviar ao orquestrador
+    for(const s of routeServices){
+      if(s.paymentStatus === 'pending' && s.cliente.trim()){
+        const nomeLower = s.cliente.trim().toLowerCase();
+        const matches = clientes.filter(c => c.nome.toLowerCase() === nomeLower);
+        if(matches.length > 1){
+          showToast(`Existem ${matches.length} clientes com o nome "${s.cliente.trim()}". Renomeie um deles na aba Clientes antes de confirmar.`, {kind:'error'});
+          return;
+        }
+        if(matches.length === 1 && matches[0].id){
+          s.clientId = matches[0].id;
+        }
+      }
+    }
+
     await runRouteConfirmation({
       kind:'draft',
       services:routeServices,
@@ -3523,38 +3538,44 @@ export function bootstrapPanel() {
     return null;
   }
 
-  function cancelConfirmedRoute(routeId){
+  let cancellingRoute = false;
+  async function cancelConfirmedRoute(routeId){
+    if(cancellingRoute) return;
     const idx = confirmedRoutes.findIndex(r => r.id === routeId);
     if(idx < 0) return;
 
-    // 1) remove a entrada de faturamento gerada por esta rota (o "recebido na hora")
-    for(let i = entradas.length - 1; i >= 0; i--){
-      if(entradas[i].routeId === routeId) entradas.splice(i, 1);
+    if(!window.__motoboyRotas || !window.__motoboyRotas.cancelAtomic){
+      showToast('Ponte de cancelamento atômico indisponível. Recarregue a página.', {kind:'error'});
+      return;
     }
 
-    // 2) remove as contas que esta rota criou nos clientes (nenhuma tem pagamento, já checamos)
-    let clientsChanged = false;
-    clientes.forEach(c => {
-      if(!Array.isArray(c.contas)) return;
-      const before = c.contas.length;
-      c.contas = c.contas.filter(conta => conta.routeId !== routeId);
-      if(c.contas.length !== before){
-        syncClientBalance(c);
-        clientsChanged = true;
+    cancellingRoute = true;
+    try {
+      const updatedClientes = await window.__motoboyRotas.cancelAtomic(routeId);
+
+      // Só altera estado local APÓS commit remoto
+      for(const updated of updatedClientes){
+        const local = clientes.find(c => c.id === updated.id || c.nome === updated.nome);
+        if(local){
+          local.contas = updated.contas;
+          local.pendente = updated.pendente;
+        }
       }
-    });
+      for(let i = entradas.length - 1; i >= 0; i--){
+        if(entradas[i].routeId === routeId) entradas.splice(i, 1);
+      }
+      confirmedRoutes.splice(idx, 1);
 
-    // 3) remove a própria rota do histórico
-    confirmedRoutes.splice(idx, 1);
-    // Ponte: remove a rota no Firestore.
-    if(window.__motoboyRotas) window.__motoboyRotas.remove(routeId);
-
-    saveLocalState();
-    if(clientsChanged) syncClientsToFirestore();
-    renderFaturamento();
-    renderClientes();
-    renderDashboard();
-    renderRouteHistory();
+      saveLocalState();
+      renderFaturamento();
+      renderClientes();
+      renderDashboard();
+      renderRouteHistory();
+    } catch(err){
+      showToast('Erro ao cancelar rota no servidor: ' + (err.message || err), {kind:'error'});
+    } finally {
+      cancellingRoute = false;
+    }
   }
 
   function renderClientes(){

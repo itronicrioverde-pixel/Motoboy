@@ -21,6 +21,7 @@ import type {
   Rota,
   RotaRepository,
 } from '../domain/rota';
+import { validateRota } from '../domain/rota';
 import {
   toNumber,
   toNumberOrNull,
@@ -72,6 +73,10 @@ export class FirestoreRotaRepository implements RotaRepository {
   }
 
   async save(rota: Rota): Promise<void> {
+    const validation = validateRota(rota);
+    if (!validation.ok) {
+      throw new Error(`Rota inválida: ${validation.message}`);
+    }
     const ref = doc(this.collectionRef(), rota.id);
     await runTransaction(db, async (tx) => {
       const existing = await tx.get(ref);
