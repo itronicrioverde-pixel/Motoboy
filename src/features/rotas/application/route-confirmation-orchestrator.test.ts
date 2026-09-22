@@ -192,7 +192,7 @@ describe('RouteConfirmationOrchestrator', () => {
     expect(dependencies.completeLocally).not.toHaveBeenCalled();
   });
 
-  it('retry reutiliza routeId, serviceId e operationId do snapshot persistido', async () => {
+  it('retry reutiliza routeId e serviceId do snapshot persistido', async () => {
     const { orchestrator, dependencies } = setup();
     const route = pendingRoute();
 
@@ -203,7 +203,7 @@ describe('RouteConfirmationOrchestrator', () => {
     expect(dependencies.generateServiceId).not.toHaveBeenCalled();
     expect(dependencies.applyFinancialPendings).toHaveBeenCalledWith(
       [{
-        operationId: 'rota-fixed:svc-fixed',
+        serviceId: 'svc-fixed',
         nome: 'Cliente A',
         valor: 25,
         desc: 'Rota · 1 entrega(s)',
@@ -231,7 +231,7 @@ describe('RouteConfirmationOrchestrator', () => {
     expect(dependencies.generateRouteId).not.toHaveBeenCalled();
     expect(dependencies.generateServiceId).not.toHaveBeenCalled();
     expect(dependencies.applyFinancialPendings).toHaveBeenCalledWith(
-      [expect.objectContaining({ operationId: 'rota-fixed:svc-fixed' })],
+      [expect.objectContaining({ serviceId: 'svc-fixed' })],
       'rota-fixed',
     );
   });
@@ -250,8 +250,8 @@ describe('RouteConfirmationOrchestrator', () => {
         throw new Error('confirm offline');
       }
     });
-    const applyFinancialPendings = vi.fn(async (items: readonly { operationId: string }[]) => {
-      items.forEach((item) => financialLedger.add(item.operationId));
+    const applyFinancialPendings = vi.fn(async (items: readonly { serviceId: string }[], routeId: string) => {
+      items.forEach((item) => financialLedger.add(`${routeId}:${item.serviceId}`));
     });
     const completeLocally = vi.fn();
     const shared = setup({ saveRoute, applyFinancialPendings, completeLocally });
@@ -415,7 +415,7 @@ describe('RouteConfirmationOrchestrator', () => {
 });
 
 describe('createPendingItemsFromRoute', () => {
-  it('ignora recebidos e deriva operationId apenas de routeId + serviceId', () => {
+  it('ignora recebidos e preserva o serviceId permanente', () => {
     const route = pendingRoute({
       services: [
         pendingRoute().services[0],
@@ -428,7 +428,7 @@ describe('createPendingItemsFromRoute', () => {
     });
 
     expect(createPendingItemsFromRoute(route)).toEqual([{
-      operationId: 'rota-fixed:svc-fixed',
+      serviceId: 'svc-fixed',
       nome: 'Cliente A',
       valor: 25,
       desc: 'Rota · 1 entrega(s)',

@@ -60,11 +60,20 @@ export interface RemoveClientOptions {
 }
 
 export interface RoutePendingItem {
-  readonly operationId: string;
+  readonly serviceId: string;
   readonly clientId?: string;
   readonly nome: string;
   readonly valor: number;
   readonly desc: string;
+}
+
+export interface ApplyReceiptInput {
+  readonly clientId?: string;
+  /** Nome exato usado apenas para localizar um cliente legado sem ID. */
+  readonly legacyLookupName?: string;
+  readonly valor: number;
+  readonly dateISO: string;
+  readonly dateLabel: string;
 }
 
 function usersCol(uid: string) {
@@ -84,9 +93,11 @@ function createConta(
   desc: string,
   routeId: string,
   operationId: string,
+  id: string,
+  dateISO: string,
 ) {
   return {
-    id: `conta-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    id,
     operationId,
     routeId,
     desc,
@@ -95,8 +106,14 @@ function createConta(
     saldo: valor,
     status: 'open',
     data: 'Hoje',
-    dateISO: new Date().toISOString().slice(0, 10),
+    dateISO,
   };
+}
+
+function requiredIdentifier(value: string, label: string): string {
+  const normalized = value.trim();
+  if (!normalized) throw new Error(`${label} obrigatório.`);
+  return normalized;
 }
 
 /**
@@ -305,7 +322,8 @@ export async function removeClientDual(id: string, options?: RemoveClientOptions
 /**
  * Aplica todas as pendências de uma rota em uma única transação atômica.
  *
- * operationId é ${routeId}:${serviceId} — apenas identificadores imutáveis.
+ * O writer recebe serviceId e constrói operationId como
+ * ${routeId}:${serviceId} — apenas identificadores imutáveis.
  * Nome, valor e descrição são dados da operação, não parte da identidade.
  *
  * Se o mesmo operationId já existe com conteúdo diferente, lança erro
@@ -313,7 +331,7 @@ export async function removeClientDual(id: string, options?: RemoveClientOptions
  *
  * Pré-condições:
  * - IDs de novos clientes são pré-gerados antes da transação.
- * - operationIds são usados para impedir duplicação e detectar conflitos.
+ * - Contas, datas e operationIds são preparados antes da transação.
  *
  * Dentro de uma única runTransaction:
  * 1. Lê clients/data uma vez.
@@ -332,14 +350,31 @@ export async function applyRoutePendingsDual(
   if (!uid) throw new Error('Sem usuário autenticado.');
   if (items.length === 0) return [];
 
-  for (const item of items) {
-    if (!item.operationId) {
-      throw new Error(`operationId obrigatório para pendência do cliente "${item.nome}".`);
-    }
-  }
+  const normalizedRouteId = requiredIdentifier(routeId, 'routeId');
+  const transactionDateISO = new Date().toISOString().slice(0, 10);
+  const preparedItems = items.map((item) => {
+    const serviceId = requiredIdentifier(
+      item.serviceId,
+      `serviceId da pendência do cliente "${item.nome}"`,
+    );
+    const operationId = `${normalizedRouteId}:${serviceId}`;
+    return {
+      ...item,
+      serviceId,
+      operationId,
+      conta: createConta(
+        item.valor,
+        item.desc,
+        normalizedRouteId,
+        operationId,
+        `conta-${generateId(uid)}`,
+        transactionDateISO,
+      ),
+    };
+  });
 
   const uniqueNames = [...new Set(
-    items.filter((i) => !i.clientId).map((i) => i.nome.toLowerCase()),
+    preparedItems.filter((i) => !i.clientId).map((i) => i.nome.toLowerCase()),
   )];
   const idMap = new Map<string, string>();
   for (const name of uniqueNames) {
@@ -357,7 +392,7 @@ export async function applyRoutePendingsDual(
     let clientes = [...existing];
     const newProfiles: Array<{ id: string; nome: string }> = [];
 
-    for (const item of items) {
+    for (const item of preparedItems) {
       const nomeLower = item.nome.toLowerCase();
 
       // Busca global por operationId — protege contra contaminação cruzada
@@ -418,7 +453,7 @@ export async function applyRoutePendingsDual(
         clientes = [...clientes, client];
       }
 
-      const newConta = createConta(item.valor, item.desc, routeId, item.operationId);
+      const newConta = { ...item.conta };
 
       const matchId = client.id;
       const updatedClient: LegacyCliente = {
@@ -455,15 +490,133 @@ export async function applyRoutePendingsDual(
 }
 
 /**
+ * Aplica um recebimento FIFO sobre a projeção financeira mais recente.
+ *
+ * A leitura e a escrita de clients/data pertencem à mesma transação. Assim,
+ * uma confirmação de recebimento concorrente com cancelRouteDual é
+ * serializada pelo Firestore: ou o recebimento vence e bloqueia o
+ * cancelamento, ou o cancelamento vence e o recebimento encontra saldo zero.
+ *
+ * O registro do recebimento é preparado antes de runTransaction para que uma
+ * reexecução do callback use exatamente os mesmos dados.
+ */
+export async function applyReceiptDual(
+  input: ApplyReceiptInput,
+): Promise<LegacyCliente[]> {
+  const uid = currentUid();
+  if (!uid) throw new Error('Sem usuário autenticado.');
+  if (!Number.isFinite(input.valor) || input.valor <= 0) {
+    throw new Error('valor do recebimento deve ser maior que zero.');
+  }
+  if (!input.clientId && !input.legacyLookupName?.trim()) {
+    throw new Error('clientId ou legacyLookupName é obrigatório para recebimento.');
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(input.dateISO)) {
+    throw new Error('dateISO inválida para recebimento.');
+  }
+
+  const preparedReceipt = {
+    id: `receipt-${generateId(uid)}`,
+    valor: input.valor,
+    data: requiredIdentifier(input.dateLabel, 'dateLabel'),
+    dateISO: input.dateISO,
+  };
+  let resultClientes: LegacyCliente[] = [];
+
+  await runTransaction(db, async (tx) => {
+    const clientsSnap = await tx.get(clientsDoc(uid));
+    const existing: LegacyCliente[] = clientsSnap.exists()
+      ? (clientsSnap.data().clientes as LegacyCliente[] ?? [])
+      : [];
+
+    let targetIndex = -1;
+    if (input.clientId) {
+      targetIndex = existing.findIndex((client) => client.id === input.clientId);
+      if (targetIndex < 0) {
+        throw new Error(`Cliente não encontrado para clientId "${input.clientId}".`);
+      }
+    } else {
+      const lookupName = input.legacyLookupName!.trim().toLowerCase();
+      const matches = existing
+        .map((client, index) => ({ client, index }))
+        .filter(({ client }) => !client.id && client.nome.trim().toLowerCase() === lookupName);
+      if (matches.length === 0) {
+        throw new Error(
+          `Nenhum cliente legado encontrado com nome "${input.legacyLookupName}".`,
+        );
+      }
+      if (matches.length > 1) {
+        throw new Error(
+          `Conflito: existem ${matches.length} clientes legados com nome ` +
+          `"${input.legacyLookupName}". Recebimento não é possível sem clientId.`,
+        );
+      }
+      targetIndex = matches[0].index;
+    }
+
+    const target = existing[targetIndex];
+    const contas = Array.isArray(target.contas)
+      ? (target.contas as Array<Record<string, unknown>>).map((conta) => ({ ...conta }))
+      : [];
+    const saldoDisponivel = contas.reduce(
+      (sum, conta) => sum + Math.max(0, Number(conta.saldo) || 0),
+      0,
+    );
+    if (input.valor > saldoDisponivel + 0.001) {
+      throw new Error(
+        `O valor recebido excede o saldo pendente atual de ${saldoDisponivel}.`,
+      );
+    }
+
+    let restante = input.valor;
+    for (let index = contas.length - 1; index >= 0 && restante > 0; index -= 1) {
+      const conta = contas[index];
+      const saldo = Math.max(0, Number(conta.saldo) || 0);
+      if (saldo <= 0) continue;
+
+      const aplicado = Math.min(restante, saldo);
+      const novoSaldo = saldo - aplicado;
+      conta.recebido = (Number(conta.recebido) || 0) + aplicado;
+      conta.saldo = novoSaldo;
+      conta.status = novoSaldo <= 0.001 ? 'paid' : 'partial';
+      restante -= aplicado;
+    }
+
+    const pendente = contas.reduce(
+      (sum, conta) => sum + Math.max(0, Number(conta.saldo) || 0),
+      0,
+    );
+    const updatedClient: LegacyCliente = {
+      ...target,
+      contas,
+      pendente,
+      recebimentos: [
+        { ...preparedReceipt },
+        ...(Array.isArray(target.recebimentos) ? target.recebimentos : []),
+      ],
+    };
+    const clientes = existing.map((client, index) =>
+      index === targetIndex ? updatedClient : client,
+    );
+
+    tx.set(clientsDoc(uid), { clientes }, { merge: true });
+    resultClientes = clientes;
+  });
+
+  return resultClientes;
+}
+
+/**
  * Cancela uma rota e remove atomicamente todas as contas associadas dos clientes.
  *
  * Dentro de uma única runTransaction:
- * 1. Lê clients/data.
- * 2. Verifica no dado remoto que nenhuma conta da rota possui recebido > 0.
- * 3. Filtra as contas com routeId correspondente de todos os clientes.
- * 4. Recalcula pendente de cada cliente afetado.
- * 5. Grava clients/data atualizado.
- * 6. Remove o documento da rota (users/{uid}/rotas/{routeId}).
+ * 1. Lê o documento da rota (verifica existência).
+ * 2. Lê clients/data.
+ * 3. Verifica no dado remoto que nenhuma conta da rota possui recebido > 0.
+ * 4. Filtra as contas com routeId correspondente de todos os clientes.
+ * 5. Recalcula pendente de cada cliente afetado.
+ * 6. Grava clients/data atualizado.
+ * 7. Remove o documento da rota (tx.delete).
  *
  * Em falha, nenhuma fonte é alterada.
  *
@@ -481,6 +634,11 @@ export async function cancelRouteDual(
   const rotaRef = doc(collection(db, 'users', uid, 'rotas'), routeId);
 
   await runTransaction(db, async (tx) => {
+    const rotaSnap = await tx.get(rotaRef);
+    if (!rotaSnap.exists()) {
+      throw new Error(`Rota ${routeId} não encontrada.`);
+    }
+
     const clientsSnap = await tx.get(clientsDoc(uid));
     const existing: LegacyCliente[] = clientsSnap.exists()
       ? (clientsSnap.data().clientes as LegacyCliente[] ?? [])

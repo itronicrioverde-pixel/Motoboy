@@ -15,7 +15,7 @@ export async function applyRouteFinancialPendings(
   routeId: string,
 ): Promise<LegacyCliente[]> {
   const clientItems: ClientWriterPendingItem[] = items.map((item) => ({
-    operationId: item.operationId,
+    serviceId: item.serviceId,
     ...(item.clientId ? { clientId: item.clientId } : {}),
     nome: item.nome,
     valor: item.valor,

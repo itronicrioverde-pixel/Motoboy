@@ -20,7 +20,7 @@ export interface RouteConfirmationDraftService {
 }
 
 export interface RoutePendingItem {
-  readonly operationId: string;
+  readonly serviceId: string;
   readonly clientId?: string;
   readonly nome: string;
   readonly valor: number;
@@ -175,7 +175,7 @@ export function createPendingItemsFromRoute(route: Rota): RoutePendingItem[] {
     seen.add(serviceId);
 
     return [{
-      operationId: `${route.id}:${serviceId}`,
+      serviceId,
       ...(service.clientId ? { clientId: service.clientId } : {}),
       nome: service.cliente.trim(),
       valor: service.valorTotal,

@@ -11,7 +11,7 @@ vi.mock('../../customers/infrastructure/client-writer', () => ({
 import { applyRouteFinancialPendings } from './client-pendings-gateway';
 
 describe('applyRouteFinancialPendings', () => {
-  it('adapta o contrato atual de client-writer sem alterar os identificadores', async () => {
+  it('passa serviceId para o writer construir o operationId', async () => {
     const expected = [{
       id: 'cliente-1',
       nome: 'Cliente A',
@@ -21,7 +21,7 @@ describe('applyRouteFinancialPendings', () => {
     }];
     mocks.applyRoutePendingsDual.mockResolvedValue(expected);
     const items = [{
-      operationId: 'rota-fixed:svc-fixed',
+      serviceId: 'svc-fixed',
       nome: 'Cliente A',
       valor: 25,
       desc: 'Rota · 1 entrega(s)',
@@ -32,7 +32,7 @@ describe('applyRouteFinancialPendings', () => {
     expect(mocks.applyRoutePendingsDual).toHaveBeenCalledTimes(1);
     expect(mocks.applyRoutePendingsDual).toHaveBeenCalledWith(
       [{
-        operationId: 'rota-fixed:svc-fixed',
+        serviceId: 'svc-fixed',
         nome: 'Cliente A',
         valor: 25,
         desc: 'Rota · 1 entrega(s)',

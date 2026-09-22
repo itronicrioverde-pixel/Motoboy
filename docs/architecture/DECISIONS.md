@@ -830,7 +830,7 @@ Não existem solicitações externas de clientes; não existe carteira; não exi
 ## DEC-022 — Separação entre persistência local e sincronização remota no bootstrap
 
 **Status:** Aprovada e implementada
-**Data:** 14/09/2026 (atualizada 17/09/2026)
+**Data:** 14/09/2026 (atualizada 21/09/2026 — remoção do writer financeiro debounced)
 
 ### Contexto
 
@@ -847,8 +847,9 @@ Antes desta decisão, `loadCustomersIntoPanel()` apenas lia `customers/{id}` e c
 #### Persistência local vs. sincronização remota
 
 - `saveLocalState()` escreve **exclusivamente** no localStorage. Não há chamadas automáticas ao Firestore dentro dela.
-- Sincronização Firestore (`saveClientsToFirestore`, `saveMotoToFirestore`) ocorre **somente após mutações reais do usuário**, por meio de `syncClientsToFirestore()` e `syncMotoToFirestore()`.
-- Ambas as funções de sync possuem guarda via `SyncGate`: só executam após a hidratação individual respectiva.
+- Sincronização não financeira da moto (`saveMotoToFirestore`) ocorre **somente após mutações reais do usuário**, por meio de `syncMotoToFirestore()`.
+- O documento financeiro agregado `clients/data` **não usa writer debounced**. Criação/edição/exclusão de clientes, pendências de rota, recebimentos e cancelamentos usam funções específicas com `runTransaction`.
+- O sync da moto possui guarda via `SyncGate`: só executa após a hidratação individual respectiva.
 - `saveLocalState()` é removida do final de `bootstrapPanel()`.
 - Removidos do boot: `loadPaymentsIntoPanel`, `loadIncomeIntoPanel`, `loadReceivablesIntoPanel` (o painel não consome seus resultados).
 
@@ -892,15 +893,14 @@ Cada feature (clientes, moto) possui três estados gerenciados pelo `HydrationMa
 - Rastreia objetos matched (não strings de nome) para evitar falsos positivos com nomes duplicados
 
 **Guards de escrita (SyncGate):**
-- `saveClientsToFirestore()` possui guarda `if(!clientsRemoteRead.isOpen) return;` — impede escrita antes da leitura remota
-- `syncClientsToFirestore()` possui guarda `if(!clientsHydrated.isOpen) return;`
+- Mutações financeiras dependem de `clientsHydrated` para liberar interação e depois leem a projeção autoritativa dentro de `runTransaction`.
 - `syncMotoToFirestore()` possui guarda `if(!motoHydrated.isOpen) return;`
 - `saveMotoToFirestore()` possui guarda `if(!motoHydrated.isOpen) return;`
 
-**Risco de concorrência documentado:**
-- O documento agregado `clients/data` é escrito por um único dispositivo por vez (via `setDoc` com `merge: true`)
-- Dois dispositivos escrevendo simultaneamente podem causar perda de dados (último escritor vence)
-- Este risco é aceito temporariamente e será resolvido no cutover (DEC-017)
+**Concorrência do agregado financeiro:**
+- Não há escrita de snapshot completo agendada ou atrasada para `clients/data`.
+- Todas as mutações leem a versão atual e gravam a projeção completa na mesma transação; concorrência entre recebimento e cancelamento é serializada pelo Firestore.
+- O cutover da DEC-017 continua necessário para eliminar o agregado legado, mas a política de “último escritor vence” não é mais aceita para mutações financeiras.
 - Nenhum campo novo é adicionado ao documento agregado — compatibilidade total com documentos antigos
 
 #### Precedência das fontes de verdade
@@ -922,6 +922,7 @@ Hierarquia de dados (DEC-006, DEC-012):
 #### Escrita debounced no Firestore
 
 - `createFirestoreWriter()` (`src/shared/infrastructure/firestore-writer.ts`) é um módulo reutilizável extraído do `panel.js`.
+- Seu uso no painel fica restrito a dados não financeiros, como a moto; `clients/data` é explicitamente excluído.
 - Captura UID e snapshot imutável no agendamento (`schedule()`).
 - Antes de escrever, confirma que o UID atual ainda é o mesmo (previne escrita com UID errado após logout/troca de usuário).
 - Gate-aware: não escreve se o `SyncGate` estiver fechado.
@@ -964,11 +965,11 @@ hydrateClientes(merged):
   2. Substitui clientes diretamente (SEM merge com localStorage)
      → garante que valores remotos vazios prevalecem sobre cache antigo
   3. syncClientBalance() em cada cliente
-  4. clientsRemoteRead.open() → habilita saveClientsToFirestore
-  5. clientsHydrated.open()   → habilita syncClientsToFirestore + interação
+  4. clientsRemoteRead.open() → registra leitura remota concluída
+  5. clientsHydrated.open()   → habilita interação financeira transacional
   6. saveLocalState()
 
-Escrita debounced (após mutação do usuário):
+Escrita debounced não financeira (após mutação do usuário):
   1. createFirestoreWriter().schedule(snapshot)
      → captura UID + snapshot no agendamento
      → debounce 500ms consolida chamadas consecutivas
@@ -977,9 +978,14 @@ Escrita debounced (após mutação do usuário):
   4. Em falha: loga erro, não propaga
 
 CRUD de clientes (criar/editar/excluir):
-  1. Bridge grava em customers/{id} via customersService
-  2. Em sucesso: atualiza array local + saveLocalState + syncClientsToFirestore
+  1. client-writer executa runTransaction em customers/{id} + clients/data
+  2. Em sucesso: atualiza array local + saveLocalState
   3. Em falha: aborta, preserva estado anterior, exibe toast de erro
+
+Recebimento:
+  1. applyReceiptDual lê clients/data dentro de runTransaction
+  2. Aplica FIFO e grava a projeção completa no mesmo commit
+  3. Painel substitui clientes pelo retorno autoritativo somente após o commit
 
 Retry (feature em estado failed):
   1. Usuário tenta interagir → guard bloqueia
@@ -992,17 +998,17 @@ Retry (feature em estado failed):
 ### Consequências
 
 - Dados antigos do localStorage não podem mais sobrescrever dados atuais do Firestore durante o bootstrap.
-- Sincronização Firestore só ocorre após hidratação + mutação real do usuário.
+- Escritas Firestore só ocorrem após hidratação + mutação real do usuário.
 - Projeção financeira de outros dispositivos é sincronizada no boot.
 - `__applyRemoteMoto` e `__applyRemoteClientes` substituem diretamente (sem merge com `localStorage`) — a persistência é feita pelas funções de hidratação.
 - Modo offline é somente leitura — sem suporte a edição offline com outbox nesta fase.
 - Nenhuma alteração de schema, rules ou Functions. **Frontend requer build e deploy** (Vite build + hosting).
-- Risco de concorrência entre dispositivos aceito temporariamente, com resolução prevista no cutover (DEC-017).
+- Recebimento e cancelamento concorrentes são serializados sobre a mesma leitura transacional de `clients/data`.
 - Nome normalizado permanece como fallback de migração, não como chave de identidade.
-- Escrita debounced captura UID no agendamento e confirma antes de executar — impede escrita com UID errado após logout/troca de usuário.
+- Escrita debounced não financeira captura UID no agendamento e confirma antes de executar — impede escrita com UID errado após logout/troca de usuário.
 - CRUD de clientes propaga erros e preserva estado anterior em falha — sem dados corrompidos.
 - IDs de clientes são gerados por `crypto.randomUUID()` — estáveis e únicos para migração de registros legados.
-- **Risco de concorrência não resolvido**: dois dispositivos escrevendo simultaneamente em `clients/data` causam perda de dados (último escritor vence). Outbox, operações atômicas ou transações ficam para o cutover (DEC-017).
+- `clients/data` continua sendo um agregado temporário, mas não possui caminho de escrita financeira fora das transações de `client-writer.ts`.
 
 ### Testes adicionados
 
@@ -1019,7 +1025,7 @@ Retry (feature em estado failed):
 
 ### Arquivos alterados
 
-- `src/legacy/panel.js` — saveLocalState(), hidratação (substituição direta), guards, sync explícito, SyncGate, CRUD dual fonte, writer debounced, resolução de clientId antes da confirmação, cancelamento atômico via `cancelRouteDual`
+- `src/legacy/panel.js` — saveLocalState(), hidratação (substituição direta), guards, sync da moto, CRUD dual fonte, recebimento e cancelamento transacionais
 - `src/main.ts` — orquestração de hidratação via HydrationManager, bridges de retry/failed
 - `src/shared/application/hydration.ts` — HydrationManager (loadFeature, retryFeatureLoad, estado por feature)
 - `src/shared/application/sync-gate.ts` — SyncGate (controle de escrita open/close)
@@ -1040,7 +1046,7 @@ Retry (feature em estado failed):
 ## DEC-023 — Atomicidade e idempotência da confirmação de rota
 
 **Status:** Aprovada e implementada
-**Data:** 17/09/2026 (atualizada 18/09/2026 — transação atômica, upsert, UUID, ciclo de vida completo)
+**Data:** 17/09/2026 (atualizada 21/09/2026 — operationId derivado no writer e dados pré-gerados)
 
 ### Contexto
 
@@ -1060,7 +1066,8 @@ A confirmação de rota no `panel.js` (handler de `btnConfirmRoute`) executava u
   - Para cada item: encontra ou cria cliente, adiciona conta.
   - Grava todos os perfis novos (`customers/{id}`) e `clients/data` **uma vez**.
   - Retorna o array completo de clientes atualizados.
-- O `panel.js` substitui o `for...of` + `await addPendingToClient()` por uma chamada `await applyRoutePendingsDual(pendings, routeId)`.
+- Cada item recebe `serviceId`; o writer constrói internamente o `operationId` e não aceita identidade arbitrária fornecida pelo chamador.
+- O adapter `client-pendings-gateway.ts` liga o orquestrador a `applyRoutePendingsDual(pendings, routeId)`.
 - Atualização de memória e interface ocorre **somente após o commit**.
 
 #### `serviceId` permanente por serviço
@@ -1074,15 +1081,17 @@ A confirmação de rota no `panel.js` (handler de `btnConfirmRoute`) executava u
 #### Idempotência por `operationId`
 
 - Cada pendência possui um `operationId` estritamente imutável: `${routeId}:${serviceId}`.
+- O chamador fornece `routeId` e `serviceId` separadamente. `client-writer.ts` valida ambos e monta o `operationId`; não existe campo `operationId` no input público do writer.
 - Nome, valor e descrição são **dados da operação**, não parte da identidade.
 - Dentro da transação, o writer verifica se já existe uma conta com o mesmo `operationId` no cliente:
   - **Mesmo operationId + mesmo conteúdo**: ignorado (idempotente, sem duplicata).
   - **Mesmo operationId + conteúdo diferente**: **conflito** — a operação é rejeitada com erro. Nunca cria duplicata nem sobrescreve silenciosamente.
-- `operationId` é pré-calculado *antes* de entrar no callback da transação.
+- `operationId` é calculado pelo writer *antes* de entrar no callback da transação.
 
 #### IDs pré-gerados
 
-- `generateId()` é chamado **antes** de `runTransaction`. O Firestore pode re-executar o callback; pré-gerar garante que o mesmo ID é usado em todas as tentativas.
+- `generateId()` é chamado **antes** de `runTransaction`. O Firestore pode reexecutar o callback; IDs de clientes, IDs das contas e a data da conta permanecem iguais em todas as tentativas.
+- `Date.now()`, `Math.random()` e `new Date()` não são executados dentro do callback transacional.
 - Para múltiplos clientes novos no batch, cada nome único recebe um ID candidato pré-gerado. Se o mesmo nome aparece duas vezes, o mesmo ID é reutilizado.
 
 #### Retry do writer (`firestore-writer.ts`)
@@ -1195,7 +1204,7 @@ A confirmação de rota executava sua máquina de estados, lock, geração de id
 - O lock pertence ao orquestrador e é sempre liberado em `finally`.
 - Para uma tentativa nova, a ordem é: gerar `serviceId` ausente, montar o snapshot, gerar um único `routeId`, salvar `pending`, fazer upsert local, aplicar pendências e salvar a mesma rota como `confirmed`.
 - O snapshot de `RotaService` passa a preservar `serviceId` no Firestore. Rotas históricas continuam aceitando sua ausência, mas uma rota `pending` sem `serviceId` não pode ser retomada com identificadores inventados.
-- Retry recebe a rota `pending` persistida e reconstrói cada `operationId` exclusivamente como `${routeId}:${serviceId}`.
+- Retry recebe a rota `pending` persistida, recupera cada `serviceId` e entrega `routeId` + `serviceId` ao writer, que deriva exclusivamente `${routeId}:${serviceId}`.
 - `confirmed` é terminal. Efeitos locais de sucesso — status local, faturamento, limpeza do formulário e mensagem — só executam depois da gravação da Fase 3.
 - O histórico oferece a ação **Retomar confirmação** para rotas `pending`, usando o mesmo orquestrador da confirmação inicial.
 

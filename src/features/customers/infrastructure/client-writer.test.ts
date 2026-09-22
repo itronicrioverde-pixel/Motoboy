@@ -46,6 +46,7 @@ import {
   updateClientDual,
   removeClientDual,
   applyRoutePendingsDual,
+  applyReceiptDual,
   cancelRouteDual,
 } from './client-writer';
 
@@ -354,14 +355,15 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       const result = await applyRoutePendingsDual(
         [
-          { operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota · 2 entrega(s)' },
-          { operationId: 'r1:svc-bbb', nome: 'Bruno', valor: 30, desc: 'Rota · 1 entrega(s)' },
+          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota · 2 entrega(s)' },
+          { serviceId: 'svc-bbb', nome: 'Bruno', valor: 30, desc: 'Rota · 1 entrega(s)' },
         ],
         'r1',
       );
 
       expect(mocks.runTransaction).toHaveBeenCalledTimes(1);
       expect(result).toHaveLength(2);
+      expect((result[0].contas[0] as { operationId: string }).operationId).toBe('r1:svc-aaa');
     });
 
     it('duas pendências do mesmo cliente são acumuladas', async () => {
@@ -372,8 +374,8 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       const result = await applyRoutePendingsDual(
         [
-          { operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota · 2 entrega(s)' },
-          { operationId: 'r1:svc-bbb', nome: 'Ana', valor: 30, desc: 'Rota · 1 entrega(s)' },
+          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota · 2 entrega(s)' },
+          { serviceId: 'svc-bbb', nome: 'Ana', valor: 30, desc: 'Rota · 1 entrega(s)' },
         ],
         'r1',
       );
@@ -390,7 +392,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
           'r1',
         ),
       ).rejects.toThrow('Transaction failed');
@@ -407,19 +409,19 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
           'r1',
         ),
       ).rejects.toThrow('Sem usuário autenticado.');
     });
 
-    it('rejeita operationId vazio em vez de fallback por nome', async () => {
+    it('rejeita serviceId vazio em vez de aceitar operationId arbitrário', async () => {
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: '', nome: 'Ana', valor: 50, desc: 'test' }],
+          [{ serviceId: '', nome: 'Ana', valor: 50, desc: 'test' }],
           'r1',
         ),
-      ).rejects.toThrow('operationId obrigatório');
+      ).rejects.toThrow('serviceId');
     });
 
     it('dois clientes novos com nomes iguais recebem o mesmo ID (mesmo cliente)', async () => {
@@ -441,8 +443,8 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await applyRoutePendingsDual(
         [
-          { operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' },
-          { operationId: 'r1:svc-bbb', nome: 'Ana', valor: 30, desc: 'test2' },
+          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' },
+          { serviceId: 'svc-bbb', nome: 'Ana', valor: 30, desc: 'test2' },
         ],
         'r1',
       );
@@ -473,7 +475,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
+        [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
         'r1',
       );
 
@@ -485,6 +487,49 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       expect(firstRunIds).toEqual(secondRunIds);
     });
 
+    it('reexecução do callback mantém ID e data da conta pré-gerados', async () => {
+      const tx = makeTx();
+      const writtenAccounts: Array<{ id: string; dateISO: string; operationId: string }> = [];
+      tx.set = vi.fn((_ref: unknown, data: unknown) => {
+        const payload = data as { clientes?: Array<{ contas: Array<{ id: string; dateISO: string; operationId: string }> }> };
+        if (payload.clientes?.[0]?.contas[0]) {
+          writtenAccounts.push(payload.clientes[0].contas[0]);
+        }
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        await fn(tx);
+      });
+
+      await applyRoutePendingsDual(
+        [{ serviceId: 'svc-stable', nome: 'Ana', valor: 50, desc: 'test' }],
+        'route-stable',
+      );
+
+      expect(writtenAccounts).toHaveLength(2);
+      expect(writtenAccounts[0]).toEqual(writtenAccounts[1]);
+      expect(writtenAccounts[0].operationId).toBe('route-stable:svc-stable');
+    });
+
+    it('ignora operationId arbitrário do chamador e deriva identidade de routeId + serviceId', async () => {
+      const tx = makeTx();
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+      const forgedItem = {
+        serviceId: 'svc-real',
+        operationId: 'outra-rota:svc-falsa',
+        nome: 'Ana',
+        valor: 50,
+        desc: 'test',
+      } as unknown as Parameters<typeof applyRoutePendingsDual>[0][number];
+
+      const result = await applyRoutePendingsDual([forgedItem], 'route-real');
+
+      expect((result[0].contas[0] as { operationId: string }).operationId)
+        .toBe('route-real:svc-real');
+    });
+
     it('ignora pendências com operationId duplicado dentro da mesma transação', async () => {
       const tx = makeTx();
       tx.set = vi.fn();
@@ -494,8 +539,8 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       const result = await applyRoutePendingsDual(
         [
-          { operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' },
-          { operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' },
+          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' },
+          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' },
         ],
         'r1',
       );
@@ -524,7 +569,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 99, desc: 'new' }],
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 99, desc: 'new' }],
           'r1',
         ),
       ).rejects.toThrow('Conflito de operationId');
@@ -549,7 +594,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' }],
+        [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' }],
         'r1',
       );
 
@@ -577,7 +622,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 99, desc: 'Rota' }],
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 99, desc: 'Rota' }],
           'r1',
         ),
       ).rejects.toThrow('Conflito de operationId');
@@ -599,8 +644,8 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       const result = await applyRoutePendingsDual(
         [
-          { operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' },
-          { operationId: 'r1:svc-bbb', nome: 'Bruno', valor: 30, desc: 'Rota' },
+          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' },
+          { serviceId: 'svc-bbb', nome: 'Bruno', valor: 30, desc: 'Rota' },
         ],
         'r1',
       );
@@ -635,7 +680,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ operationId: 'r2:svc-aaa', nome: 'Ana', valor: 50, desc: 'Nova rota' }],
+        [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Nova rota' }],
         'r2',
       );
 
@@ -675,7 +720,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 10, desc: 'test' }],
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 10, desc: 'test' }],
           'r1',
         ),
       ).rejects.toThrow('Network error');
@@ -721,7 +766,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ operationId: 'r1:svc-aaa', clientId: 'c2', nome: 'Ana Costa', valor: 50, desc: 'test' }],
+        [{ serviceId: 'svc-aaa', clientId: 'c2', nome: 'Ana Costa', valor: 50, desc: 'test' }],
         'r1',
       );
 
@@ -748,7 +793,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
           'r1',
         ),
       ).rejects.toThrow('Ambiguidade');
@@ -771,7 +816,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', clientId: 'c2', nome: 'Bruno', valor: 99, desc: 'other' }],
+          [{ serviceId: 'svc-aaa', clientId: 'c2', nome: 'Bruno', valor: 99, desc: 'other' }],
           'r1',
         ),
       ).rejects.toThrow('Conflito de operationId');
@@ -794,8 +839,8 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       const result = await applyRoutePendingsDual(
         [
-          { operationId: 'r1:svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'test' },
-          { operationId: 'r1:svc-bbb', clientId: 'c2', nome: 'Ana', valor: 30, desc: 'test' },
+          { serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'test' },
+          { serviceId: 'svc-bbb', clientId: 'c2', nome: 'Ana', valor: 30, desc: 'test' },
         ],
         'r1',
       );
@@ -827,7 +872,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ operationId: 'r1:svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'Rota' }],
+        [{ serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'Rota' }],
         'r1',
       );
 
@@ -843,7 +888,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(
         applyRoutePendingsDual(
-          [{ operationId: 'r1:svc-aaa', clientId: 'inexistente', nome: 'Ana', valor: 50, desc: 'test' }],
+          [{ serviceId: 'svc-aaa', clientId: 'inexistente', nome: 'Ana', valor: 50, desc: 'test' }],
           'r1',
         ),
       ).rejects.toThrow('Cliente não encontrado para clientId');
@@ -868,11 +913,135 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ operationId: 'r1:svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'test' }],
+        [{ serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'test' }],
         'r1',
       );
 
       expect(result.find((c) => c.id === 'c1')!.contas).toHaveLength(1);
+    });
+  });
+
+  describe('applyReceiptDual', () => {
+    it('aplica FIFO e grava a projeção completa em uma única transação', async () => {
+      const existing = [
+        {
+          id: 'c1', nome: 'Ana', pendente: 80,
+          contas: [
+            { id: 'nova', saldo: 30, recebido: 0, status: 'open' },
+            { id: 'antiga', saldo: 50, recebido: 0, status: 'open' },
+          ],
+          recebimentos: [],
+        },
+        { id: 'c2', nome: 'Bruno', pendente: 10, contas: [{ saldo: 10 }], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await applyReceiptDual({
+        clientId: 'c1',
+        valor: 60,
+        dateISO: '2026-09-21',
+        dateLabel: '21/09/2026',
+      });
+
+      expect(mocks.runTransaction).toHaveBeenCalledTimes(1);
+      expect(tx.set).toHaveBeenCalledTimes(1);
+      expect(result).toHaveLength(2);
+      const ana = result[0];
+      expect(ana.pendente).toBe(20);
+      expect(ana.recebimentos).toEqual([
+        expect.objectContaining({ valor: 60, dateISO: '2026-09-21' }),
+      ]);
+      expect(ana.contas).toEqual([
+        expect.objectContaining({ id: 'nova', saldo: 20, recebido: 10, status: 'partial' }),
+        expect.objectContaining({ id: 'antiga', saldo: 0, recebido: 50, status: 'paid' }),
+      ]);
+      expect(result[1]).toBe(existing[1]);
+    });
+
+    it('não ressuscita conta se o cancelamento venceu a concorrência', async () => {
+      const existing = [{ id: 'c1', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] }];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual({
+        clientId: 'c1',
+        valor: 50,
+        dateISO: '2026-09-21',
+        dateLabel: '21/09/2026',
+      })).rejects.toThrow('excede o saldo pendente atual');
+      expect(tx.set).not.toHaveBeenCalled();
+    });
+
+    it('reexecução do callback reutiliza o mesmo recebimento pré-gerado', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      const writtenReceipts: Array<{ id: string; valor: number; dateISO: string }> = [];
+      tx.set = vi.fn((_ref: unknown, data: unknown) => {
+        const payload = data as { clientes: Array<{ recebimentos: Array<{ id: string; valor: number; dateISO: string }> }> };
+        writtenReceipts.push(payload.clientes[0].recebimentos[0]);
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        await fn(tx);
+      });
+
+      await applyReceiptDual({
+        clientId: 'c1',
+        valor: 20,
+        dateISO: '2026-09-21',
+        dateLabel: '21/09/2026',
+      });
+
+      expect(writtenReceipts).toHaveLength(2);
+      expect(writtenReceipts[0]).toEqual(writtenReceipts[1]);
+    });
+
+    it('rejeita dois clientes legados de mesmo nome sem escolher o primeiro', async () => {
+      const existing = [
+        { nome: 'Ana', pendente: 10, contas: [{ saldo: 10 }], recebimentos: [] },
+        { nome: 'Ana', pendente: 20, contas: [{ saldo: 20 }], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual({
+        legacyLookupName: 'Ana',
+        valor: 10,
+        dateISO: '2026-09-21',
+        dateLabel: '21/09/2026',
+      })).rejects.toThrow('Conflito');
+      expect(tx.set).not.toHaveBeenCalled();
     });
   });
 
@@ -889,10 +1058,9 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
         },
       ];
       const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
+        get: vi.fn()
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: existing }) }),
         delete: vi.fn(),
       });
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
@@ -902,6 +1070,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       const result = await cancelRouteDual('r1');
 
       expect(mocks.runTransaction).toHaveBeenCalledTimes(1);
+      expect(tx.get).toHaveBeenCalledTimes(2);
       expect(tx.delete).toHaveBeenCalledTimes(1);
       const ana = result.find((c) => c.id === 'c1');
       expect(ana!.contas).toHaveLength(1);
@@ -917,6 +1086,20 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       await expect(cancelRouteDual('r1')).rejects.toThrow('Network error');
     });
 
+    it('rejeita se rota não existe no Firestore', async () => {
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({ exists: () => false }),
+        delete: vi.fn(),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(cancelRouteDual('r1')).rejects.toThrow('não encontrada');
+      expect(tx.delete).not.toHaveBeenCalled();
+      expect(tx.set).not.toHaveBeenCalled();
+    });
+
     it('pagamento remoto parcial bloqueia cancelamento dentro da transação', async () => {
       const existing = [
         {
@@ -928,10 +1111,9 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
         },
       ];
       const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
+        get: vi.fn()
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: existing }) }),
         delete: vi.fn(),
       });
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
@@ -941,6 +1123,251 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       await expect(cancelRouteDual('r1')).rejects.toThrow('já recebeu pagamento');
       expect(tx.set).not.toHaveBeenCalled();
       expect(tx.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('contratos comportamentais — recebimento', () => {
+    it('falha no recebimento não altera memória nem faturamento', async () => {
+      const existing = [
+        {
+          id: 'c1', nome: 'Ana', pendente: 30,
+          contas: [{ id: 'conta-1', saldo: 30, recebido: 0, status: 'open' }],
+          recebimentos: [],
+        },
+      ];
+      let writtenData: unknown = null;
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+        set: vi.fn((_ref: unknown, data: unknown) => { writtenData = data; }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual({
+        clientId: 'c1',
+        valor: 100,
+        dateISO: '2026-09-21',
+        dateLabel: '21/09/2026',
+      })).rejects.toThrow('excede o saldo');
+      expect(writtenData).toBeNull();
+    });
+
+    it('duplo clique no recebimento executa uma única transação', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      let callCount = 0;
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        callCount++;
+        await fn(tx);
+      });
+
+      await applyReceiptDual({
+        clientId: 'c1',
+        valor: 20,
+        dateISO: '2026-09-21',
+        dateLabel: '21/09/2026',
+      });
+
+      expect(callCount).toBe(1);
+    });
+
+    it('concorrência: recebimento e cancelamento serializados pelo Firestore', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 30,
+        contas: [{ routeId: 'r1', saldo: 30, recebido: 20, operationId: 'r1:svc-aaa' }],
+        recebimentos: [],
+      }];
+      const tx = makeTx({
+        get: vi.fn()
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: existing }) }),
+        delete: vi.fn(),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(cancelRouteDual('r1')).rejects.toThrow('já recebeu pagamento');
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(tx.delete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('contratos comportamentais — cancelamento', () => {
+    it('falha no cancelamento preserva rota, contas e estado local', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ routeId: 'r1', saldo: 50, recebido: 20, operationId: 'r1:svc-aaa' }],
+        recebimentos: [],
+      }];
+      let writtenData: unknown = null;
+      const tx = makeTx({
+        get: vi.fn()
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: existing }) }),
+        set: vi.fn((_ref: unknown, data: unknown) => { writtenData = data; }),
+        delete: vi.fn(),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(cancelRouteDual('r1')).rejects.toThrow('já recebeu pagamento');
+      expect(writtenData).toBeNull();
+      expect(tx.delete).not.toHaveBeenCalled();
+    });
+
+    it('dois clientes legados sem ID com mesmo nome permanecem intactos após cancelamento', async () => {
+      const existing = [
+        { id: '', nome: 'Ana', pendente: 30, contas: [{ routeId: 'r1', saldo: 30, recebido: 0 }], recebimentos: [] },
+        { id: '', nome: 'Ana', pendente: 20, contas: [{ routeId: 'r1', saldo: 20, recebido: 0 }], recebimentos: [] },
+        { id: 'c3', nome: 'Bruno', pendente: 10, contas: [{ routeId: 'r1', saldo: 10, recebido: 0 }], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn()
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: existing }) }),
+        delete: vi.fn(),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await cancelRouteDual('r1');
+
+      expect(result).toHaveLength(3);
+      const legacyAnas = result.filter((c) => c.nome === 'Ana');
+      expect(legacyAnas).toHaveLength(2);
+      expect(legacyAnas[0].contas).toHaveLength(0);
+      expect(legacyAnas[0].pendente).toBe(0);
+      expect(legacyAnas[1].contas).toHaveLength(0);
+      expect(legacyAnas[1].pendente).toBe(0);
+      const bruno = result.find((c) => c.id === 'c3');
+      expect(bruno!.contas).toHaveLength(0);
+      expect(bruno!.pendente).toBe(0);
+      expect(tx.delete).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('contratos comportamentais — pendências de rota', () => {
+    it('routeId vazio é rejeitado', async () => {
+      await expect(
+        applyRoutePendingsDual(
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
+          '',
+        ),
+      ).rejects.toThrow('routeId obrigatório');
+    });
+
+    it('serviceId vazio é rejeitado', async () => {
+      await expect(
+        applyRoutePendingsDual(
+          [{ serviceId: '', nome: 'Ana', valor: 50, desc: 'test' }],
+          'r1',
+        ),
+      ).rejects.toThrow('serviceId');
+    });
+
+    it('reexecução do callback mantém ID, data e conteúdo da conta', async () => {
+      const tx = makeTx();
+      const writtenAccounts: Array<{ id: string; dateISO: string; operationId: string; valorOriginal: number; desc: string }> = [];
+      tx.set = vi.fn((_ref: unknown, data: unknown) => {
+        const payload = data as { clientes?: Array<{ contas: Array<{ id: string; dateISO: string; operationId: string; valorOriginal: number; desc: string }> }> };
+        if (payload.clientes?.[0]?.contas[0]) {
+          writtenAccounts.push({ ...payload.clientes[0].contas[0] });
+        }
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        await fn(tx);
+      });
+
+      await applyRoutePendingsDual(
+        [{ serviceId: 'svc-stable', nome: 'Ana', valor: 50, desc: 'Rota · 2 entrega(s)' }],
+        'route-stable',
+      );
+
+      expect(writtenAccounts).toHaveLength(2);
+      expect(writtenAccounts[0].id).toBe(writtenAccounts[1].id);
+      expect(writtenAccounts[0].dateISO).toBe(writtenAccounts[1].dateISO);
+      expect(writtenAccounts[0].operationId).toBe(writtenAccounts[1].operationId);
+      expect(writtenAccounts[0].valorOriginal).toBe(writtenAccounts[1].valorOriginal);
+      expect(writtenAccounts[0].desc).toBe(writtenAccounts[1].desc);
+    });
+
+    it('operationId é derivado de routeId + serviceId ignorando valor do chamador', async () => {
+      const tx = makeTx();
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await applyRoutePendingsDual(
+        [{ serviceId: 'svc-x', nome: 'Ana', valor: 10, desc: 'd' } as never],
+        'route-y',
+      );
+
+      expect((result[0].contas[0] as { operationId: string }).operationId).toBe('route-y:svc-x');
+    });
+
+    it('mesmo operationId e payload idempotente', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ operationId: 'r1:svc-aaa', saldo: 50, valorOriginal: 50, desc: 'Rota' }],
+        recebimentos: [],
+      }];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await applyRoutePendingsDual(
+        [{ serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'Rota' }],
+        'r1',
+      );
+
+      expect(result.find((c) => c.id === 'c1')!.contas).toHaveLength(1);
+    });
+
+    it('mesmo operationId com payload diferente gera conflito', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ operationId: 'r1:svc-aaa', saldo: 50, valorOriginal: 50, desc: 'old' }],
+        recebimentos: [],
+      }];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(
+        applyRoutePendingsDual(
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 99, desc: 'new' }],
+          'r1',
+        ),
+      ).rejects.toThrow('Conflito de operationId');
     });
   });
 });

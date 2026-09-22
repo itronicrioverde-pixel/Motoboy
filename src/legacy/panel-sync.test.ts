@@ -9,8 +9,8 @@ import { resolve } from 'path';
  * Estes testes verificam propriedades do código-fonte que garantem:
  * - Ausência de variáveis obsoletas
  * - Hidratação sem sincronização remota
- * - Sincronização bloqueada antes da hidratação
- * - Sincronização somente após mutação real
+ * - Ausência do writer financeiro agregado e debounced
+ * - Escritas financeiras transacionais
  * - Uso do SyncGate real para controle de escrita
  */
 
@@ -25,6 +25,12 @@ const ORCHESTRATOR_PATH = resolve(
   '../features/rotas/application/route-confirmation-orchestrator.ts',
 );
 const orchestratorSource = readFileSync(ORCHESTRATOR_PATH, 'utf-8');
+
+const CLIENT_WRITER_PATH = resolve(
+  __dirname,
+  '../features/customers/infrastructure/client-writer.ts',
+);
+const clientWriterSource = readFileSync(CLIENT_WRITER_PATH, 'utf-8');
 
 describe('panel.js — propriedades estáticas', () => {
   describe('ausência de motoRemoteLoaded', () => {
@@ -106,19 +112,44 @@ describe('panel.js — propriedades estáticas', () => {
       expect(block).toMatch(/if\s*\(\s*!motoHydrated\.isOpen\s*\)\s*return/);
     });
 
-    it('syncClientsToFirestore tem guarda if(!clientsHydrated.isOpen) return', () => {
-      const block = extractFunction(panelSource, 'syncClientsToFirestore');
-      expect(block).toMatch(/if\s*\(\s*!clientsHydrated\.isOpen\s*\)\s*return/);
-    });
-
     it('saveMotoToFirestore tem guarda if(!motoHydrated.isOpen) return', () => {
       const block = extractFunction(panelSource, 'saveMotoToFirestore');
       expect(block).toMatch(/if\s*\(\s*!motoHydrated\.isOpen\s*\)\s*return/);
     });
+  });
 
-    it('saveClientsToFirestore tem guarda if(!clientsRemoteRead.isOpen) return', () => {
-      const block = extractFunction(panelSource, 'saveClientsToFirestore');
-      expect(block).toMatch(/if\s*\(\s*!clientsRemoteRead\.isOpen\s*\)\s*return/);
+  describe('recebimento — projeção financeira transacional', () => {
+    it('não mantém writer debounced para clients/data', () => {
+      expect(panelSource).not.toContain('clientsWriter');
+      expect(panelSource).not.toContain('saveClientsToFirestore');
+      expect(panelSource).not.toContain('syncClientsToFirestore');
+    });
+
+    it('aguarda applyReceiptDual antes de aplicar a projeção autoritativa local', () => {
+      const start = panelSource.indexOf("document.getElementById('recebimentoSave')");
+      const end = panelSource.indexOf('const clienteModalCtl', start);
+      const body = panelSource.slice(start, end);
+      const awaitPos = body.indexOf('await applyReceiptDual');
+      const projectionPos = body.indexOf('clientes = updatedClientes');
+      expect(awaitPos).toBeGreaterThan(-1);
+      expect(projectionPos).toBeGreaterThan(awaitPos);
+      expect(body).not.toContain('applyReceipt(cliente');
+    });
+
+    it('falha remota não cria faturamento nem altera o cache local', () => {
+      const start = panelSource.indexOf("document.getElementById('recebimentoSave')");
+      const end = panelSource.indexOf('const clienteModalCtl', start);
+      const body = panelSource.slice(start, end);
+      const awaitPos = body.indexOf('await applyReceiptDual');
+      expect(body.indexOf('entradas.unshift')).toBeGreaterThan(awaitPos);
+      expect(body.indexOf('saveLocalState()')).toBeGreaterThan(awaitPos);
+      expect(body).toContain('catch(err)');
+    });
+
+    it('lock savingReceipt impede duplo clique', () => {
+      expect(panelSource).toContain('let savingReceipt = false');
+      expect(panelSource).toContain('if(savingReceipt) return');
+      expect(panelSource).toMatch(/finally\s*\{[^}]*savingReceipt\s*=\s*false/);
     });
   });
 
@@ -142,10 +173,10 @@ describe('panel.js — propriedades estáticas', () => {
       expect(orchestratorSource).toMatch(/finally\s*\{\s*locked = false/);
     });
 
-    it('operationId usa somente routeId + serviceId', () => {
-      expect(orchestratorSource).toContain('`${route.id}:${serviceId}`');
-      expect(orchestratorSource).not.toMatch(/operationId:\s*`[^`]*cliente/);
-      expect(orchestratorSource).not.toMatch(/operationId:\s*`[^`]*valor/);
+    it('writer constrói operationId somente de routeId + serviceId', () => {
+      expect(clientWriterSource).toContain('`${normalizedRouteId}:${serviceId}`');
+      expect(clientWriterSource).not.toMatch(/operationId:\s*`[^`]*nome/);
+      expect(clientWriterSource).not.toMatch(/operationId:\s*`[^`]*valor/);
     });
 
     it('newService gera serviceId permanente com UUID', () => {
@@ -246,7 +277,8 @@ describe('panel.js — propriedades estáticas', () => {
     it('aplica estado atômico do Firestore localmente após commit', () => {
       const body = extractFunction(panelSource, 'cancelConfirmedRoute');
       expect(body).toContain('updatedClientes');
-      expect(body).toContain('local.contas = updated.contas');
+      expect(body).toContain('clientes = updatedClientes');
+      expect(body).not.toContain('clientes.find');
     });
 
     it('trata erro e mostra toast', () => {
@@ -282,7 +314,7 @@ describe('panel.js — propriedades estáticas', () => {
 
   describe('dual source — SyncGate import e uso', () => {
     it('panel.js importa gates do módulo panel-hydration', () => {
-      expect(panelSource).toContain("import { clientsRemoteRead, clientsHydrated, motoHydrated } from");
+      expect(panelSource).toContain("import { clientsHydrated, motoHydrated } from");
     });
 
     it('panel.js não cria SyncGate localmente', () => {

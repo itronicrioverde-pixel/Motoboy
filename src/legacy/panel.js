@@ -4,9 +4,9 @@ import { db } from '../config/firebase.js';
 import { doc, setDoc } from 'firebase/firestore';
 import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
-import { clientsRemoteRead, clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
+import { clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
 import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
-import { createClientDual, updateClientDual, removeClientDual } from '../features/customers/infrastructure/client-writer';
+import { applyReceiptDual, createClientDual, updateClientDual, removeClientDual } from '../features/customers/infrastructure/client-writer';
 import { createRouteConfirmationOrchestrator } from '../features/rotas/application/route-confirmation-orchestrator';
 import { applyRouteFinancialPendings } from '../features/rotas/infrastructure/client-pendings-gateway';
 
@@ -294,15 +294,6 @@ export function bootstrapPanel() {
       : 'O navegador bloqueou o armazenamento local. Os dados durarão somente enquanto esta página estiver aberta.';
   }
 
-  const clientsWriter = createFirestoreWriter(
-    (uid) => ['users', uid, 'clients', 'data'],
-    { gate: clientsRemoteRead, onError(err){ showToast('Erro ao sincronizar clientes no servidor.', {kind:'error'}); } },
-  );
-  function saveClientsToFirestore(){
-    if(!clientsRemoteRead.isOpen) return;
-    clientsWriter.schedule({ clientes: clientes });
-  }
-
   const motoWriter = createFirestoreWriter(
     (uid) => ['users', uid, 'moto', 'data'],
     { gate: motoHydrated, onError(err){ showToast('Erro ao sincronizar dados da moto no servidor.', {kind:'error'}); } },
@@ -337,10 +328,6 @@ export function bootstrapPanel() {
 
   // ---------- sincronização explícita com Firestore ----------
   // Só é chamada após mutações reais do usuário, nunca dentro de saveLocalState().
-  function syncClientsToFirestore(){
-    if(!clientsHydrated.isOpen) return;
-    saveClientsToFirestore();
-  }
   function syncMotoToFirestore(){
     if(!motoHydrated.isOpen) return;
     saveMotoToFirestore();
@@ -3553,14 +3540,8 @@ export function bootstrapPanel() {
     try {
       const updatedClientes = await window.__motoboyRotas.cancelAtomic(routeId);
 
-      // Só altera estado local APÓS commit remoto
-      for(const updated of updatedClientes){
-        const local = clientes.find(c => c.id === updated.id || c.nome === updated.nome);
-        if(local){
-          local.contas = updated.contas;
-          local.pendente = updated.pendente;
-        }
-      }
+      // A transação devolve a projeção financeira completa e autoritativa.
+      clientes = updatedClientes;
       for(let i = entradas.length - 1; i >= 0; i--){
         if(entradas[i].routeId === routeId) entradas.splice(i, 1);
       }
@@ -3626,22 +3607,9 @@ export function bootstrapPanel() {
     setTimeout(() => document.getElementById('recebimentoValor').focus(), 0);
   }
 
-  function applyReceipt(cliente, valor, receiptISO){
-    let restante = valor;
-    const contasMaisAntigasPrimeiro = [...cliente.contas].reverse();
-    contasMaisAntigasPrimeiro.forEach(conta => {
-      if(restante <= 0 || conta.saldo <= 0) return;
-      const aplicado = Math.min(restante, conta.saldo);
-      conta.recebido += aplicado;
-      conta.saldo -= aplicado;
-      conta.status = conta.saldo <= 0.001 ? 'paid' : 'partial';
-      restante -= aplicado;
-    });
-    cliente.recebimentos.unshift({ valor, data: dateLabelFromISO(receiptISO), dateISO: receiptISO });
-    syncClientBalance(cliente);
-  }
-
-  document.getElementById('recebimentoSave').addEventListener('click', () => {
+  let savingReceipt = false;
+  document.getElementById('recebimentoSave').addEventListener('click', async () => {
+    if(savingReceipt) return;
     if(!ensureClientesInteractive()) return;
     const cliente = clientes[receiptClientIndex];
     const valor = parseBrazilianInput(document.getElementById('recebimentoValor').value);
@@ -3660,16 +3628,34 @@ export function bootstrapPanel() {
     if(!receiptISO){ showDateError(recebimentoDateEl, 'Informe uma data válida no formato DD/MM/AAAA.'); return; }
     if(receiptISO > localTodayISO()){ showDateError(recebimentoDateEl, 'A data não pode ser futura.', true); return; }
     clearDateError(recebimentoDateEl);
-    applyReceipt(cliente, valor, receiptISO);
-    entradas.unshift({ desc:`Recebimento de ${cliente.nome}`, valor, data: dateLabelFromISO(receiptISO), dateISO: receiptISO, clientName:cliente.nome });
-    saveLocalState();
-    syncClientsToFirestore();
-    receiptModalCtl.close();
-    receiptClientIndex = null;
-    renderClientes();
-    renderFaturamento();
-    renderDashboard();
-    showToast(`${fmtBRL(valor)} recebido de ${cliente.nome}. O saldo restante é ${fmtBRL(cliente.pendente)}.`, {kind:'success'});
+
+    savingReceipt = true;
+    try {
+      const updatedClientes = await applyReceiptDual({
+        ...(cliente.id ? {clientId: cliente.id} : {legacyLookupName: cliente.nome}),
+        valor,
+        dateISO: receiptISO,
+        dateLabel: dateLabelFromISO(receiptISO),
+      });
+
+      // Só altera estado local APÓS commit remoto, usando a projeção completa.
+      clientes = updatedClientes;
+      const updatedCliente = cliente.id
+        ? clientes.find(c => c.id === cliente.id)
+        : clientes.find(c => !c.id && c.nome === cliente.nome);
+      entradas.unshift({ desc:`Recebimento de ${cliente.nome}`, valor, data: dateLabelFromISO(receiptISO), dateISO: receiptISO, clientName:cliente.nome });
+      saveLocalState();
+      receiptModalCtl.close();
+      receiptClientIndex = null;
+      renderClientes();
+      renderFaturamento();
+      renderDashboard();
+      showToast(`${fmtBRL(valor)} recebido de ${cliente.nome}. O saldo restante é ${fmtBRL(updatedCliente?.pendente || 0)}.`, {kind:'success'});
+    } catch(err) {
+      showToast('Erro ao registrar recebimento no servidor: ' + (err.message || err), {kind:'error'});
+    } finally {
+      savingReceipt = false;
+    }
   });
 
   const clienteModalCtl = wireModal('btnOpenCliente', 'clienteModal', 'clienteBackdrop', 'clienteClose', 'clienteCancel');
