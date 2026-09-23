@@ -1,6 +1,6 @@
 /**
  * Casos de uso de Rotas (aplicação). Rotas confirmadas são imutáveis:
- * só há confirmar (save) e cancelar (remove).
+ * só há confirmar (save). Cancelamento é feito via cancelRouteDual (transacional).
  */
 
 import type { Rota, RotaRepository } from '../domain/rota';
@@ -28,9 +28,5 @@ export class RotasService {
       throw new RotaValidationError('Rota sem id.');
     }
     return this.repo.save(rota);
-  }
-
-  remove(id: string): Promise<void> {
-    return this.repo.remove(id);
   }
 }

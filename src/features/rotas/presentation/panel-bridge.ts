@@ -15,7 +15,6 @@ declare global {
   interface Window {
     __motoboyRotas?: {
       save(rota: Rota): Promise<void>;
-      remove(id: string): Promise<void>;
       cancelAtomic(routeId: string): Promise<LegacyCliente[]>;
     };
     __applyRemoteRotas?: (entities: Rota[]) => void;
@@ -26,9 +25,6 @@ export function installRotasBridge(): void {
   window.__motoboyRotas = {
     async save(rota) {
       await rotasService.save(rota);
-    },
-    async remove(id) {
-      await rotasService.remove(id);
     },
     async cancelAtomic(routeId) {
       return cancelRouteDual(routeId);

@@ -6,7 +6,6 @@
 import {
   collection,
   doc,
-  deleteDoc,
   getDocs,
   onSnapshot,
   query,
@@ -88,9 +87,5 @@ export class FirestoreRotaRepository implements RotaRepository {
       }
       tx.set(ref, rota);
     });
-  }
-
-  async remove(id: string): Promise<void> {
-    await deleteDoc(doc(this.collectionRef(), id));
   }
 }

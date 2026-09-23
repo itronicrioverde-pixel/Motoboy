@@ -49,6 +49,7 @@ import {
   applyReceiptDual,
   cancelRouteDual,
 } from './client-writer';
+import type { ApplyReceiptInput, ReceiptBillingEntry } from './client-writer';
 
 function makeTx(overrides: Record<string, unknown> = {}) {
   return {
@@ -59,6 +60,69 @@ function makeTx(overrides: Record<string, unknown> = {}) {
     set: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),
+    ...overrides,
+  };
+}
+
+/**
+ * Buffer de escritas transacional.
+ * tx.set adiciona ao buffer; o commit aplica.
+ * Se o callback lançar erro, o buffer inteiro é descartado.
+ */
+interface TxEntry { ref: unknown; data: unknown; options?: unknown; }
+interface BufferedTx {
+  tx: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
+  commitBuffer: () => TxEntry[];
+  discarded: boolean;
+}
+
+function makeBufferedTx(
+  getClientData: () => unknown,
+  onCommit?: ((entries: TxEntry[]) => void) | { get?: ReturnType<typeof vi.fn>; onCommit?: (entries: TxEntry[]) => void },
+): BufferedTx {
+  const buffer: TxEntry[] = [];
+  let discarded = false;
+  const opts = typeof onCommit === 'function'
+    ? { onCommit }
+    : (onCommit ?? {});
+  const tx = {
+    get: opts.get ?? vi.fn().mockImplementation(async () => ({
+      exists: () => true,
+      data: () => getClientData(),
+    })),
+    set: vi.fn((_ref: unknown, _data: unknown, _options?: unknown) => {
+      buffer.push({ ref: _ref, data: _data, options: _options });
+    }),
+    update: vi.fn(),
+    delete: vi.fn(),
+  };
+
+  return {
+    tx,
+    commitBuffer: () => {
+      if (opts.onCommit) opts.onCommit([...buffer]);
+      const result = [...buffer];
+      buffer.length = 0;
+      return result;
+    },
+    get discarded() { return discarded; },
+  };
+}
+
+function extractBillingEntryFromBuffer(entries: TxEntry[]): ReceiptBillingEntry | null {
+  const entrada = entries.find(({ ref }) => {
+    const path = (ref as { _path?: string })._path ?? '';
+    return path.includes('/entradas/');
+  });
+  return entrada ? (entrada.data as ReceiptBillingEntry) : null;
+}
+
+function receiptInput(overrides: Partial<ApplyReceiptInput> & { valor: number }): ApplyReceiptInput {
+  return {
+    clientId: 'c1',
+    dateISO: '2026-09-21',
+    dateLabel: '21/09/2026',
+    receiptOperationId: 'receipt-test-1',
     ...overrides,
   };
 }
@@ -921,8 +985,8 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
     });
   });
 
-  describe('applyReceiptDual', () => {
-    it('aplica FIFO e grava a projeção completa em uma única transação', async () => {
+  describe('applyReceiptDual — contrato atômico', () => {
+    it('commit bem-sucedido altera clients/data e cria entradas/{receiptOperationId}', async () => {
       const existing = [
         {
           id: 'c1', nome: 'Ana', pendente: 80,
@@ -934,27 +998,30 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
         },
         { id: 'c2', nome: 'Bruno', pendente: 10, contas: [{ saldo: 10 }], recebimentos: [] },
       ];
-      const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
-      });
+      let latestSnapshot = existing;
+      let committedEntries: TxEntry[] = [];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+      );
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
         await fn(tx);
+        committedEntries = commitBuffer();
+        for (const entry of committedEntries) {
+          const path = (entry.ref as { _path?: string })._path ?? '';
+          if (path.includes('/clients/')) latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+        }
       });
 
-      const result = await applyReceiptDual({
-        clientId: 'c1',
-        valor: 60,
-        dateISO: '2026-09-21',
-        dateLabel: '21/09/2026',
-      });
+      const result = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 60, receiptOperationId: 'receipt-op-1',
+      }));
 
       expect(mocks.runTransaction).toHaveBeenCalledTimes(1);
-      expect(tx.set).toHaveBeenCalledTimes(1);
-      expect(result).toHaveLength(2);
-      const ana = result[0];
+      expect(committedEntries).toHaveLength(2);
+      expect(result.status).toBe('applied');
+      expect(result.receiptOperationId).toBe('receipt-op-1');
+      expect(result.clientes).toHaveLength(2);
+      const ana = result.clientes[0];
       expect(ana.pendente).toBe(20);
       expect(ana.recebimentos).toEqual([
         expect.objectContaining({ valor: 60, dateISO: '2026-09-21' }),
@@ -963,61 +1030,178 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
         expect.objectContaining({ id: 'nova', saldo: 20, recebido: 10, status: 'partial' }),
         expect.objectContaining({ id: 'antiga', saldo: 0, recebido: 50, status: 'paid' }),
       ]);
-      expect(result[1]).toBe(existing[1]);
-    });
-
-    it('não ressuscita conta se o cancelamento venceu a concorrência', async () => {
-      const existing = [{ id: 'c1', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] }];
-      const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
-      });
-      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
-        await fn(tx);
-      });
-
-      await expect(applyReceiptDual({
+      expect(result.clientes[1]).toBe(existing[1]);
+      expect(result.billingEntry).toMatchObject({
+        receiptOperationId: 'receipt-op-1',
+        source: 'client_receipt',
         clientId: 'c1',
-        valor: 50,
-        dateISO: '2026-09-21',
-        dateLabel: '21/09/2026',
-      })).rejects.toThrow('excede o saldo pendente atual');
-      expect(tx.set).not.toHaveBeenCalled();
+        clientName: 'Ana',
+        desc: 'Recebimento de Ana',
+        valor: 60,
+      });
     });
 
-    it('reexecução do callback reutiliza o mesmo recebimento pré-gerado', async () => {
+    it('documento de faturamento usa receiptOperationId como ID do documento', async () => {
       const existing = [{
         id: 'c1', nome: 'Ana', pendente: 50,
         contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
         recebimentos: [],
       }];
-      const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
+      let committedEntries: TxEntry[] = [];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: existing }),
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        committedEntries = commitBuffer();
       });
+
+      const result = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-doc-id',
+      }));
+
+      const entradasWrite = committedEntries.filter(({ ref }) => {
+        const path = (ref as { _path?: string })._path ?? '';
+        return path.includes('/entradas/');
+      });
+      expect(entradasWrite).toHaveLength(1);
+      expect(extractBillingEntryFromBuffer(entradasWrite)).toMatchObject({
+        receiptOperationId: 'receipt-doc-id',
+        source: 'client_receipt',
+      });
+      expect(result.billingEntry.receiptOperationId).toBe('receipt-doc-id');
+    });
+
+    it('falha de commit preserva clients/data — nenhuma fonte é alterada', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existing;
+      const committedPaths: string[] = [];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        () => {},
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        const entries = commitBuffer();
+        const billingEntry = entries.find(({ ref }) => {
+          const path = (ref as { _path?: string })._path ?? '';
+          return path.includes('/entradas/');
+        });
+        if (billingEntry) {
+          throw new Error('Firestore commit denied');
+        }
+        for (const entry of entries) {
+          committedPaths.push((entry.ref as { _path?: string })._path ?? '');
+        }
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-commit-fail',
+      }))).rejects.toThrow('Firestore commit denied');
+      expect(committedPaths).toHaveLength(0);
+      expect(latestSnapshot).toBe(existing);
+      expect(latestSnapshot[0].recebimentos).toHaveLength(0);
+    });
+
+    it('falha de commit não cria entradas/{receiptOperationId}', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
+      const committedData: unknown[] = [];
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        const entries = commitBuffer();
+        if (entries.length === 2) {
+          throw new Error('Firestore commit denied');
+        }
+        for (const entry of entries) {
+          committedData.push(entry.data);
+        }
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-no-entrada',
+      }))).rejects.toThrow('Firestore commit denied');
+      expect(committedData).toHaveLength(0);
+    });
+
+    it('callback prepara exatamente duas escritas na mesma transação', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let committedEntries: TxEntry[] = [];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: existing }),
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        committedEntries = commitBuffer();
+      });
+
+      await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-two-writes',
+      }));
+
+      expect(committedEntries).toHaveLength(2);
+    });
+
+    it('reexecução do callback reutiliza os mesmos dados preparados', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
       const writtenReceipts: Array<{ id: string; valor: number; dateISO: string }> = [];
-      tx.set = vi.fn((_ref: unknown, data: unknown) => {
-        const payload = data as { clientes: Array<{ recebimentos: Array<{ id: string; valor: number; dateISO: string }> }> };
-        writtenReceipts.push(payload.clientes[0].recebimentos[0]);
+      const buffer: TxEntry[] = [];
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+      );
+      tx.set = vi.fn((_ref: unknown, data: unknown, _options?: unknown) => {
+        buffer.push({ ref: _ref, data, options: _options });
+        const payload = data as { clientes?: Array<{ recebimentos: Array<{ id: string; valor: number; dateISO: string }> }> };
+        if (payload?.clientes?.[0]?.recebimentos?.[0]) {
+          writtenReceipts.push(payload.clientes[0].recebimentos[0]);
+        }
       });
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
         await fn(tx);
         await fn(tx);
       });
 
-      await applyReceiptDual({
-        clientId: 'c1',
-        valor: 20,
-        dateISO: '2026-09-21',
-        dateLabel: '21/09/2026',
-      });
+      await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-retry-1',
+      }));
 
       expect(writtenReceipts).toHaveLength(2);
       expect(writtenReceipts[0]).toEqual(writtenReceipts[1]);
+    });
+
+    it('não ressuscita conta se o cancelamento venceu a concorrência', async () => {
+      const existing = [{ id: 'c1', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] }];
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 50, receiptOperationId: 'receipt-op-2',
+      }))).rejects.toThrow('excede o saldo pendente atual');
+      expect(tx.set).not.toHaveBeenCalled();
     });
 
     it('rejeita dois clientes legados de mesmo nome sem escolher o primeiro', async () => {
@@ -1025,23 +1209,43 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
         { nome: 'Ana', pendente: 10, contas: [{ saldo: 10 }], recebimentos: [] },
         { nome: 'Ana', pendente: 20, contas: [{ saldo: 20 }], recebimentos: [] },
       ];
-      const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
-      });
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
         await fn(tx);
       });
 
-      await expect(applyReceiptDual({
-        legacyLookupName: 'Ana',
-        valor: 10,
-        dateISO: '2026-09-21',
-        dateLabel: '21/09/2026',
-      })).rejects.toThrow('Conflito');
+      await expect(applyReceiptDual(receiptInput({
+        clientId: undefined, legacyLookupName: 'Ana', valor: 10, receiptOperationId: 'receipt-op-3',
+      }))).rejects.toThrow('Conflito');
       expect(tx.set).not.toHaveBeenCalled();
+    });
+
+    it('falha não altera os objetos de entrada usados no teste', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      const originalExisting = JSON.parse(JSON.stringify(existing));
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        throw new Error('Commit failed');
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-obj-intact',
+      }))).rejects.toThrow('Commit failed');
+
+      expect(existing).toEqual(originalExisting);
+      expect(existing[0].recebimentos).toHaveLength(0);
+      expect(existing[0].contas[0].saldo).toBe(50);
     });
   });
 
@@ -1135,74 +1339,175 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
           recebimentos: [],
         },
       ];
-      let writtenData: unknown = null;
-      const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
-        set: vi.fn((_ref: unknown, data: unknown) => { writtenData = data; }),
-      });
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
         await fn(tx);
       });
 
-      await expect(applyReceiptDual({
-        clientId: 'c1',
-        valor: 100,
-        dateISO: '2026-09-21',
-        dateLabel: '21/09/2026',
-      })).rejects.toThrow('excede o saldo');
-      expect(writtenData).toBeNull();
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 100, receiptOperationId: 'receipt-fail-1',
+      }))).rejects.toThrow('excede o saldo');
+      expect(tx.set).not.toHaveBeenCalled();
     });
 
-    it('duplo clique no recebimento executa uma única transação', async () => {
+    it('duas submissões concorrentes com o mesmo receiptOperationId são idempotentes', async () => {
       const existing = [{
         id: 'c1', nome: 'Ana', pendente: 50,
         contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
         recebimentos: [],
       }];
-      const tx = makeTx({
-        get: vi.fn().mockResolvedValue({
-          exists: () => true,
-          data: () => ({ clientes: existing }),
-        }),
-      });
+      let latestSnapshot = existing;
+      const committedPaths: string[] = [];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+            committedPaths.push(path);
+          }
+        },
+      );
       let callCount = 0;
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
         callCount++;
         await fn(tx);
+        commitBuffer();
       });
 
-      await applyReceiptDual({
-        clientId: 'c1',
-        valor: 20,
-        dateISO: '2026-09-21',
-        dateLabel: '21/09/2026',
-      });
+      const input = receiptInput({ clientId: 'c1', valor: 20, receiptOperationId: 'receipt-ui-1' });
+      const r1 = await applyReceiptDual(input);
+      const r2 = await applyReceiptDual(input);
 
-      expect(callCount).toBe(1);
+      expect(callCount).toBe(2);
+      expect(r1.clientes[0].recebimentos).toHaveLength(1);
+      expect(r2.clientes[0].recebimentos).toHaveLength(1);
+      expect(r1.status).toBe('applied');
+      expect(r2.status).toBe('already-applied');
+      expect(r1.clientes[0].pendente).toBe(r2.clientes[0].pendente);
+      expect(committedPaths.filter((p) => p.includes('/entradas/'))).toHaveLength(1);
     });
 
-    it('concorrência: recebimento e cancelamento serializados pelo Firestore', async () => {
+    it('duas operações legítimas com IDs diferentes acumulam recebimentos', async () => {
       const existing = [{
-        id: 'c1', nome: 'Ana', pendente: 30,
-        contas: [{ routeId: 'r1', saldo: 30, recebido: 20, operationId: 'r1:svc-aaa' }],
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
         recebimentos: [],
       }];
-      const tx = makeTx({
-        get: vi.fn()
-          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
-          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: existing }) }),
-        delete: vi.fn(),
-      });
+      let latestSnapshot = existing;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
         await fn(tx);
+        commitBuffer();
+      });
+
+      const r1 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-legit-1',
+      }));
+      expect(r1.status).toBe('applied');
+      expect(r1.clientes[0].recebimentos).toHaveLength(1);
+
+      const r2 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 10, receiptOperationId: 'receipt-legit-2',
+        dateISO: '2026-09-22', dateLabel: '22/09/2026',
+      }));
+      expect(r2.status).toBe('applied');
+      expect(r2.clientes[0].recebimentos).toHaveLength(2);
+      expect(r2.clientes[0].pendente).toBe(20);
+    });
+
+    it('concorrência: receipt com saldo suficiente impede cancelamento', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ routeId: 'r1', saldo: 50, recebido: 0, operationId: 'r1:svc-aaa' }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existing;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementationOnce(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 30, receiptOperationId: 'receipt-concurrent-1',
+      }));
+
+      const cancelTx = makeTx({
+        get: vi.fn()
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ id: 'r1' }) })
+          .mockResolvedValueOnce({ exists: () => true, data: () => ({ clientes: latestSnapshot }) }),
+        delete: vi.fn(),
+      });
+      mocks.runTransaction.mockImplementationOnce(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(cancelTx);
       });
 
       await expect(cancelRouteDual('r1')).rejects.toThrow('já recebeu pagamento');
-      expect(tx.set).not.toHaveBeenCalled();
-      expect(tx.delete).not.toHaveBeenCalled();
+      expect(cancelTx.delete).not.toHaveBeenCalled();
+    });
+
+    it('troca de UID não escreve na conta anterior nem na nova indevidamente', async () => {
+      const existingUid1 = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existingUid1;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existingUid1 }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const r1 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-uid-1',
+      }));
+      expect(r1.status).toBe('applied');
+      expect(r1.billingEntry.clientId).toBe('c1');
+
+      mockCurrentUid.mockReturnValue('uid-2');
+      const r2 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 10, receiptOperationId: 'receipt-uid-2',
+        dateISO: '2026-09-22', dateLabel: '22/09/2026',
+      }));
+      expect(r2.status).toBe('applied');
+      expect(r2.billingEntry.clientId).toBe('c1');
     });
   });
 
@@ -1368,6 +1673,202 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
           'r1',
         ),
       ).rejects.toThrow('Conflito de operationId');
+    });
+  });
+
+  describe('receiptOperationId — idempotência entre submissões', () => {
+    it('rejeita receiptOperationId vazio', async () => {
+      await expect(
+        applyReceiptDual(receiptInput({
+          clientId: 'c1', valor: 10, receiptOperationId: '',
+        })),
+      ).rejects.toThrow('receiptOperationId é obrigatório');
+    });
+
+    it('mesmo receiptOperationId e mesmo payload retorna already-applied sem tx.set', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [{
+          receiptOperationId: 'receipt-stable-1', valor: 20, dateISO: '2026-09-21', data: '21/09/2026',
+        }],
+      }];
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const { clientes: result, billingEntry, status } = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-stable-1',
+      }));
+
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(status).toBe('already-applied');
+      expect(billingEntry.receiptOperationId).toBe('receipt-stable-1');
+      expect(billingEntry.source).toBe('client_receipt');
+      expect(result[0].contas).toHaveLength(1);
+      expect((result[0].contas[0] as { saldo: number }).saldo).toBe(50);
+    });
+
+    it('mesmo receiptOperationId com payload diferente gera conflito', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [{
+          receiptOperationId: 'receipt-conflict-1', valor: 20, dateISO: '2026-09-21', data: '21/09/2026',
+        }],
+      }];
+      const { tx } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 30, dateISO: '2026-09-22', dateLabel: '22/09/2026',
+        receiptOperationId: 'receipt-conflict-1',
+      }))).rejects.toThrow('Conflito de receiptOperationId');
+    });
+
+    it('receiptOperationId diferente permite dois recebimentos no mesmo cliente', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existing;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const r1 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-a',
+      }));
+      expect(r1.status).toBe('applied');
+      expect(r1.clientes[0].recebimentos).toHaveLength(1);
+
+      const r2 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 10, receiptOperationId: 'receipt-b',
+        dateISO: '2026-09-22', dateLabel: '22/09/2026',
+      }));
+      expect(r2.status).toBe('applied');
+      expect(r2.clientes[0].recebimentos).toHaveLength(2);
+      expect(r2.clientes[0].pendente).toBe(20);
+    });
+
+    it('retry idempotente não executa segunda tx.set financeira', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existing;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const input = receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-retry-1',
+      });
+      const r1 = await applyReceiptDual(input);
+      expect(r1.status).toBe('applied');
+      expect(r1.clientes[0].recebimentos).toHaveLength(1);
+      const firstSetCallCount = tx.set.mock.calls.length;
+
+      const r2 = await applyReceiptDual(input);
+      expect(r2.status).toBe('already-applied');
+      expect(r2.clientes[0].recebimentos).toHaveLength(1);
+      expect(tx.set.mock.calls.length).toBe(firstSetCallCount);
+    });
+
+    it('firestore confirma, resposta é perdida e retry reutiliza o mesmo ID', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existing;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            const path = (entry.ref as { _path?: string })._path ?? '';
+            if (path.includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const input = receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-lost-resp',
+      });
+
+      const r1 = await applyReceiptDual(input);
+      expect(r1.status).toBe('applied');
+      expect(r1.clientes[0].recebimentos).toHaveLength(1);
+      expect(r1.clientes[0].pendente).toBe(30);
+
+      const r2 = await applyReceiptDual(input);
+      expect(r2.status).toBe('already-applied');
+      expect(r2.clientes[0].recebimentos).toHaveLength(1);
+      expect(r2.clientes[0].pendente).toBe(30);
+    });
+
+    it('falha na escrita da entrada financeira também desfaz o recebimento do cliente', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: existing }),
+        () => {},
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        const entries = commitBuffer();
+        if (entries.length === 2) {
+          throw new Error('Firestore billing write denied');
+        }
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-billing-fail',
+      }))).rejects.toThrow('Firestore billing write denied');
     });
   });
 });

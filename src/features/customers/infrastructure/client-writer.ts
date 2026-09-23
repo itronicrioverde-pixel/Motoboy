@@ -74,6 +74,39 @@ export interface ApplyReceiptInput {
   readonly valor: number;
   readonly dateISO: string;
   readonly dateLabel: string;
+  /**
+   * Identificador idempotente da submissão de recebimento.
+   * Gerado uma vez por submissão (ex: `receipt-${crypto.randomUUID()}`).
+   * Reexecuções do callback transacional reutilizam o mesmo ID.
+   * Dois dispositivos ou reloads que enviem o same receiptOperationId
+   * com o mesmo payload são idempotentes (no-op).
+   * Payload diferente gera conflito.
+   */
+  readonly receiptOperationId: string;
+}
+
+/**
+ * Entrada de faturamento construída internamente por applyReceiptDual.
+ * O painel nunca deve criar entradas manualmente para recebimentos.
+ */
+export interface ReceiptBillingEntry {
+  readonly receiptOperationId: string;
+  readonly source: 'client_receipt';
+  readonly clientId: string | null;
+  readonly clientName: string;
+  readonly desc: string;
+  readonly valor: number;
+  readonly data: string;
+  readonly dateISO: string;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+}
+
+export interface ApplyReceiptResult {
+  readonly clientes: LegacyCliente[];
+  readonly billingEntry: ReceiptBillingEntry;
+  readonly receiptOperationId: string;
+  readonly status: 'applied' | 'already-applied';
 }
 
 function usersCol(uid: string) {
@@ -82,6 +115,10 @@ function usersCol(uid: string) {
 
 function clientsDoc(uid: string) {
   return doc(db, 'users', uid, 'clients', 'data');
+}
+
+function entradasDoc(uid: string, receiptOperationId: string) {
+  return doc(db, 'users', uid, 'entradas', receiptOperationId);
 }
 
 function generateId(_uid: string): string {
@@ -492,17 +529,28 @@ export async function applyRoutePendingsDual(
 /**
  * Aplica um recebimento FIFO sobre a projeção financeira mais recente.
  *
- * A leitura e a escrita de clients/data pertencem à mesma transação. Assim,
- * uma confirmação de recebimento concorrente com cancelRouteDual é
- * serializada pelo Firestore: ou o recebimento vence e bloqueia o
- * cancelamento, ou o cancelamento vence e o recebimento encontra saldo zero.
+ * A leitura e a escrita de clients/data e entradas/{receiptOperationId}
+ * pertencem à mesma runTransaction — recebimento e faturamento são atômicos.
  *
- * O registro do recebimento é preparado antes de runTransaction para que uma
- * reexecução do callback use exatamente os mesmos dados.
+ * A entrada de faturamento é construída internamente a partir de clientId,
+ * nome do cliente, valor, dateISO e dateLabel. O painel nunca precisa
+ * enviar billingEntry.
+ *
+ * receiptOperationId garante idempotência entre submissões distintas:
+ * - mesmo ID e mesmo payload → no-op, status 'already-applied'.
+ * - mesmo ID e payload diferente → conflito, nenhuma escrita.
+ * - IDs diferentes → dois recebimentos legítimos.
+ *
+ * Pré-condições:
+ * - receiptOperationId é não vazio.
+ * - IDs, datas e payloads são preparados antes de runTransaction.
+ *
+ * Retorna ApplyReceiptResult com clientes, billingEntry autoritativo,
+ * receiptOperationId e status.
  */
 export async function applyReceiptDual(
   input: ApplyReceiptInput,
-): Promise<LegacyCliente[]> {
+): Promise<ApplyReceiptResult> {
   const uid = currentUid();
   if (!uid) throw new Error('Sem usuário autenticado.');
   if (!Number.isFinite(input.valor) || input.valor <= 0) {
@@ -514,14 +562,22 @@ export async function applyReceiptDual(
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.dateISO)) {
     throw new Error('dateISO inválida para recebimento.');
   }
+  if (!input.receiptOperationId?.trim()) {
+    throw new Error('receiptOperationId é obrigatório para recebimento.');
+  }
 
+  const receiptOperationId = input.receiptOperationId.trim();
+  const now = Date.now();
   const preparedReceipt = {
     id: `receipt-${generateId(uid)}`,
+    receiptOperationId,
     valor: input.valor,
     data: requiredIdentifier(input.dateLabel, 'dateLabel'),
     dateISO: input.dateISO,
   };
   let resultClientes: LegacyCliente[] = [];
+  let resultBillingEntry: ReceiptBillingEntry | null = null;
+  let resultStatus: 'applied' | 'already-applied' = 'applied';
 
   await runTransaction(db, async (tx) => {
     const clientsSnap = await tx.get(clientsDoc(uid));
@@ -558,6 +614,39 @@ export async function applyReceiptDual(
     const contas = Array.isArray(target.contas)
       ? (target.contas as Array<Record<string, unknown>>).map((conta) => ({ ...conta }))
       : [];
+
+    const existingReceipt = ((target.recebimentos ?? []) as Array<Record<string, unknown>>).find(
+      (r) => r.receiptOperationId === receiptOperationId,
+    ) as { receiptOperationId?: string; valor?: number; dateISO?: string } | undefined;
+
+    if (existingReceipt) {
+      const samePayload =
+        existingReceipt.valor === preparedReceipt.valor &&
+        existingReceipt.dateISO === preparedReceipt.dateISO;
+      if (!samePayload) {
+        throw new Error(
+          `Conflito de receiptOperationId "${receiptOperationId}": ` +
+          `existente (valor=${existingReceipt.valor}, dateISO=${existingReceipt.dateISO}) × ` +
+          `entrante (valor=${preparedReceipt.valor}, dateISO=${preparedReceipt.dateISO})`,
+        );
+      }
+      resultClientes = existing;
+      resultBillingEntry = {
+        receiptOperationId,
+        source: 'client_receipt',
+        clientId: target.id || null,
+        clientName: target.nome,
+        desc: `Recebimento de ${target.nome}`,
+        valor: preparedReceipt.valor,
+        data: preparedReceipt.data,
+        dateISO: preparedReceipt.dateISO,
+        createdAt: now,
+        updatedAt: now,
+      };
+      resultStatus = 'already-applied';
+      return;
+    }
+
     const saldoDisponivel = contas.reduce(
       (sum, conta) => sum + Math.max(0, Number(conta.saldo) || 0),
       0,
@@ -599,11 +688,44 @@ export async function applyReceiptDual(
       index === targetIndex ? updatedClient : client,
     );
 
+    const billingEntry: ReceiptBillingEntry = {
+      receiptOperationId,
+      source: 'client_receipt',
+      clientId: target.id || null,
+      clientName: target.nome,
+      desc: `Recebimento de ${target.nome}`,
+      valor: preparedReceipt.valor,
+      data: preparedReceipt.data,
+      dateISO: preparedReceipt.dateISO,
+      createdAt: now,
+      updatedAt: now,
+    };
+
     tx.set(clientsDoc(uid), { clientes }, { merge: true });
+    tx.set(entradasDoc(uid, receiptOperationId), {
+      receiptOperationId: billingEntry.receiptOperationId,
+      source: billingEntry.source,
+      clientId: billingEntry.clientId,
+      clientName: billingEntry.clientName,
+      desc: billingEntry.desc,
+      valor: billingEntry.valor,
+      data: billingEntry.data,
+      dateISO: billingEntry.dateISO,
+      createdAt: billingEntry.createdAt,
+      updatedAt: billingEntry.updatedAt,
+    });
+
     resultClientes = clientes;
+    resultBillingEntry = billingEntry;
+    resultStatus = 'applied';
   });
 
-  return resultClientes;
+  return {
+    clientes: resultClientes,
+    billingEntry: resultBillingEntry!,
+    receiptOperationId,
+    status: resultStatus,
+  };
 }
 
 /**

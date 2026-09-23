@@ -57,8 +57,6 @@ export interface RotaRepository {
   list(): Promise<Rota[]>;
   /** Upsert por id (confirmar rota). */
   save(rota: Rota): Promise<void>;
-  /** Remover por id (cancelar rota). */
-  remove(id: string): Promise<void>;
   observe(callback: (items: Rota[]) => void): () => void;
 }
 
