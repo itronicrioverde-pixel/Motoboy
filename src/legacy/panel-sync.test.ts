@@ -32,6 +32,12 @@ const CLIENT_WRITER_PATH = resolve(
 );
 const clientWriterSource = readFileSync(CLIENT_WRITER_PATH, 'utf-8');
 
+const RECEIPT_MANAGER_PATH = resolve(
+  __dirname,
+  '../features/customers/application/receipt-submission-manager.ts',
+);
+const receiptManagerSource = readFileSync(RECEIPT_MANAGER_PATH, 'utf-8');
+
 describe('panel.js — propriedades estáticas', () => {
   describe('ausência de motoRemoteLoaded', () => {
     it('variável motoRemoteLoaded não existe no código', () => {
@@ -118,38 +124,80 @@ describe('panel.js — propriedades estáticas', () => {
     });
   });
 
-  describe('recebimento — projeção financeira transacional', () => {
+  describe('recebimento — submissão transacional com lock e retry no manager', () => {
     it('não mantém writer debounced para clients/data', () => {
       expect(panelSource).not.toContain('clientsWriter');
       expect(panelSource).not.toContain('saveClientsToFirestore');
       expect(panelSource).not.toContain('syncClientsToFirestore');
     });
 
-    it('aguarda applyReceiptDual antes de aplicar a projeção autoritativa local', () => {
+    it('importa e compõe manager + controlador; não chama applyReceiptDual diretamente no fluxo', () => {
+      expect(panelSource).toContain("import { createReceiptSubmissionManager } from");
+      expect(panelSource).toContain('const receiptSubmissionManager = createReceiptSubmissionManager');
+      expect(panelSource).toContain("import { createReceiptSubmissionController } from");
+      expect(panelSource).toContain('const receiptSubmissionController = createReceiptSubmissionController');
+
       const start = panelSource.indexOf("document.getElementById('recebimentoSave')");
       const end = panelSource.indexOf('const clienteModalCtl', start);
       const body = panelSource.slice(start, end);
-      const awaitPos = body.indexOf('await applyReceiptDual');
-      const projectionPos = body.indexOf('clientes = updatedClientes');
-      expect(awaitPos).toBeGreaterThan(-1);
-      expect(projectionPos).toBeGreaterThan(awaitPos);
-      expect(body).not.toContain('applyReceipt(cliente');
+      expect(body).not.toContain('applyReceiptDual');
+      expect(body).not.toContain("localStorage.getItem('pendingReceipt')");
+      expect(body).not.toContain('entradas.unshift');
+      expect(body).toContain('receiptSubmissionController.submit');
+      expect(body).toContain('retryPendingReceipt');
     });
 
-    it('falha remota não cria faturamento nem altera o cache local', () => {
+    it('falha mantém o modal aberto sem criar faturamento nem alterar o cache local', () => {
+      expect(panelSource).toContain('handleReceiptSubmissionFailure');
+      expect(panelSource).toContain('catch(err)');
+      const success = extractFunction(panelSource, 'applyReceiptSuccess');
+      expect(success).toContain('applyReceiptResult({ clientes, entradas }, result)');
+      expect(success).toContain('saveLocalState()');
+      expect(success).toContain('renderFaturamento()');
+    });
+
+    it('lock compartilhado entre submit e retry fica no manager (painel não mantém savingReceipt)', () => {
+      expect(panelSource).toContain('createReceiptSubmissionManager');
+      expect(panelSource).not.toContain('savingReceipt');
+      expect(panelSource).not.toMatch(/let savingReceipt\b/);
+    });
+
+    it('receiptOperationId é gerado na composição do manager, não dentro do handler', () => {
       const start = panelSource.indexOf("document.getElementById('recebimentoSave')");
       const end = panelSource.indexOf('const clienteModalCtl', start);
       const body = panelSource.slice(start, end);
-      const awaitPos = body.indexOf('await applyReceiptDual');
-      expect(body.indexOf('entradas.unshift')).toBeGreaterThan(awaitPos);
-      expect(body.indexOf('saveLocalState()')).toBeGreaterThan(awaitPos);
-      expect(body).toContain('catch(err)');
+      expect(body).not.toContain('crypto.randomUUID()');
+
+      const compositionStart = panelSource.indexOf('const receiptSubmissionManager = createReceiptSubmissionManager');
+      const compositionEnd = panelSource.indexOf('let receiptPendingMode', compositionStart);
+      const composition = panelSource.slice(compositionStart, compositionEnd);
+      expect(composition).toContain('generateReceiptOperationId: () => `receipt-${crypto.randomUUID()}`');
     });
 
-    it('lock savingReceipt impede duplo clique', () => {
-      expect(panelSource).toContain('let savingReceipt = false');
-      expect(panelSource).toContain('if(savingReceipt) return');
-      expect(panelSource).toMatch(/finally\s*\{[^}]*savingReceipt\s*=\s*false/);
+    it('tentativa pendente oferece retomada por banner e modal em modo pendente', () => {
+      expect(panelSource).toContain('data-action="pending-receipt"');
+      expect(panelSource).toContain('Retomar recebimento');
+      expect(panelSource).toContain('enterReceiptPendingMode');
+      expect(panelSource).toContain('retryPendingReceipt');
+      expect(panelSource).toContain('receiptSubmissionController.retry');
+    });
+
+    it('controlador não acessa banco remoto, DOM, janela global nem armazenamento', () => {
+      const controllerSource = readFileSync(
+        resolve(__dirname, '../features/customers/presentation/receipt-submission-controller.ts'),
+        'utf-8',
+      );
+      expect(controllerSource).not.toContain('firebase');
+      expect(controllerSource).not.toContain('document.');
+      expect(controllerSource).not.toContain('window.');
+      expect(controllerSource).not.toContain('localStorage');
+    });
+
+    it('manager não acessa banco remoto, DOM, janela global nem armazenamento', () => {
+      expect(receiptManagerSource).not.toContain('firebase');
+      expect(receiptManagerSource).not.toContain('document.');
+      expect(receiptManagerSource).not.toContain('window.');
+      expect(receiptManagerSource).not.toContain('localStorage');
     });
   });
 
@@ -354,6 +402,16 @@ describe('panel.js — propriedades estáticas', () => {
 
     it('panel.js importa mergeLegacyCustomers', () => {
       expect(panelSource).toContain("import { mergeLegacyCustomers } from");
+    });
+  });
+
+  describe('cancelamento — remove() removido', () => {
+    it('panel.js não chama __motoboyRotas.remove()', () => {
+      expect(panelSource).not.toContain('__motoboyRotas.remove');
+    });
+
+    it('panel.js não chama rotasService.remove()', () => {
+      expect(panelSource).not.toContain('rotasService.remove');
     });
   });
 });

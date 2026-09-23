@@ -15,6 +15,16 @@ export interface Entrada {
   editReason: string | null;
   createdAt: number;
   updatedAt: number;
+  /**
+   * Identidade de recebimento (quando a entrada veio de um recebimento de cliente).
+   * No Firestore o documento é gravado em entradas/{receiptOperationId}; o mapper
+   * preserva esse campo para que o upsert local (applyReceiptResult) nunca duplique.
+   */
+  receiptOperationId?: string;
+  /** Origem da entrada. Recebimentos usam 'client_receipt'; manuais não têm. */
+  source?: string | null;
+  clientId?: string | null;
+  clientName?: string | null;
 }
 
 export interface NewEntrada {

@@ -5,7 +5,9 @@
  */
 
 import { entradasService } from '../index';
-import type { EditEntrada, Entrada, NewEntrada } from '../index';
+import type { EditEntrada, NewEntrada } from '../index';
+import { entradaToEntryVM } from './entrada-view-model';
+import type { EntradaEntryVM } from './entrada-view-model';
 import type { LoadResult } from '../../../shared/application/load-result';
 import { loadOk, loadFail } from '../../../shared/application/load-result';
 
@@ -32,7 +34,7 @@ declare global {
       update(fsId: string | null | undefined, vm: EntradaVM): Promise<void>;
       remove(fsId: string | null | undefined): Promise<void>;
     };
-    __applyRemoteEntradas?: (entities: Entrada[]) => void;
+    __applyRemoteEntradas?: (entries: EntradaEntryVM[]) => void;
   }
 }
 
@@ -69,14 +71,15 @@ export function installFaturamentoBridge(): void {
 }
 
 /**
- * Carrega as entradas do dono no Firestore e injeta no painel.
+ * Carrega as entradas do dono no Firestore e injeta no painel como view models já
+ * mapeados (fsId + identidade de recebimento preservada).
  * Nunca lança: retorna ok:false em caso de falha.
  */
-export async function loadFaturamentoIntoPanel(): Promise<LoadResult<Entrada[]>> {
+export async function loadFaturamentoIntoPanel(): Promise<LoadResult<EntradaEntryVM[]>> {
   try {
     const items = await entradasService.list();
-    window.__applyRemoteEntradas?.(items);
-    return loadOk(items);
+    window.__applyRemoteEntradas?.(items.map(entradaToEntryVM));
+    return loadOk(items.map(entradaToEntryVM));
   } catch (error) {
     console.error('[Faturamento] Erro ao carregar:', error);
     return loadFail(error);

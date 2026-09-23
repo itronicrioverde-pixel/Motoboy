@@ -1221,3 +1221,125 @@ A confirmação de rota executava sua máquina de estados, lock, geração de id
 - `client-pendings-gateway.test.ts`: compatibilidade do contrato entre o orquestrador e `client-writer`.
 - `firestore-rota-mappers.test.ts`: preservação de `serviceId` ao reconstruir o snapshot persistido.
 - `panel-sync.test.ts`: ausência do caminho legado fora do orquestrador e ação de retomada exclusiva para rotas `pending`.
+
+---
+
+## DEC-025 — Remoção de remove() inseguro e receiptOperationId para idempotência de recebimentos
+
+### Status
+
+Aprovada.
+
+### Contexto
+
+Duas vulnerabilidades foram identificadas na revisão:
+
+1. **Caminho inseguro `remove()`**: O método `RotaRepository.remove()`, `RotasService.remove()`, `FirestoreRotaRepository.remove()` (usando `deleteDoc`) e `window.__motoboyRotas.remove()` continuavam expostos. Qualquer consumidor poderia apagar uma rota sem desfazer as contas financeiras associadas, criando órfãos financeiros. O único cancelamento seguro é `cancelRouteDual()` (transacional).
+
+2. **Recebimentos não idempotentes entre submissões distintas**: O `applyReceiptDual()` gerava um novo `id` interno a cada chamada. Em caso de resposta de rede ambígua, reload ou dois dispositivos, o mesmo recebimento poderia ser aplicado novamente se ainda houvesse saldo, resultando em duplo recebimento.
+
+### Decisão
+
+#### 1. Remoção de `remove()` em todas as camadas
+
+| Camada | Arquivo | Mudança |
+|---|---|---|
+| Domain | `rota.ts` | `RotaRepository.remove(id)` removido da interface |
+| Application | `rotas-service.ts` | `RotasService.remove(id)` removido |
+| Infrastructure | `firestore-rota-repository.ts` | `FirestoreRotaRepository.remove(id)` e import `deleteDoc` removidos |
+| Presentation | `panel-bridge.ts` | `window.__motoboyRotas.remove` e `rotasService.remove` removidos da bridge |
+
+O único caminho público de cancelamento é `cancelAtomic()` → `cancelRouteDual()`, que executas todas as operações financeiras em uma única `runTransaction`.
+
+#### 2. `receiptOperationId` para idempotência de recebimentos
+
+`ApplyReceiptInput` recebe campo obrigatório `receiptOperationId` (string). Regras:
+
+- **Gerado uma vez por submissão**: `receipt-${crypto.randomUUID()}` gerado antes do `try` em `panel.js`.
+- **Pré-gerado antes de `runTransaction`**: sobrevive a reexecuções do callback pelo Firestore.
+- **Persistido em `recebimentos[]`** do cliente.
+- **Idempotência**: Mesmo `receiptOperationId` + mesmo payload → no-op (retorna estado atual sem escrever).
+- **Conflito**: Mesmo `receiptOperationId` + payload diferente → erro explícito.
+- **Retry**: Reutiliza o mesmo `receiptOperationId` (gerado antes do `try`).
+
+#### 3. Testes comportamentais corrigidos
+
+- **Duplo clique**: Simula duas chamadas reais com `Promise.all`, mock com snapshot atualizável, valida que ambas as transações executam e o estado final é consistente.
+- **Concorrência receipt/cancel**: Receipt aplica primeiro, cancel lê estado pós-receipt e rejeita (conta com `recebido > 0`).
+- **Idempotência receiptOperationId**: 4 testes — vazio rejeitado, mesmo ID + payload no-op, mesmo ID + payload diferente conflito, IDs diferentes permitem dois recebimentos.
+
+### Motivo
+
+- **Segurança financeira**: `remove()` sem rollback financeiro é inseguro por design. A remoção em todas as camadas garante que nenhum consumidor possa apagar dados financeiros sem o devido cancelamento atômico.
+- **Idempotência**: Em ambientes com rede instável, a garantia de que o mesmo recebimento não é aplicado duas vezes é crítica para a integridade financeira.
+- **Concorrência**: Dois dispositivos ou reloads não devem resultar em dupla aplicação do mesmo recebimento.
+
+### Testes
+
+- `client-writer.test.ts`: receiptOperationId vazio rejeitado, idempotência (mesmo ID = no-op), conflito (mesmo ID + payload diferente), dois recebimentos com IDs diferentes, submissões concorrentes (mesmo receiptOperationId = idempotente), concorrência receipt/cancel, rollback de commit preserva estado, reexecução de callback reutiliza dados preparados.
+- `panel-sync.test.ts`: geração de `receiptOpId` antes do `try`, ausência de `__motoboyRotas.remove()` e `rotasService.remove()`.
+
+#### 4. Recebimento atômico: `billingEntry` construído internamente
+
+`ApplyReceiptInput` **não mais aceita** `billingEntry`. O `billingEntry` é construído internamente por `applyReceiptDual` a partir dos dados do cliente + input. Isso garante que a escrita financeira (`entradas/{receiptOperationId}`) é sempre consistente com o estado do cliente.
+
+- **`ReceiptBillingEntry`**: nova interface com `receiptOperationId`, `source: 'client_receipt'`, `clientId`, `clientName`, `desc`, `valor`, `data`, `dateISO`, `createdAt`, `updatedAt`.
+- **`ApplyReceiptResult`**: retorna `{ clientes, billingEntry, receiptOperationId, status }` — o campo `billingWritten: boolean` foi removido.
+- **Escrita atômica**: `applyReceiptDual` executa `tx.set(clientsDoc, ...)` e `tx.set(entradasDoc, ...)` na mesma `runTransaction`. Se uma falhar, nenhuma persiste.
+- **Testes de buffer**: `makeBufferedTx` simula semântica transacional do Firestore (escritas no buffer, commit aplica tudo, erro descarta tudo).
+
+#### 5. Gerenciador de submissão com tentativa persistida e retry (lock compartilhado)
+
+A `applyReceiptDual` garantia idempotência por `receiptOperationId`, mas a geração e a
+reutilização do ID dependiam do painel (`pendingReceipt` no `localStorage` do legado). A
+Task 2 move essa garantia para um gerenciador dedicado na camada de aplicação:
+
+- **`receipt-submission-manager.ts`**: submite com lock de concorrência **compartilhado**
+  entre `submit()` e `retry()` (uma única operação por vez; chamadas concorrentes
+  retornam a **mesma Promise**).
+- **Persistência antes do gateway**: a tentativa é salva **antes** de chamar
+  `applyReceiptDual`. Falha ao persistir impede a chamada ao gateway.
+- **Retry**: reutiliza exatamente o mesmo `receiptOperationId` e o payload persistido;
+  enquanto houver tentativa pendente, um novo `submit()` é **recusado** (nada de descarte
+  silencioso), independentemente de o payload ser igual ou diferente.
+- **Estados**: `idle`, `pending`, `inFlight`, `failed`. Falha preserva a tentativa
+  persistida e o `receiptOperationId` para retry; sucesso limpa a tentativa confirmada.
+- **Isolamento por UID**: a chave é `motoboy.receipt-attempt.v1.{uid}`; leitura somente
+  da própria tentativa; sessão alterada durante a execução lança erro sem confirmar nem
+  limpar a tentativa.
+- **Aplicação do resultado**: `apply-receipt-result.ts` (função pura, sem mutar arrays)
+  sincroniza a entrada de faturamento por `receiptOperationId` (upsert) e usa a projeção
+  financeira retornada pelo gateway como autoritativa.
+- **Painel**: o handler de `recebimentoSave` delega ao manager; em falha o modal
+  permanece aberto em **modo pendente** (valor/data bloqueados), com o botão principal
+  virando **"Retentar recebimento"**. Tentativas de sessões anteriores são detectadas no
+  boot e retomáveis por um banner no painel de clientes.
+
+#### 6. Troca de sessão no gerenciador, controlador de apresentação e identidade de recebimento no Faturamento
+
+Refinamento aprovado após a entrega da Task 2, cobrindo três frentes:
+
+- **Troca de sessão sem vazamento de estado**: o gerenciador ganhou `resetStaleMemoryState()`,
+  chamado em `getState()`, `submit()`, `retry()` e `loadPending()`. Quando o UID atual não é o
+  dono da tentativa em memória, o estado vira `idle` — a conta atual nunca enxerga tentativa de
+  outra conta, e nada do store é apagado (a tentativa de A permanece na chave de A e é
+  recuperada quando A volta). Troca de sessão durante a execução (gateway em voo) não confirma
+  nem limpa a tentativa e deixa o estado em `idle` (era `failed`).
+- **Controlador de apresentação testável**: `receipt-submission-controller.ts` orquestra o
+  clique sobre o manager sem tocar DOM/banco/armazenamento. Garante lock de clique
+  compartilhado entre submit e retry (promessas pendentes retornam a MESMA Promise), no máximo
+  um `commit` por submissão, falha encaminhada a `fail` (modal permanece aberto com
+  "Retentar recebimento") e nenhuma rejeição no contrato público. O painel delega o handler de
+  `recebimentoSave` ao controlador.
+- **Identidade de recebimento preservada na reidratação**: o mapper de Faturamento
+  (`entradaFromSnapshot`) passou a preservar `receiptOperationId`/`source`/`clientId`/
+  `clientName` lidos do documento (doc id = `receiptOperationId`; recebimentos legados sem o
+  campo convertem o ID do documento). O view model `entradaToEntryVM` repassa esses campos ao
+  painel, e a mesclagem do `__applyRemoteEntradas` passa a **deduplicar** por
+  `fsId`/`receiptOperationId` (remoto é autoritativo). Com isso, um retry `already-applied`
+  após reidratação não duplica a entrada no Faturamento (`applyReceiptResult` encontra a
+  existente pelo `receiptOperationId`).
+
+### Decisões anteriores afetadas
+
+- DEC-023: Complementada com receiptOperationId para idempotência de recebimentos.

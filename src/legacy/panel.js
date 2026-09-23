@@ -6,7 +6,12 @@ import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
 import { clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
 import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
-import { applyReceiptDual, createClientDual, updateClientDual, removeClientDual } from '../features/customers/infrastructure/client-writer';
+import { applyReceiptResult } from '../features/customers/application/apply-receipt-result';
+import { createReceiptSubmissionManager } from '../features/customers/application/receipt-submission-manager';
+import { createReceiptSubmissionController } from '../features/customers/presentation/receipt-submission-controller';
+import { createLocalStorageReceiptAttemptStore } from '../features/customers/infrastructure/local-storage-receipt-attempt-store';
+import { createClientReceiptGateway } from '../features/customers/infrastructure/client-receipt-gateway';
+import { createClientDual, updateClientDual, removeClientDual } from '../features/customers/infrastructure/client-writer';
 import { createRouteConfirmationOrchestrator } from '../features/rotas/application/route-confirmation-orchestrator';
 import { applyRouteFinancialPendings } from '../features/rotas/infrastructure/client-pendings-gateway';
 
@@ -1395,21 +1400,19 @@ export function bootstrapPanel() {
   }
   document.getElementById('btnOpenEntrada').addEventListener('click', resetEntryFormMode);
 
-  // Ponte: recebe as entradas MANUAIS do Firestore e mescla com as locais
-  // (preserva as de rota — routeId/clientName — e as ainda não sincronizadas).
-  function entradaEntityToVM(e){
-    return {
-      fsId: e.id,
-      desc: e.desc || '',
-      valor: Number(e.valor) || 0,
-      data: dateLabelFromISO(e.dateISO),
-      dateISO: e.dateISO
-    };
-  }
-  window.__applyRemoteEntradas = function(entities){
-    if(!Array.isArray(entities)) return;
-    const remoto = entities.map(entradaEntityToVM);
-    const locaisPreservadas = entradas.filter(function(e){ return e.routeId || e.clientName || !e.fsId; });
+  // Ponte: recebe as entradas do bridge (view models já mapeados, com a identidade
+  // de recebimento preservada — receiptOperationId/source/clientId/clientName).
+  // A mesclagem preserva somente o que o remoto não cobre: entradas de rota
+  // (routeId) e manuais ainda não sincronizadas (sem fsId nem receiptOperationId).
+  // Cópias locais de recebimentos/entradas já autoritativas no Firestore são
+  // substituídas pela cópia remota — evita recebimento duplicado após reidratação.
+  window.__applyRemoteEntradas = function(remoto){
+    if(!Array.isArray(remoto)) return;
+    const locaisPreservadas = entradas.filter(function(e){
+      if(e.routeId) return true;
+      if(!e.fsId && !e.receiptOperationId) return true;
+      return false;
+    });
     entradas = remoto.concat(locaisPreservadas);
     entradas.sort(function(a,b){ return String(b.dateISO||'').localeCompare(String(a.dateISO||'')); });
     saveLocalState();
@@ -3559,17 +3562,36 @@ export function bootstrapPanel() {
     }
   }
 
+  function wirePendingReceiptRetry(list){
+    const btn = list.querySelector('[data-action="pending-receipt"]');
+    if(btn) btn.addEventListener('click', () => openReceiptPendingRetry());
+  }
+
   function renderClientes(){
     clientes.forEach(syncClientBalance);
     document.getElementById('clientesTotalValue').textContent = fmtBRL(clientesTotal());
     document.getElementById('clientesCountValue').textContent = clientes.length;
 
     const list = document.getElementById('clienteList');
+    // Tentativa pendente fica visível independente do saldo atual do cliente.
+    const pendingAttempt = receiptSubmissionController.loadPending();
+    const pendingBannerHTML = pendingAttempt ? `
+      <div class="cliente-card">
+        <div class="avatar">${clientIcon}</div>
+        <div class="info">
+          <div class="name">Recebimento não confirmado</div>
+          <div class="sub owed">A última tentativa de recebimento ainda não foi confirmada.</div>
+        </div>
+        <div class="cliente-side">
+          <button type="button" class="btn-charge" data-action="pending-receipt">Retomar recebimento</button>
+        </div>
+      </div>` : '';
     if(clientes.length === 0){
-      list.innerHTML = '<div class="cliente-empty">Nenhum cliente cadastrado ainda. Toca no + acima ou marque "Fica pra depois" em um serviço da rota.</div>';
+      list.innerHTML = pendingBannerHTML || '<div class="cliente-empty">Nenhum cliente cadastrado ainda. Toca no + acima ou marque "Fica pra depois" em um serviço da rota.</div>';
+      if(pendingBannerHTML) wirePendingReceiptRetry(list);
       return;
     }
-    list.innerHTML = clientes.map((c, i) => `
+    list.innerHTML = pendingBannerHTML + clientes.map((c, i) => `
       <div class="cliente-card">
         <div class="avatar">${clientIcon}</div>
         <div class="info">
@@ -3584,6 +3606,7 @@ export function bootstrapPanel() {
       </div>
     `).join('');
 
+    if(pendingBannerHTML) wirePendingReceiptRetry(list);
     list.querySelectorAll('[data-action="receive"]').forEach(btn => {
       btn.addEventListener('click', () => {
         openReceiptForClient(parseInt(btn.dataset.i));
@@ -3595,9 +3618,80 @@ export function bootstrapPanel() {
   let receiptClientIndex = null;
   const receiptModalCtl = wireModal(null, 'recebimentoModal', 'recebimentoBackdrop', 'recebimentoClose', 'recebimentoCancel');
 
+  // ---------- submissão de recebimentos com lock, persistência e retry ----------
+  // O manager guarda a tentativa ANTES de chamar o gateway e reutiliza o mesmo
+  // receiptOperationId no retry. Duplo clique, reload e falhas de rede resultam em
+  // no máximo uma aplicação financeira — nunca em recebimento duplicado.
+  const receiptSubmissionManager = createReceiptSubmissionManager({
+    currentUid,
+    generateReceiptOperationId: () => `receipt-${crypto.randomUUID()}`,
+    store: createLocalStorageReceiptAttemptStore(),
+    gateway: createClientReceiptGateway(),
+  });
+  // Controlador de apresentação: lock de clique (uma operação por vez), commit
+  // no sucesso e falha mantendo o modal aberto no modo de retentativa.
+  const receiptSubmissionController = createReceiptSubmissionController(receiptSubmissionManager, {
+    commit: applyReceiptSuccess,
+    fail: handleReceiptSubmissionFailure,
+    isInteractive: ensureClientesInteractive,
+  });
+  let receiptPendingMode = false;
+
+  function disableDateSegments(disabled){
+    ['recebimentoDate-d', 'recebimentoDate-m', 'recebimentoDate-y'].forEach(function(id){
+      document.getElementById(id).disabled = disabled;
+    });
+  }
+
+  function exitReceiptPendingMode(){
+    receiptPendingMode = false;
+    document.getElementById('recebimentoValor').disabled = false;
+    disableDateSegments(false);
+    document.getElementById('recebimentoSave').textContent = 'Registrar valor';
+    const descEl = document.getElementById('recebimentoModalDesc');
+    if(descEl) descEl.textContent = 'Informe quanto o cliente pagou agora';
+  }
+
+  function enterReceiptPendingMode(attempt){
+    receiptPendingMode = true;
+    receiptClientIndex = null;
+    const knownCliente = attempt.clientId
+      ? clientes.find(c => c.id === attempt.clientId)
+      : clientes.find(c => !c.id && c.nome === attempt.legacyLookupName);
+    document.getElementById('recebimentoClienteNome').textContent = knownCliente ? knownCliente.nome : (attempt.legacyLookupName || 'Cliente');
+    document.getElementById('recebimentoSaldo').textContent = knownCliente ? fmtBRL(knownCliente.pendente) : '—';
+    document.getElementById('recebimentoValor').value = attempt.valor.toFixed(2);
+    document.getElementById('recebimentoValor').disabled = true;
+    setBrDateValue(document.getElementById('recebimentoDate'), attempt.dateISO);
+    disableDateSegments(true);
+    document.getElementById('recebimentoSave').textContent = 'Retentar recebimento';
+    const descEl = document.getElementById('recebimentoModalDesc');
+    if(descEl) descEl.textContent = 'A última tentativa não foi confirmada. Você pode só tentar de novo com o mesmo valor e data.';
+    receiptModalCtl.open();
+  }
+
+  // Acesso à tentativa pendente independente do saldo atual do cliente.
+  function openReceiptPendingRetry(){
+    const pendingAttempt = receiptSubmissionController.loadPending();
+    if(!pendingAttempt){
+      showToast('Não existe recebimento pendente para retomar. Preencha um novo recebimento.', {kind:'info'});
+      return;
+    }
+    enterReceiptPendingMode(pendingAttempt);
+  }
+
   function openReceiptForClient(clientIndex){
     const cliente = clientes[clientIndex];
     if(!cliente || cliente.pendente <= 0) return;
+    exitReceiptPendingMode();
+    // Tentativa pendente (ex: de uma sessão anterior) nunca pode ser sobrescrita
+    // silenciosamente: o modal abre no modo de retomada.
+    const pendingAttempt = receiptSubmissionController.loadPending();
+    if(pendingAttempt){
+      enterReceiptPendingMode(pendingAttempt);
+      showToast('Existe um recebimento pendente da última tentativa. Use "Retentar recebimento".', {kind:'warning'});
+      return;
+    }
     receiptClientIndex = clientIndex;
     document.getElementById('recebimentoClienteNome').textContent = cliente.nome;
     document.getElementById('recebimentoSaldo').textContent = fmtBRL(cliente.pendente);
@@ -3607,10 +3701,13 @@ export function bootstrapPanel() {
     setTimeout(() => document.getElementById('recebimentoValor').focus(), 0);
   }
 
-  let savingReceipt = false;
   document.getElementById('recebimentoSave').addEventListener('click', async () => {
-    if(savingReceipt) return;
     if(!ensureClientesInteractive()) return;
+    if(receiptSubmissionController.isRunning()) return;
+    if(receiptPendingMode){
+      await retryPendingReceipt();
+      return;
+    }
     const cliente = clientes[receiptClientIndex];
     const valor = parseBrazilianInput(document.getElementById('recebimentoValor').value);
     if(!cliente){ receiptModalCtl.close(); return; }
@@ -3629,34 +3726,49 @@ export function bootstrapPanel() {
     if(receiptISO > localTodayISO()){ showDateError(recebimentoDateEl, 'A data não pode ser futura.', true); return; }
     clearDateError(recebimentoDateEl);
 
-    savingReceipt = true;
-    try {
-      const updatedClientes = await applyReceiptDual({
-        ...(cliente.id ? {clientId: cliente.id} : {legacyLookupName: cliente.nome}),
-        valor,
-        dateISO: receiptISO,
-        dateLabel: dateLabelFromISO(receiptISO),
-      });
-
-      // Só altera estado local APÓS commit remoto, usando a projeção completa.
-      clientes = updatedClientes;
-      const updatedCliente = cliente.id
-        ? clientes.find(c => c.id === cliente.id)
-        : clientes.find(c => !c.id && c.nome === cliente.nome);
-      entradas.unshift({ desc:`Recebimento de ${cliente.nome}`, valor, data: dateLabelFromISO(receiptISO), dateISO: receiptISO, clientName:cliente.nome });
-      saveLocalState();
-      receiptModalCtl.close();
-      receiptClientIndex = null;
-      renderClientes();
-      renderFaturamento();
-      renderDashboard();
-      showToast(`${fmtBRL(valor)} recebido de ${cliente.nome}. O saldo restante é ${fmtBRL(updatedCliente?.pendente || 0)}.`, {kind:'success'});
-    } catch(err) {
-      showToast('Erro ao registrar recebimento no servidor: ' + (err.message || err), {kind:'error'});
-    } finally {
-      savingReceipt = false;
-    }
+    await submitReceipt({
+      ...(cliente.id ? {clientId: cliente.id} : {legacyLookupName: cliente.nome}),
+      valor,
+      dateISO: receiptISO,
+      dateLabel: dateLabelFromISO(receiptISO),
+    });
   });
+
+  function submitReceipt(draft){
+    return receiptSubmissionController.submit(draft);
+  }
+
+  function retryPendingReceipt(){
+    return receiptSubmissionController.retry();
+  }
+
+  function handleReceiptSubmissionFailure(err){
+    // Modal permanece aberto; nada é aplicado localmente em caso de erro.
+    const pendingAttempt = receiptSubmissionController.pendingAttempt();
+    showToast('Erro ao registrar recebimento: ' + (err.message || err) + '. Use "Retentar recebimento".', {kind:'error'});
+    if(pendingAttempt) enterReceiptPendingMode(pendingAttempt);
+  }
+
+  function applyReceiptSuccess(result){
+    // A projeção financeira vem autoritativa do gateway; a entrada de faturamento é
+    // sincronizada por receiptOperationId (upsert) pela função pura.
+    const next = applyReceiptResult({ clientes, entradas }, result);
+    clientes = next.clientes;
+    clientes.forEach(syncClientBalance);
+    entradas = next.entradas;
+    saveLocalState();
+    const entry = result.billingEntry;
+    const updatedCliente = entry.clientId
+      ? clientes.find(c => c.id === entry.clientId)
+      : clientes.find(c => !c.id && c.nome === entry.clientName);
+    exitReceiptPendingMode();
+    receiptModalCtl.close();
+    receiptClientIndex = null;
+    renderClientes();
+    renderFaturamento();
+    renderDashboard();
+    showToast(`${fmtBRL(entry.valor)} recebido de ${entry.clientName}. O saldo restante é ${fmtBRL(updatedCliente ? updatedCliente.pendente : 0)}.`, {kind:'success'});
+  }
 
   const clienteModalCtl = wireModal('btnOpenCliente', 'clienteModal', 'clienteBackdrop', 'clienteClose', 'clienteCancel');
   let editingClientIndex = null;
@@ -3927,6 +4039,13 @@ export function bootstrapPanel() {
   renderClientes();
   renderFaturamento();
   renderDashboard();
+
+  // Recebimento pendente de uma sessão anterior: informa sem abrir o modal. A retomada
+  // fica disponível pelo banner na lista de clientes e ao abrir o registro.
+  const bootPendingReceipt = receiptSubmissionController.loadPending();
+  if(bootPendingReceipt){
+    showToast('Existe um recebimento pendente não confirmado. Para retomar, toque em "Retomar recebimento" na lista de clientes.', {kind:'warning'});
+  }
 
   // ============ ROTA ATIVA: MODO NAVEGAÇÃO ============
 
