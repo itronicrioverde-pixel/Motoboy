@@ -51,21 +51,11 @@ export function installFaturamentoBridge(): void {
     },
     async update(fsId, vm) {
       if (!fsId) return;
-      try {
-        await entradasService.update(fsId, vmToEdit(vm));
-      } catch (error) {
-        console.error('[Faturamento] Erro ao atualizar:', error);
-        /* offline/erro: mantém o cache local */
-      }
+      await entradasService.update(fsId, vmToEdit(vm));
     },
     async remove(fsId) {
       if (!fsId) return;
-      try {
-        await entradasService.remove(fsId);
-      } catch (error) {
-        console.error('[Faturamento] Erro ao remover:', error);
-        /* offline/erro: mantém o cache local */
-      }
+      await entradasService.remove(fsId);
     },
   };
 }

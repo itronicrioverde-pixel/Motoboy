@@ -62,21 +62,11 @@ export function installAbastecimentosBridge(): void {
     },
     async update(fsId, vm) {
       if (!fsId) return;
-      try {
-        await abastecimentosService.update(fsId, vmToEdit(vm));
-      } catch (error) {
-        console.error('[Abastecimentos] Erro ao atualizar:', error);
-        /* offline/erro: mantém o cache local */
-      }
+      await abastecimentosService.update(fsId, vmToEdit(vm));
     },
     async remove(fsId) {
       if (!fsId) return;
-      try {
-        await abastecimentosService.remove(fsId);
-      } catch (error) {
-        console.error('[Abastecimentos] Erro ao remover:', error);
-        /* offline/erro: mantém o cache local */
-      }
+      await abastecimentosService.remove(fsId);
     },
   };
 }

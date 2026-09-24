@@ -425,6 +425,12 @@
     background:var(--surface-3); border:1px solid var(--line); border-radius:999px;
     padding:1px 7px; margin-left:6px; vertical-align:middle; letter-spacing:0.02em; cursor:help;
   }
+  .sync-badge{
+    display:inline-block; font-size:12px; font-weight:600; border-radius:999px;
+    padding:1px 7px; margin-left:6px; vertical-align:middle; letter-spacing:0.02em;
+  }
+  .sync-badge.pending{ color:var(--orange); background:var(--orange-dim); border:1px solid rgba(255,122,26,.35); }
+  .sync-badge.failure{ color:var(--red); background:rgba(255,107,118,.13); border:1px solid rgba(255,107,118,.4); }
   .edit-reason-field{ border-top:1px dashed var(--line); padding-top:12px; }
   .record-actions{ display:flex; align-items:center; justify-content:flex-end; gap:5px; }
   .record-action-btn{
