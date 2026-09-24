@@ -42,6 +42,40 @@ describe('createLocalStorageReceiptAttemptStore', () => {
     expect(loaded).toEqual(attempt);
   });
 
+  it('#1b clientName do momento da submissão é preservado no roundtrip', () => {
+    const { storage } = makeFakeStorage();
+    const store = createLocalStorageReceiptAttemptStore(storage);
+    const attempt = makeAttempt({ clientName: 'Ana' });
+
+    store.save(attempt);
+    const loaded = store.load('user-1');
+
+    expect(loaded).not.toBeNull();
+    expect(loaded?.clientName).toBe('Ana');
+    expect(loaded).toEqual(attempt);
+  });
+
+  it('#1c tentativa antiga sem clientName continua válida na leitura (clienteName fica indefinido)', () => {
+    const { storage } = makeFakeStorage();
+    const store = createLocalStorageReceiptAttemptStore(storage);
+    storage.setItem(
+      receiptAttemptKey('user-1'),
+      JSON.stringify({
+        uid: 'user-1',
+        receiptOperationId: 'receipt-abc',
+        clientId: 'c1',
+        valor: 30,
+        dateISO: '2026-09-23',
+        dateLabel: 'Hoje',
+        createdAt: 1,
+      }),
+    );
+
+    const loaded = store.load('user-1');
+    expect(loaded).not.toBeNull();
+    expect(loaded?.clientName).toBeUndefined();
+  });
+
   it('#2 load com outro UID retorna null (isolamento por usuário)', () => {
     const { storage } = makeFakeStorage();
     const store = createLocalStorageReceiptAttemptStore(storage);

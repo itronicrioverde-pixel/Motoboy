@@ -71,6 +71,13 @@ export interface ApplyReceiptInput {
   readonly clientId?: string;
   /** Nome exato usado apenas para localizar um cliente legado sem ID. */
   readonly legacyLookupName?: string;
+  /**
+   * Nome do cliente exibido na submissão original. Quando presente, define o
+   * clientName/desc do payload imutável da entrada — o retry reutiliza o mesmo
+   * valor mesmo se o cliente for renomeado antes da reaplicação. Quando ausente
+   * (tentativa antiga sem o campo), usa o nome atual do cliente.
+   */
+  readonly clientName?: string;
   readonly valor: number;
   readonly dateISO: string;
   readonly dateLabel: string;
@@ -735,12 +742,13 @@ export async function applyReceiptDual(
     }
 
     const target = existing[targetIndex];
+    const payloadClientName = input.clientName?.trim() || target.nome;
     const incomingPayload = {
       receiptOperationId,
       source: 'client_receipt' as const,
       clientId: target.id || null,
-      clientName: target.nome,
-      desc: `Recebimento de ${target.nome}`,
+      clientName: payloadClientName,
+      desc: `Recebimento de ${payloadClientName}`,
       valor: preparedReceipt.valor,
       data: preparedReceipt.data,
       dateISO: preparedReceipt.dateISO,

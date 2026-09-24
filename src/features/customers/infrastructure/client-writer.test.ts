@@ -165,6 +165,59 @@ function makeStoreBufferedTx(store: Map<string, unknown>) {
   return { tx, commit, committed };
 }
 
+/**
+ * Simulação transacional com detecção de conflito, no espírito do Firestore:
+ * cada runTransaction cria uma transação sobre um snapshot; o commit só aplica
+ * se nenhum caminho escrito pela transação tiver sido modificado desde o
+ * snapshot. Em conflito, commit() retorna false e a aplicação (runTransaction)
+ * repete o callback com um snapshot novo.
+ */
+function createVersionedStore(seed: Record<string, unknown> = {}) {
+  interface DocState { data: unknown; version: number; }
+  const docs = new Map<string, DocState>();
+  for (const [path, data] of Object.entries(seed)) {
+    docs.set(path, { data, version: 1 });
+  }
+
+  function createTransaction() {
+    const snapshot = new Map<string, DocState>();
+    for (const [path, state] of docs) {
+      snapshot.set(path, { data: state.data, version: state.version });
+    }
+    const buffer: TxEntry[] = [];
+    const tx = {
+      get: vi.fn(async (ref: unknown) => {
+        const state = snapshot.get(refPath(ref));
+        return { exists: () => state !== undefined, data: () => state?.data };
+      }),
+      set: vi.fn((ref: unknown, data: unknown, options?: unknown) => {
+        buffer.push({ ref, data, options });
+      }),
+      update: vi.fn(),
+      delete: vi.fn(),
+    };
+    function commit(): boolean {
+      for (const entry of buffer) {
+        const path = refPath(entry.ref);
+        const readVersion = snapshot.get(path)?.version ?? 0;
+        const currentVersion = docs.get(path)?.version ?? 0;
+        if (readVersion !== currentVersion) return false;
+      }
+      for (const entry of buffer) {
+        const path = refPath(entry.ref);
+        docs.set(path, {
+          data: entry.data,
+          version: (docs.get(path)?.version ?? 0) + 1,
+        });
+      }
+      return true;
+    }
+    return { tx, commit };
+  }
+
+  return { docs, createTransaction };
+}
+
 function extractBillingEntryFromBuffer(entries: TxEntry[]): ReceiptBillingEntry | null {
   const entrada = entries.find(({ ref }) => {
     const path = (ref as { _path?: string })._path ?? '';
@@ -1409,44 +1462,68 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       expect(tx.set).not.toHaveBeenCalled();
     });
 
-    it('duas submissões concorrentes com o mesmo receiptOperationId são idempotentes', async () => {
-      const existing = [{
-        id: 'c1', nome: 'Ana', pendente: 50,
-        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
-        recebimentos: [],
-      }];
-      let latestSnapshot = existing;
-      const committedPaths: string[] = [];
-      const { tx, commitBuffer } = makeBufferedTx(
-        () => ({ clientes: latestSnapshot }),
-        (entries) => {
-          for (const entry of entries) {
-            const path = (entry.ref as { _path?: string })._path ?? '';
-            if (path.includes('/clients/')) {
-              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
-            }
-            committedPaths.push(path);
-          }
+    it('duas submissões concorrentes com o mesmo receiptOperationId aplicam o saldo uma única vez', async () => {
+      const versioned = createVersionedStore({
+        'users/uid-1/clients/data': {
+          clientes: [{
+            id: 'c1', nome: 'Ana', pendente: 50,
+            contas: [{ id: 'conta-1', saldo: 50, recebido: 0, status: 'open' }],
+            recebimentos: [],
+          }],
         },
-      );
-      let callCount = 0;
+      });
+
+      let executed = 0;
+      let callbackRuns = 0;
+      let waiters: Array<() => void> = [];
+
+      // runTransaction se comporta como o Firestore: após o callback, tenta
+      // commitar; em conflito de versão repete o callback com snapshot novo.
+      // A barreira só vale para as DUAS execuções iniciais (retries são
+      // subsequentes): garante que ambas leiam o snapshot inicial (interleaving
+      // real) e retoma os commits na ordem em que cada callback terminou —
+      // a primeira transação confirma; a segunda conflita e tem o callback
+      // re-executado (volta com estado já-commitado).
       mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
-        callCount++;
-        await fn(tx);
-        commitBuffer();
+        for (;;) {
+          const txn = versioned.createTransaction();
+          callbackRuns += 1;
+          await fn(txn.tx);
+          executed += 1;
+          if (executed <= 2) {
+            await new Promise<void>((resolve) => {
+              waiters.push(resolve);
+              if (executed === 2) {
+                const resolvers = waiters;
+                waiters = [];
+                for (const r of resolvers) r();
+              }
+            });
+          }
+          if (txn.commit()) return;
+        }
       });
 
       const input = receiptInput({ clientId: 'c1', valor: 20, receiptOperationId: 'receipt-ui-1' });
-      const r1 = await applyReceiptDual(input);
-      const r2 = await applyReceiptDual(input);
+      const [r1, r2] = await Promise.all([applyReceiptDual(input), applyReceiptDual(input)]);
 
-      expect(callCount).toBe(2);
-      expect(r1.clientes[0].recebimentos).toHaveLength(1);
-      expect(r2.clientes[0].recebimentos).toHaveLength(1);
+      // A segunda transação só vence por conflito repetindo o callback: 2 execuções min.
+      expect(callbackRuns).toBe(3);
       expect(r1.status).toBe('applied');
       expect(r2.status).toBe('already-applied');
-      expect(r1.clientes[0].pendente).toBe(r2.clientes[0].pendente);
-      expect(committedPaths.filter((p) => p.includes('/entradas/'))).toHaveLength(1);
+
+      const finalClients =
+        (versioned.docs.get('users/uid-1/clients/data')!.data as {
+          clientes: Array<{ pendente: number; recebimentos: unknown[] }>;
+        }).clientes;
+      // Saldo reduzido exatamente uma vez (50 − 20 = 30), um único recebimento no histórico.
+      expect(finalClients[0].pendente).toBe(30);
+      expect(finalClients[0].recebimentos).toHaveLength(1);
+      // Uma única entrada financeira persistida; a tentativa repetida não escreveu nada.
+      const entradas = Array.from(versioned.docs.keys()).filter((k) => k.includes('/entradas/'));
+      expect(entradas).toEqual(['users/uid-1/entradas/receipt-ui-1']);
+      expect(r2.clientes[0].pendente).toBe(30);
+      expect(r2.clientes[0].recebimentos).toHaveLength(1);
     });
 
     it('duas operações legítimas com IDs diferentes acumulam recebimentos', async () => {

@@ -51,9 +51,21 @@ function normalizeAttempt(value: unknown): PendingReceiptAttempt | null {
     typeof v.legacyLookupName === 'string' && v.legacyLookupName.trim()
       ? v.legacyLookupName.trim()
       : undefined;
+  const clientName =
+    typeof v.clientName === 'string' && v.clientName.trim() ? v.clientName.trim() : undefined;
   if (!clientId && !legacyLookupName) return null;
 
-  return { uid, receiptOperationId, valor, dateISO, dateLabel, createdAt, clientId, legacyLookupName };
+  return {
+    uid,
+    receiptOperationId,
+    valor,
+    dateISO,
+    dateLabel,
+    createdAt,
+    clientId,
+    legacyLookupName,
+    clientName,
+  };
 }
 
 export function createLocalStorageReceiptAttemptStore(

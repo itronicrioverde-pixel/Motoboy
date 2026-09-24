@@ -3728,6 +3728,7 @@ export function bootstrapPanel() {
 
     await submitReceipt({
       ...(cliente.id ? {clientId: cliente.id} : {legacyLookupName: cliente.nome}),
+      clientName: cliente.nome,
       valor,
       dateISO: receiptISO,
       dateLabel: dateLabelFromISO(receiptISO),

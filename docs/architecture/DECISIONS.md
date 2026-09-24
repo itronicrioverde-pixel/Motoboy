@@ -1379,6 +1379,13 @@ A DEC-025 introduziu o `receiptOperationId` e a escrita atômica em `clients/dat
 - Vários legados com o mesmo nome → conflito; nenhum legado + cliente moderno com o mesmo nome → rejeição exigindo `clientId`; nome sem correspondência → criação normal.
 - Clientes criados na **mesma transação** são reutilizados por nome (deduplicação interna), preservando o comportamento de duas pendências do mesmo cliente novo em um único batch.
 
+#### 4. Nome do cliente estável no retry
+
+- A tentativa de recebimento preserva o `clientName` usado na submissão original: o painel preenche `clientName: cliente.nome` **antes** da chamada ao Firestore, o gerenciador valida (trim) e o persistente no armazenamento local junto com o `receiptOperationId`.
+- O retry — inclusive após recarregar a página (nova instância do gerenciador) — reutiliza o **mesmo `receiptOperationId` e o mesmo `clientName`**. Assim o payload imutável comparado em `entradas/{receiptOperationId}` permanece idêntico mesmo que o cliente seja renomeado entre a submissão e a reaplicação; a entrada já persistida é devolvida com nome e timestamps originais, sem nova escrita.
+- Tentativas antigas gravadas sem `clientName` continuam válidas: o writer usa o nome atual do cliente como fallback (comportamento legado) e a leitura tolerante do armazenamento não descarta esses dados.
+- A proteção da DEC-026 permanece: cliente, valor, data ou origem **realmente diferentes** continuam gerando conflito mesmo quando o `clientName` preservado coincide com o persistido.
+
 ### Consequências
 
 - O mesmo `receiptOperationId` nunca reduz o saldo de dois clientes diferentes nem sobrescreve a entrada de faturamento de outrem.
@@ -1389,4 +1396,8 @@ A DEC-025 introduziu o `receiptOperationId` e a escrita atômica em `clients/dat
 
 ### Testes
 
-- `client-writer.test.ts`: 8 testes da proteção global (`entradas/{id}` — already-applied com timestamps preservados, retry sem escrita, Ana→Bruno conflito, conflito sem alteração de saldo/histórico/entrada, valor diferente, data diferente, IDs diferentes legítimos, histórico legado em outro cliente) e 5 testes do fallback restrito (moderno sem `clientId` rejeitado, moderno com `clientId` atualizado, 1 legado usa nome, 2 legados conflitam, nome novo cria). Teste de UID substituído por isolamento com caminhos completos por usuário. Contagem do arquivo: 79 → 92; total do projeto: 841 → 854 (40 arquivos).
+- `client-writer.test.ts`: 8 testes da proteção global (`entradas/{id}` — already-applied com timestamps preservados, retry sem escrita, Ana→Bruno conflito, conflito sem alteração de saldo/histórico/entrada, valor diferente, data diferente, IDs diferentes legítimos, histórico legado em outro cliente) e 5 testes do fallback restrito (moderno sem `clientId` rejeitado, moderno com `clientId` atualizado, 1 legado usa nome, 2 legados conflitam, nome novo cria). Teste de UID substituído por isolamento com caminhos completos por usuário. Teste de concorrência reescrito como **simulação transacional determinística** (store versionado com detecção de conflito + retry de transação tal como o Firestore): duas submissões simultâneas leem o mesmo snapshot inicial, a primeira confirma (`applied`) e a segunda conflita e reexecuta o callback (`already-applied`); asserta saldo reduzido uma única vez, um recebimento no histórico e uma única entrada financeira (teste substituído, contagem do arquivo permanece 92).
+- `local-storage-receipt-attempt-store.test.ts` (8 → 10): `clientName` preservado no roundtrip e tentativa antiga sem o campo continua válida na leitura.
+- `receipt-submission-manager.test.ts` (22 → 23): submissão e retry repassam o `clientName` original ao gateway.
+- `receipt-retry-payload.test.ts` (novo, 5 testes; integração manager + gateway + store reais): resposta perdida (commit + exceção) seguida de renomeação → retry `already-applied` com nome e timestamps originais; recarga do armazenamento local com novo manager; renomeação anterior à submissão; payload financeiro diferente mantém conflito mesmo com `clientName` preservado; tentativa antiga sem `clientName` aplica com fallback para o nome atual.
+- Total do projeto: 854 → **862** (41 arquivos).

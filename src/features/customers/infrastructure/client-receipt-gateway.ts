@@ -13,6 +13,7 @@ export function createClientReceiptGateway(): ReceiptGateway {
       return applyReceiptDual({
         clientId: attempt.clientId,
         legacyLookupName: attempt.clientId ? undefined : attempt.legacyLookupName,
+        clientName: attempt.clientName,
         valor: attempt.valor,
         dateISO: attempt.dateISO,
         dateLabel: attempt.dateLabel,

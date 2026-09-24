@@ -10,9 +10,10 @@ import type {
 
 // ---------- Fakes ----------
 
-function makeDraft(overrides: Partial<{ clientId: string; valor: number; dateISO: string; dateLabel: string }> = {}) {
+function makeDraft(overrides: Partial<{ clientId: string; clientName: string; valor: number; dateISO: string; dateLabel: string }> = {}) {
   return {
     clientId: 'c1',
+    clientName: 'Ana',
     valor: 30,
     dateISO: '2026-09-23',
     dateLabel: 'Hoje',
@@ -125,11 +126,30 @@ describe('createReceiptSubmissionManager', () => {
     const attemptArg = gateway.mock.calls[0][0] as PendingReceiptAttempt;
     expect(attemptArg.receiptOperationId).toBe('receipt-abc123');
     expect(attemptArg.clientId).toBe('c1');
+    expect(attemptArg.clientName).toBe('Ana');
     expect(attemptArg.valor).toBe(30);
     expect(attemptArg.dateISO).toBe('2026-09-23');
     expect(data.get('user-1')).toBeUndefined();
     expect(result.status).toBe('applied');
     expect(manager.getState().status).toBe('idle');
+  });
+
+  it('#1b retry preserva o clientName da submissão original', async () => {
+    const gateway = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockImplementation(async (attempt: PendingReceiptAttempt) => makeResult(attempt));
+    const { manager } = makeHarness({ gateway });
+
+    await expect(manager.submit(makeDraft({ clientName: 'Ana' }))).rejects.toThrow('offline');
+    await manager.retry();
+
+    expect(gateway).toHaveBeenCalledTimes(2);
+    const originalArg = gateway.mock.calls[0][0] as PendingReceiptAttempt;
+    const retryArg = gateway.mock.calls[1][0] as PendingReceiptAttempt;
+    expect(originalArg.clientName).toBe('Ana');
+    expect(retryArg.clientName).toBe('Ana');
+    expect(retryArg.receiptOperationId).toBe('receipt-abc123');
   });
 
   it('#2 lock: submissões concorrentes retornam a mesma Promise', async () => {

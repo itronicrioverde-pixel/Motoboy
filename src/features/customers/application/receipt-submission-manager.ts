@@ -21,6 +21,12 @@ export interface ReceiptDraft {
   readonly clientId?: string;
   /** Nome exato usado apenas para localizar um cliente legado sem ID. */
   readonly legacyLookupName?: string;
+  /**
+   * Nome do cliente exibido na submissão. Preservado na tentativa persistida
+   * para o retry reutilizar o mesmo payload imutável (billing clientName/desc)
+   * mesmo se o cliente for renomeado antes da reaplicação.
+   */
+  readonly clientName?: string;
   readonly valor: number;
   /** Data no formato AAAA-MM-DD. */
   readonly dateISO: string;
@@ -105,6 +111,7 @@ const DATE_ISO_REGEX = /^\d{4}-\d{2}-\d{2}$/;
 function validateDraft(draft: ReceiptDraft): Required<Pick<ReceiptDraft, 'valor' | 'dateISO' | 'dateLabel'>> & {
   readonly clientId?: string;
   readonly legacyLookupName?: string;
+  readonly clientName?: string;
 } {
   if (!draft || typeof draft !== 'object') {
     throw new Error('Recebimento inválido para submissão.');
@@ -125,10 +132,21 @@ function validateDraft(draft: ReceiptDraft): Required<Pick<ReceiptDraft, 'valor'
     typeof draft.legacyLookupName === 'string' && draft.legacyLookupName.trim()
       ? draft.legacyLookupName.trim()
       : undefined;
+  const clientName =
+    typeof draft.clientName === 'string' && draft.clientName.trim()
+      ? draft.clientName.trim()
+      : undefined;
   if (!clientId && !legacyLookupName) {
     throw new Error('clientId ou legacyLookupName é obrigatório para recebimento.');
   }
-  return { valor, dateISO: draft.dateISO, dateLabel: draft.dateLabel.trim(), clientId, legacyLookupName };
+  return {
+    valor,
+    dateISO: draft.dateISO,
+    dateLabel: draft.dateLabel.trim(),
+    clientId,
+    legacyLookupName,
+    clientName,
+  };
 }
 
 export function createReceiptSubmissionManager(
@@ -248,6 +266,7 @@ export function createReceiptSubmissionManager(
       dateLabel: validated.dateLabel,
       clientId: validated.clientId,
       legacyLookupName: validated.legacyLookupName,
+      clientName: validated.clientName,
     };
 
     // Persistência ANTES do gateway: falha ao persistir impede a chamada ao gateway.
