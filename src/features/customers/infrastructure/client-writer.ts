@@ -153,6 +153,96 @@ function requiredIdentifier(value: string, label: string): string {
   return normalized;
 }
 
+function normalizeCustomerName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+interface ReceiptPayloadToCompare {
+  readonly receiptOperationId?: string;
+  readonly source?: string;
+  readonly clientId?: string | null;
+  readonly clientName?: string;
+  readonly desc?: string;
+  readonly valor?: unknown;
+  readonly data?: string;
+  readonly dateISO?: string;
+  readonly createdAt?: unknown;
+  readonly updatedAt?: unknown;
+}
+
+/**
+ * Compara o payload imutável de uma entrada já persistida com a submissão atual.
+ * createdAt/updatedAt NÃO fazem parte do conteúdo da submissão.
+ */
+function assertSameReceiptPayload(
+  persisted: ReceiptPayloadToCompare,
+  incoming: ReceiptPayloadToCompare,
+): void {
+  const differs =
+    persisted.receiptOperationId !== incoming.receiptOperationId ||
+    persisted.source !== incoming.source ||
+    String(persisted.clientId ?? '') !== String(incoming.clientId ?? '') ||
+    persisted.clientName !== incoming.clientName ||
+    Number(persisted.valor) !== Number(incoming.valor) ||
+    persisted.data !== incoming.data ||
+    persisted.dateISO !== incoming.dateISO ||
+    (persisted.desc !== undefined && persisted.desc !== incoming.desc);
+  if (!differs) return;
+  throw new Error(
+    `Conflito de receiptOperationId "${incoming.receiptOperationId}": ` +
+    `entrada já registrada com payload diferente ` +
+    `(existente: cliente=${persisted.clientName ?? '?'}, ` +
+    `valor=${persisted.valor ?? '?'}, data=${persisted.dateISO ?? '?'}) × ` +
+    `(entrante: cliente=${incoming.clientName}, ` +
+    `valor=${incoming.valor}, data=${incoming.dateISO ?? '?'}).`,
+  );
+}
+
+/**
+ * Compara o registro legado de recebimentos (quando a entrada {id} ainda não
+ * existia) com a submissão atual. Campos ausentes no registro legado não
+ * são exigidos.
+ */
+function assertSameLegacyReceipt(
+  recorded: { valor?: unknown; data?: unknown; dateISO?: unknown },
+  incoming: { valor: number; data: string; dateISO: string },
+  receiptOperationId: string,
+): void {
+  const differs =
+    Number(recorded.valor) !== incoming.valor ||
+    (recorded.dateISO !== undefined && recorded.dateISO !== incoming.dateISO) ||
+    (recorded.data !== undefined && recorded.data !== incoming.data);
+  if (!differs) return;
+  throw new Error(
+    `Conflito de receiptOperationId "${receiptOperationId}": ` +
+    `recebimento legado já registrado com payload diferente ` +
+    `(existente: valor=${recorded.valor ?? '?'}, ` +
+    `data=${recorded.dateISO ?? recorded.data ?? '?'}) × ` +
+    `(entrante: valor=${incoming.valor}, data=${incoming.dateISO}).`,
+  );
+}
+
+interface ReceiptHistoryHit {
+  readonly clientIndex: number;
+  readonly recorded: Record<string, unknown>;
+}
+
+function findReceiptInHistory(
+  clientes: LegacyCliente[],
+  receiptOperationId: string,
+): ReceiptHistoryHit[] {
+  const hits: ReceiptHistoryHit[] = [];
+  clientes.forEach((client, clientIndex) => {
+    const history = Array.isArray(client.recebimentos) ? client.recebimentos : [];
+    for (const recorded of history as Array<Record<string, unknown>>) {
+      if (recorded.receiptOperationId === receiptOperationId) {
+        hits.push({ clientIndex, recorded });
+      }
+    }
+  });
+  return hits;
+}
+
 /**
  * Verifica se há conflito: mesma operationId mas conteúdo diferente.
  * Lança erro se houver conflito — nunca cria duplicata nem sobrescreve.
@@ -411,7 +501,7 @@ export async function applyRoutePendingsDual(
   });
 
   const uniqueNames = [...new Set(
-    preparedItems.filter((i) => !i.clientId).map((i) => i.nome.toLowerCase()),
+    preparedItems.filter((i) => !i.clientId).map((i) => normalizeCustomerName(i.nome)),
   )];
   const idMap = new Map<string, string>();
   for (const name of uniqueNames) {
@@ -428,9 +518,10 @@ export async function applyRoutePendingsDual(
 
     let clientes = [...existing];
     const newProfiles: Array<{ id: string; nome: string }> = [];
+    const createdThisTx = new Set<string>();
 
     for (const item of preparedItems) {
-      const nomeLower = item.nome.toLowerCase();
+      const nomeLower = normalizeCustomerName(item.nome);
 
       // Busca global por operationId — protege contra contaminação cruzada
       let globalOwner: LegacyCliente | undefined;
@@ -466,28 +557,50 @@ export async function applyRoutePendingsDual(
           );
         }
       } else {
-        const nameMatches = clientes.filter((c) => c.nome.toLowerCase() === nomeLower);
-        if (nameMatches.length > 1) {
+        // Sem clientId, o nome pode localizar apenas cliente legado sem ID.
+        const legacyMatches = clientes.filter(
+          (c) => !c.id && normalizeCustomerName(c.nome) === nomeLower,
+        );
+        if (legacyMatches.length > 1) {
           throw new Error(
-            `Ambiguidade: ${nameMatches.length} clientes com nome "${item.nome}". ` +
+            `Conflito: ${legacyMatches.length} clientes legados sem ID com nome "${item.nome}". ` +
             `Informe clientId para identificar corretamente.`,
           );
         }
-        client = nameMatches[0];
+        if (legacyMatches.length === 1) {
+          client = legacyMatches[0];
+        } else {
+          const modernWithSameName = clientes.some(
+            (c) => Boolean(c.id) && !createdThisTx.has(c.id as string)
+              && normalizeCustomerName(c.nome) === nomeLower,
+          );
+          if (modernWithSameName) {
+            throw new Error(
+              `Cliente moderno "${item.nome}" já existe, mas a pendência não possui clientId. ` +
+              `Informe clientId para associar a pendência.`,
+            );
+          }
+        }
       }
 
       if (!client) {
         const newId = idMap.get(nomeLower)!;
-        newProfiles.push({ id: newId, nome: item.nome });
+        const alreadyCreated = clientes.find((c) => c.id === newId);
+        if (alreadyCreated) {
+          client = alreadyCreated;
+        } else {
+          newProfiles.push({ id: newId, nome: item.nome });
+          createdThisTx.add(newId);
 
-        client = {
-          id: newId,
-          nome: item.nome,
-          pendente: 0,
-          contas: [],
-          recebimentos: [],
-        };
-        clientes = [...clientes, client];
+          client = {
+            id: newId,
+            nome: item.nome,
+            pendente: 0,
+            contas: [],
+            recebimentos: [],
+          };
+          clientes = [...clientes, client];
+        }
       }
 
       const newConta = { ...item.conta };
@@ -541,6 +654,14 @@ export async function applyRoutePendingsDual(
  * - mesmo ID e payload diferente → conflito, nenhuma escrita.
  * - IDs diferentes → dois recebimentos legítimos.
  *
+ * A proteção global e autoritativa da operação é o documento
+ * users/{uid}/entradas/{receiptOperationId}, lido dentro da mesma
+ * runTransaction antes de qualquer escrita. Se ele já existir, o payload
+ * imutável completo é comparado (cliente, valor, data, origem, desc);
+ * createdAt/updatedAt não fazem parte da submissão. O histórico
+ * recebimentos[] de TODOS os clientes também é verificado para impedir
+ * reaplicação em dados legados que não possuem a entrada financeira.
+ *
  * Pré-condições:
  * - receiptOperationId é não vazio.
  * - IDs, datas e payloads são preparados antes de runTransaction.
@@ -575,12 +696,15 @@ export async function applyReceiptDual(
     data: requiredIdentifier(input.dateLabel, 'dateLabel'),
     dateISO: input.dateISO,
   };
+  const clientsRef = clientsDoc(uid);
+  const entradasRef = entradasDoc(uid, receiptOperationId);
   let resultClientes: LegacyCliente[] = [];
   let resultBillingEntry: ReceiptBillingEntry | null = null;
   let resultStatus: 'applied' | 'already-applied' = 'applied';
 
   await runTransaction(db, async (tx) => {
-    const clientsSnap = await tx.get(clientsDoc(uid));
+    const clientsSnap = await tx.get(clientsRef);
+    const entradasSnap = await tx.get(entradasRef);
     const existing: LegacyCliente[] = clientsSnap.exists()
       ? (clientsSnap.data().clientes as LegacyCliente[] ?? [])
       : [];
@@ -592,10 +716,10 @@ export async function applyReceiptDual(
         throw new Error(`Cliente não encontrado para clientId "${input.clientId}".`);
       }
     } else {
-      const lookupName = input.legacyLookupName!.trim().toLowerCase();
+      const lookupName = normalizeCustomerName(input.legacyLookupName ?? '');
       const matches = existing
         .map((client, index) => ({ client, index }))
-        .filter(({ client }) => !client.id && client.nome.trim().toLowerCase() === lookupName);
+        .filter(({ client }) => !client.id && normalizeCustomerName(client.nome) === lookupName);
       if (matches.length === 0) {
         throw new Error(
           `Nenhum cliente legado encontrado com nome "${input.legacyLookupName}".`,
@@ -611,24 +735,50 @@ export async function applyReceiptDual(
     }
 
     const target = existing[targetIndex];
-    const contas = Array.isArray(target.contas)
-      ? (target.contas as Array<Record<string, unknown>>).map((conta) => ({ ...conta }))
-      : [];
+    const incomingPayload = {
+      receiptOperationId,
+      source: 'client_receipt' as const,
+      clientId: target.id || null,
+      clientName: target.nome,
+      desc: `Recebimento de ${target.nome}`,
+      valor: preparedReceipt.valor,
+      data: preparedReceipt.data,
+      dateISO: preparedReceipt.dateISO,
+    };
 
-    const existingReceipt = ((target.recebimentos ?? []) as Array<Record<string, unknown>>).find(
-      (r) => r.receiptOperationId === receiptOperationId,
-    ) as { receiptOperationId?: string; valor?: number; dateISO?: string } | undefined;
+    // Proteção global autoritativa: a entrada já existente impede reaplicação.
+    if (entradasSnap.exists()) {
+      const persisted = entradasSnap.data() as ReceiptPayloadToCompare;
+      assertSameReceiptPayload(persisted, incomingPayload);
+      resultClientes = existing;
+      resultBillingEntry = {
+        receiptOperationId: persisted.receiptOperationId ?? receiptOperationId,
+        source: 'client_receipt',
+        clientId: persisted.clientId ?? null,
+        clientName: persisted.clientName ?? target.nome,
+        desc: typeof persisted.desc === 'string' ? persisted.desc : incomingPayload.desc,
+        valor: Number(persisted.valor),
+        data: typeof persisted.data === 'string' ? persisted.data : incomingPayload.data,
+        dateISO: persisted.dateISO ?? incomingPayload.dateISO,
+        createdAt: typeof persisted.createdAt === 'number' ? persisted.createdAt : now,
+        updatedAt: typeof persisted.updatedAt === 'number' ? persisted.updatedAt : now,
+      };
+      resultStatus = 'already-applied';
+      return;
+    }
 
-    if (existingReceipt) {
-      const samePayload =
-        existingReceipt.valor === preparedReceipt.valor &&
-        existingReceipt.dateISO === preparedReceipt.dateISO;
-      if (!samePayload) {
-        throw new Error(
-          `Conflito de receiptOperationId "${receiptOperationId}": ` +
-          `existente (valor=${existingReceipt.valor}, dateISO=${existingReceipt.dateISO}) × ` +
-          `entrante (valor=${preparedReceipt.valor}, dateISO=${preparedReceipt.dateISO})`,
-        );
+    // Verificação global do histórico recebimentos (dados legados sem entrada).
+    const legacyHits = findReceiptInHistory(existing, receiptOperationId);
+    if (legacyHits.length > 0) {
+      for (const hit of legacyHits) {
+        if (hit.clientIndex !== targetIndex) {
+          throw new Error(
+            `Conflito de receiptOperationId "${receiptOperationId}": ` +
+            `recebimento já registrado no cliente "${existing[hit.clientIndex].nome}". ` +
+            `Não é possível reaplicar o mesmo identificador em outro cliente.`,
+          );
+        }
+        assertSameLegacyReceipt(hit.recorded, incomingPayload, receiptOperationId);
       }
       resultClientes = existing;
       resultBillingEntry = {
@@ -636,7 +786,7 @@ export async function applyReceiptDual(
         source: 'client_receipt',
         clientId: target.id || null,
         clientName: target.nome,
-        desc: `Recebimento de ${target.nome}`,
+        desc: incomingPayload.desc,
         valor: preparedReceipt.valor,
         data: preparedReceipt.data,
         dateISO: preparedReceipt.dateISO,
@@ -646,6 +796,10 @@ export async function applyReceiptDual(
       resultStatus = 'already-applied';
       return;
     }
+
+    const contas = Array.isArray(target.contas)
+      ? (target.contas as Array<Record<string, unknown>>).map((conta) => ({ ...conta }))
+      : [];
 
     const saldoDisponivel = contas.reduce(
       (sum, conta) => sum + Math.max(0, Number(conta.saldo) || 0),
@@ -689,20 +843,13 @@ export async function applyReceiptDual(
     );
 
     const billingEntry: ReceiptBillingEntry = {
-      receiptOperationId,
-      source: 'client_receipt',
-      clientId: target.id || null,
-      clientName: target.nome,
-      desc: `Recebimento de ${target.nome}`,
-      valor: preparedReceipt.valor,
-      data: preparedReceipt.data,
-      dateISO: preparedReceipt.dateISO,
+      ...incomingPayload,
       createdAt: now,
       updatedAt: now,
     };
 
-    tx.set(clientsDoc(uid), { clientes }, { merge: true });
-    tx.set(entradasDoc(uid, receiptOperationId), {
+    tx.set(clientsRef, { clientes }, { merge: true });
+    tx.set(entradasRef, {
       receiptOperationId: billingEntry.receiptOperationId,
       source: billingEntry.source,
       clientId: billingEntry.clientId,

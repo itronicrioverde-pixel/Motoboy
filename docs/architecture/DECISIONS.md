@@ -1343,3 +1343,50 @@ Refinamento aprovado após a entrega da Task 2, cobrindo três frentes:
 ### Decisões anteriores afetadas
 
 - DEC-023: Complementada com receiptOperationId para idempotência de recebimentos.
+
+---
+
+## DEC-026 — Idempotência global de recebimentos e fallback legado restrito nas pendências
+
+**Status:** Aprovada e implementada
+**Data:** 24/09/2026
+**Relação:** Complementa a DEC-025 (idempotência por `receiptOperationId`) e a DEC-023 (pendências de rota). Em caso de divergência sobre a proteção global do recebimento ou o fallback por nome, prevalece esta decisão.
+
+### Contexto
+
+A DEC-025 introduziu o `receiptOperationId` e a escrita atômica em `clients/data` + `entradas/{receiptOperationId}`, mas a checagem de idempotência dentro do `applyReceiptDual` só varria o array `recebimentos[]` do cliente-alvo. O documento `users/{uid}/entradas/{receiptOperationId}` — a fonte financeira do faturamento — nunca era lido antes de escrever. Consequência: o mesmo `receiptOperationId` podia ser aplicado primeiro em Ana e depois em Bruno (saldo de ambos reduzido, entrada de faturamento sobrescrita, histórico do cliente-alvo vazio do outro lado). O `applyRoutePendingsDual` aceitava pendência sem `clientId` quando existia um cliente moderno com o mesmo nome, associando a pendência à identidade errada, e o teste de isolamento por UID reutilizava o mesmo snapshot para dois UIDs (falso positivo).
+
+### Decisão
+
+#### 1. `entradas/{receiptOperationId}` é a proteção global e autoritativa
+
+- `applyReceiptDual` lê `clients/data` **e** `users/{uid}/entradas/{receiptOperationId}` no início da mesma `runTransaction`, **antes de qualquer escrita**; as refs são preparadas fora do callback.
+- Se a entrada existir, compara-se o **payload imutável completo**: `receiptOperationId`, `source`, `clientId`, `clientName`, `valor`, `data`, `dateISO` e `desc` (quando persistido). `createdAt`/`updatedAt` **não** fazem parte da comparação.
+- Payload igual → `already-applied`: retorna a entrada **realmente persistida** (com os `createdAt`/`updatedAt` originais) e não executa nenhuma escrita.
+- Payload diferente (inclusive cliente, valor, data ou origem) → **erro de conflito**, nenhuma escrita.
+
+#### 2. Histórico legado verificado em todos os clientes
+
+- Quando a entrada `{id}` ainda não existe, o `receiptOperationId` é procurado no `recebimentos[]` de **todos** os clientes de `clients/data` (não só do alvo).
+- Registro em **outro cliente** → conflito (impede reaplicação em dados legados sem entrada financeira).
+- Registro no **mesmo cliente** com payload igual → no-op (já aplicado); com payload diferente → conflito.
+- Campos ausentes no registro legado (ex.: `dateISO` antigo) não são exigidos na comparação.
+
+#### 3. Fallback por nome restrito a clientes legados sem ID
+
+- Em `applyRoutePendingsDual`, item com `clientId` associa exclusivamente por ID.
+- Item **sem** `clientId` só pode localizar cliente **legado sem ID** (`!c.id`), por nome normalizado (`trim()` + caixa).
+- Vários legados com o mesmo nome → conflito; nenhum legado + cliente moderno com o mesmo nome → rejeição exigindo `clientId`; nome sem correspondência → criação normal.
+- Clientes criados na **mesma transação** são reutilizados por nome (deduplicação interna), preservando o comportamento de duas pendências do mesmo cliente novo em um único batch.
+
+### Consequências
+
+- O mesmo `receiptOperationId` nunca reduz o saldo de dois clientes diferentes nem sobrescreve a entrada de faturamento de outrem.
+- Retry após resposta de rede ambígua é no-op barato (nenhuma escrita) e preserva timestamps persistidos.
+- Dados legados anteriores à entrada `{id}` não podem ser reaplicados sob novo cliente.
+- Pendências sem `clientId` não se associam mais a clientes modernos homônimos; identidade continua sendo `clientId` (DEC-013).
+- Nenhuma alteração em Firestore Rules, índices, Cloud Functions ou deploy.
+
+### Testes
+
+- `client-writer.test.ts`: 8 testes da proteção global (`entradas/{id}` — already-applied com timestamps preservados, retry sem escrita, Ana→Bruno conflito, conflito sem alteração de saldo/histórico/entrada, valor diferente, data diferente, IDs diferentes legítimos, histórico legado em outro cliente) e 5 testes do fallback restrito (moderno sem `clientId` rejeitado, moderno com `clientId` atualizado, 1 legado usa nome, 2 legados conflitam, nome novo cria). Teste de UID substituído por isolamento com caminhos completos por usuário. Contagem do arquivo: 79 → 92; total do projeto: 841 → 854 (40 arquivos).

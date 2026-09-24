@@ -68,12 +68,22 @@ function makeTx(overrides: Record<string, unknown> = {}) {
  * Buffer de escritas transacional.
  * tx.set adiciona ao buffer; o commit aplica.
  * Se o callback lançar erro, o buffer inteiro é descartado.
+ *
+ * O tx.get distingue paths completos:
+ * - `.../clients/data` → dados fornecidos por getClientData().
+ * - `.../entradas/{receiptOperationId}` → store próprio (persistido no commit).
  */
 interface TxEntry { ref: unknown; data: unknown; options?: unknown; }
 interface BufferedTx {
   tx: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   commitBuffer: () => TxEntry[];
   discarded: boolean;
+  entradas: Map<string, unknown>;
+  seed: (path: string, data: unknown) => void;
+}
+
+function refPath(ref: unknown): string {
+  return (ref as { _path?: string })._path ?? '';
 }
 
 function makeBufferedTx(
@@ -81,15 +91,23 @@ function makeBufferedTx(
   onCommit?: ((entries: TxEntry[]) => void) | { get?: ReturnType<typeof vi.fn>; onCommit?: (entries: TxEntry[]) => void },
 ): BufferedTx {
   const buffer: TxEntry[] = [];
+  const entradas = new Map<string, unknown>();
   let discarded = false;
   const opts = typeof onCommit === 'function'
     ? { onCommit }
     : (onCommit ?? {});
+
+  const defaultGet = async (ref: unknown) => {
+    const path = refPath(ref);
+    if (path.includes('/entradas/')) {
+      const data = entradas.get(path);
+      return { exists: () => data !== undefined, data: () => data };
+    }
+    return { exists: () => true, data: () => getClientData() };
+  };
+
   const tx = {
-    get: opts.get ?? vi.fn().mockImplementation(async () => ({
-      exists: () => true,
-      data: () => getClientData(),
-    })),
+    get: opts.get ?? vi.fn(defaultGet),
     set: vi.fn((_ref: unknown, _data: unknown, _options?: unknown) => {
       buffer.push({ ref: _ref, data: _data, options: _options });
     }),
@@ -101,12 +119,50 @@ function makeBufferedTx(
     tx,
     commitBuffer: () => {
       if (opts.onCommit) opts.onCommit([...buffer]);
+      for (const entry of buffer) {
+        if (refPath(entry.ref).includes('/entradas/')) {
+          entradas.set(refPath(entry.ref), entry.data);
+        }
+      }
       const result = [...buffer];
       buffer.length = 0;
       return result;
     },
     get discarded() { return discarded; },
+    entradas,
+    seed(path: string, data: unknown) { entradas.set(path, data); },
   };
+}
+
+/**
+ * Fake transacional com armazenamento separado por caminho completo do Firestore.
+ * tx.get lê do store; commit aplica as escritas do buffer ao store.
+ */
+function makeStoreBufferedTx(store: Map<string, unknown>) {
+  const buffer: TxEntry[] = [];
+  const committed: TxEntry[] = [];
+  const tx = {
+    get: vi.fn(async (ref: unknown) => {
+      const path = refPath(ref);
+      const data = store.get(path);
+      return { exists: () => data !== undefined, data: () => data };
+    }),
+    set: vi.fn((ref: unknown, data: unknown, options?: unknown) => {
+      buffer.push({ ref, data, options });
+    }),
+    update: vi.fn(),
+    delete: vi.fn(),
+  };
+  const commit = () => {
+    const entries = [...buffer];
+    buffer.length = 0;
+    for (const entry of entries) {
+      store.set(refPath(entry.ref), entry.data);
+    }
+    committed.push(...entries);
+    return entries;
+  };
+  return { tx, commit, committed };
 }
 
 function extractBillingEntryFromBuffer(entries: TxEntry[]): ReceiptBillingEntry | null {
@@ -708,14 +764,14 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       const result = await applyRoutePendingsDual(
         [
-          { serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' },
+          { serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'Rota' },
           { serviceId: 'svc-bbb', nome: 'Bruno', valor: 30, desc: 'Rota' },
         ],
         'r1',
       );
 
       expect(result).toHaveLength(2);
-      const ana = result.find((c) => c.nome === 'Ana');
+      const ana = result.find((c) => c.id === 'c1');
       expect(ana!.contas).toHaveLength(2);
       expect(ana!.pendente).toBe(60);
       const bruno = result.find((c) => c.nome === 'Bruno');
@@ -744,11 +800,11 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       });
 
       const result = await applyRoutePendingsDual(
-        [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Nova rota' }],
+        [{ serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'Nova rota' }],
         'r2',
       );
 
-      const ana = result.find((c) => c.nome === 'Ana');
+      const ana = result.find((c) => c.id === 'c1');
       expect(ana!.contas).toHaveLength(2);
       expect(ana!.pendente).toBe(70);
     });
@@ -840,7 +896,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       expect(other!.contas).toHaveLength(0);
     });
 
-    it('rejeita ambiguidade quando dois clientes têm o mesmo nome sem clientId', async () => {
+    it('rejeita item sem clientId quando existem clientes modernos com o mesmo nome', async () => {
       const existing = [
         { id: 'c1', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
         { id: 'c2', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
@@ -860,7 +916,7 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
           [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'test' }],
           'r1',
         ),
-      ).rejects.toThrow('Ambiguidade');
+      ).rejects.toThrow('não possui clientId');
     });
 
     it('busca global de operationId detecta conflito em outro cliente', async () => {
@@ -1472,42 +1528,67 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       expect(cancelTx.delete).not.toHaveBeenCalled();
     });
 
-    it('troca de UID não escreve na conta anterior nem na nova indevidamente', async () => {
-      const existingUid1 = [{
-        id: 'c1', nome: 'Ana', pendente: 50,
-        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
-        recebimentos: [],
-      }];
-      let latestSnapshot = existingUid1;
-      const { tx, commitBuffer } = makeBufferedTx(
-        () => ({ clientes: latestSnapshot }),
-        (entries) => {
-          for (const entry of entries) {
-            const path = (entry.ref as { _path?: string })._path ?? '';
-            if (path.includes('/clients/')) {
-              latestSnapshot = (entry.data as { clientes: typeof existingUid1 }).clientes;
-            }
-          }
-        },
-      );
-      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
-        await fn(tx);
-        commitBuffer();
+    it('isola estados financeiros por UID usando caminhos completos do Firestore', async () => {
+      const store = new Map<string, unknown>();
+      store.set('users/uid-1/clients/data', {
+        clientes: [{
+          id: 'c1', nome: 'Ana', pendente: 50,
+          contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+          recebimentos: [],
+        }],
+      });
+      store.set('users/uid-2/clients/data', {
+        clientes: [{
+          id: 'c2', nome: 'Bruno', pendente: 30,
+          contas: [{ id: 'conta-2', saldo: 30, recebido: 0 }],
+          recebimentos: [],
+        }],
       });
 
+      const { tx, commit, committed } = makeStoreBufferedTx(store);
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commit();
+      });
+
+      mockCurrentUid.mockReturnValue('uid-1');
       const r1 = await applyReceiptDual(receiptInput({
-        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-uid-1',
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-uid-isolado',
       }));
       expect(r1.status).toBe('applied');
       expect(r1.billingEntry.clientId).toBe('c1');
 
       mockCurrentUid.mockReturnValue('uid-2');
       const r2 = await applyReceiptDual(receiptInput({
-        clientId: 'c1', valor: 10, receiptOperationId: 'receipt-uid-2',
+        clientId: 'c2', valor: 10, receiptOperationId: 'receipt-uid-isolado',
         dateISO: '2026-09-22', dateLabel: '22/09/2026',
       }));
       expect(r2.status).toBe('applied');
-      expect(r2.billingEntry.clientId).toBe('c1');
+      expect(r2.billingEntry.clientId).toBe('c2');
+
+      const uid1Data = (store.get('users/uid-1/clients/data') as { clientes: Array<{ id: string; pendente: number }> }).clientes;
+      const uid2Data = (store.get('users/uid-2/clients/data') as { clientes: Array<{ id: string; pendente: number }> }).clientes;
+
+      expect(uid1Data.find((c) => c.id === 'c1')!.pendente).toBe(30);
+      expect(uid2Data.find((c) => c.id === 'c2')!.pendente).toBe(20);
+
+      const entUid1 = store.get('users/uid-1/entradas/receipt-uid-isolado') as { clientId: string };
+      const entUid2 = store.get('users/uid-2/entradas/receipt-uid-isolado') as { clientId: string };
+      expect(entUid1.clientId).toBe('c1');
+      expect(entUid2.clientId).toBe('c2');
+
+      const paths = committed.map((e) => refPath(e.ref));
+      expect(paths).toContain('users/uid-1/clients/data');
+      expect(paths).toContain('users/uid-1/entradas/receipt-uid-isolado');
+      expect(paths).toContain('users/uid-2/clients/data');
+      expect(paths).toContain('users/uid-2/entradas/receipt-uid-isolado');
+
+      const uid1Entradas = paths.filter((p) => p.startsWith('users/uid-1/') && p.includes('/entradas/'));
+      const uid2Entradas = paths.filter((p) => p.startsWith('users/uid-2/') && p.includes('/entradas/'));
+      expect(uid1Entradas).toEqual(['users/uid-1/entradas/receipt-uid-isolado']);
+      expect(uid2Entradas).toEqual(['users/uid-2/entradas/receipt-uid-isolado']);
+      expect(uid1Entradas.every((p) => !p.startsWith('users/uid-2/'))).toBe(true);
+      expect(uid2Entradas.every((p) => !p.startsWith('users/uid-1/'))).toBe(true);
     });
   });
 
@@ -1869,6 +1950,382 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       await expect(applyReceiptDual(receiptInput({
         clientId: 'c1', valor: 20, receiptOperationId: 'receipt-billing-fail',
       }))).rejects.toThrow('Firestore billing write denied');
+    });
+  });
+
+  describe('applyReceiptDual — proteção global via entradas/{receiptOperationId}', () => {
+    const anaOnly = () => [{
+      id: 'c1', nome: 'Ana', pendente: 30,
+      contas: [{ id: 'conta-1', saldo: 30, recebido: 0 }],
+      recebimentos: [],
+    }];
+
+    function seedEntry(seed: (path: string, data: unknown) => void, operationId: string, overrides: Record<string, unknown> = {}) {
+      seed(`users/uid-1/entradas/${operationId}`, {
+        receiptOperationId: operationId,
+        source: 'client_receipt',
+        clientId: 'c1',
+        clientName: 'Ana',
+        desc: 'Recebimento de Ana',
+        valor: 20,
+        data: '21/09/2026',
+        dateISO: '2026-09-21',
+        createdAt: 111,
+        updatedAt: 222,
+        ...overrides,
+      });
+    }
+
+    it('mesmo ID, mesmo cliente e mesmo payload retorna already-applied preservando timestamps persistidos', async () => {
+      const { tx, seed } = makeBufferedTx(() => ({ clientes: anaOnly() }), () => {});
+      seedEntry(seed, 'receipt-persist-timestamps');
+
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const { billingEntry, status, clientes } = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-persist-timestamps',
+      }));
+
+      expect(status).toBe('already-applied');
+      expect(billingEntry.createdAt).toBe(111);
+      expect(billingEntry.updatedAt).toBe(222);
+      expect(billingEntry.clientName).toBe('Ana');
+      expect(billingEntry.valor).toBe(20);
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(clientes[0].pendente).toBe(30);
+      expect(clientes[0].contas).toHaveLength(1);
+    });
+
+    it('retry idempotente não cria nova escrita nem sobrescreve a entrada', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 30,
+        contas: [{ id: 'conta-1', saldo: 30, recebido: 10 }],
+        recebimentos: [{
+          receiptOperationId: 'receipt-retry-no-write', valor: 20,
+          dateISO: '2026-09-21', data: '21/09/2026',
+        }],
+      }];
+      let latestSnapshot = existing;
+      const { tx, commitBuffer } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            if (refPath(entry.ref).includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const r = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-retry-no-write',
+      }));
+
+      expect(r.status).toBe('already-applied');
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(latestSnapshot[0].recebimentos).toHaveLength(1);
+      expect(latestSnapshot[0].contas[0].recebido).toBe(10);
+      expect(latestSnapshot[0].pendente).toBe(30);
+    });
+
+    it('mesmo ID aplicado primeiro em Ana e depois em Bruno gera conflito', async () => {
+      const ana = {
+        id: 'c1', nome: 'Ana', pendente: 80,
+        contas: [
+          { id: 'conta-ana-1', saldo: 40, recebido: 0, status: 'open' },
+          { id: 'conta-ana-2', saldo: 40, recebido: 0, status: 'open' },
+        ],
+        recebimentos: [],
+      };
+      const bruno = {
+        id: 'c2', nome: 'Bruno', pendente: 50,
+        contas: [{ id: 'conta-bru-1', saldo: 50, recebido: 0, status: 'open' }],
+        recebimentos: [],
+      };
+      let latestSnapshot = [ana, bruno];
+      const { tx, commitBuffer, entradas } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            if (refPath(entry.ref).includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof latestSnapshot }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const r1 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 40, receiptOperationId: 'receipt-ana-bruno',
+      }));
+      expect(r1.status).toBe('applied');
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c2', valor: 30, receiptOperationId: 'receipt-ana-bruno',
+      }))).rejects.toThrow('Conflito de receiptOperationId');
+
+      expect(tx.set).toHaveBeenCalledTimes(2);
+      const persisted = entradas.get('users/uid-1/entradas/receipt-ana-bruno') as { clientId: string; clientName: string };
+      expect(persisted.clientId).toBe('c1');
+      expect(persisted.clientName).toBe('Ana');
+
+      const after = latestSnapshot;
+      expect(after.find((c) => c.id === 'c1')!.pendente).toBe(40);
+      expect(after.find((c) => c.id === 'c1')!.recebimentos).toHaveLength(1);
+      expect(after.find((c) => c.id === 'c2')!.pendente).toBe(50);
+      expect(after.find((c) => c.id === 'c2')!.recebimentos).toHaveLength(0);
+    });
+
+    it('conflito entre clientes não altera saldo nem recebimentos da entrada persistida', async () => {
+      const ana = {
+        id: 'c1', nome: 'Ana', pendente: 40,
+        contas: [{ id: 'conta-ana-1', saldo: 40, recebido: 0 }],
+        recebimentos: [{
+          receiptOperationId: 'receipt-cross-client', valor: 40,
+          dateISO: '2026-09-21', data: '21/09/2026',
+        }],
+      };
+      const bruno = {
+        id: 'c2', nome: 'Bruno', pendente: 50,
+        contas: [{ id: 'conta-bru-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      };
+      const { tx, seed, entradas } = makeBufferedTx(() => ({ clientes: [ana, bruno] }), () => {});
+      seedEntry(seed, 'receipt-cross-client', { clientId: 'c1', clientName: 'Ana', valor: 40 });
+
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c2', valor: 10, receiptOperationId: 'receipt-cross-client',
+      }))).rejects.toThrow('Conflito de receiptOperationId');
+
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(bruno.recebimentos).toHaveLength(0);
+      expect(bruno.pendente).toBe(50);
+      expect(ana.recebimentos).toHaveLength(1);
+      const persisted = entradas.get('users/uid-1/entradas/receipt-cross-client') as { clientId: string };
+      expect(persisted.clientId).toBe('c1');
+    });
+
+    it('mesmo ID com valor diferente gera conflito', async () => {
+      const { tx, seed } = makeBufferedTx(() => ({ clientes: anaOnly() }), () => {});
+      seedEntry(seed, 'receipt-valor-diff', { valor: 20 });
+
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 25, receiptOperationId: 'receipt-valor-diff',
+      }))).rejects.toThrow('Conflito de receiptOperationId');
+      expect(tx.set).not.toHaveBeenCalled();
+    });
+
+    it('mesmo ID com data diferente gera conflito', async () => {
+      const { tx, seed } = makeBufferedTx(() => ({ clientes: anaOnly() }), () => {});
+      seedEntry(seed, 'receipt-data-diff', { dateISO: '2026-09-21', data: '21/09/2026' });
+
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, dateISO: '2026-09-22', dateLabel: '22/09/2026',
+        receiptOperationId: 'receipt-data-diff',
+      }))).rejects.toThrow('Conflito de receiptOperationId');
+      expect(tx.set).not.toHaveBeenCalled();
+    });
+
+    it('IDs diferentes continuam permitindo recebimentos legítimos no mesmo cliente', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana', pendente: 50,
+        contas: [{ id: 'conta-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      }];
+      let latestSnapshot = existing;
+      const { tx, commitBuffer, entradas } = makeBufferedTx(
+        () => ({ clientes: latestSnapshot }),
+        (entries) => {
+          for (const entry of entries) {
+            if (refPath(entry.ref).includes('/clients/')) {
+              latestSnapshot = (entry.data as { clientes: typeof existing }).clientes;
+            }
+          }
+        },
+      );
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+        commitBuffer();
+      });
+
+      const r1 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-multi-a',
+      }));
+      const r2 = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 10, receiptOperationId: 'receipt-multi-b',
+        dateISO: '2026-09-22', dateLabel: '22/09/2026',
+      }));
+
+      expect(r1.status).toBe('applied');
+      expect(r2.status).toBe('applied');
+      expect(r2.clientes[0].recebimentos).toHaveLength(2);
+      expect(r2.clientes[0].pendente).toBe(20);
+      expect(entradas.get('users/uid-1/entradas/receipt-multi-a')).toBeDefined();
+      expect(entradas.get('users/uid-1/entradas/receipt-multi-b')).toBeDefined();
+    });
+
+    it('histórico recebimentos registrado em outro cliente (legado) bloqueia reaplicação', async () => {
+      const anaLegacy = {
+        nome: 'Ana', pendente: 30,
+        contas: [{ id: 'conta-ana-1', saldo: 30, recebido: 0 }],
+        recebimentos: [{
+          receiptOperationId: 'receipt-legacy-owner', valor: 20,
+          dateISO: '2026-09-21', data: '21/09/2026',
+        }],
+      };
+      const bruno = {
+        id: 'c2', nome: 'Bruno', pendente: 50,
+        contas: [{ id: 'conta-bru-1', saldo: 50, recebido: 0 }],
+        recebimentos: [],
+      };
+      const { tx } = makeBufferedTx(() => ({ clientes: [anaLegacy, bruno] }), () => {});
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(applyReceiptDual(receiptInput({
+        clientId: 'c2', valor: 10, receiptOperationId: 'receipt-legacy-owner',
+      }))).rejects.toThrow('Conflito de receiptOperationId');
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(bruno.recebimentos).toHaveLength(0);
+      expect(bruno.pendente).toBe(50);
+    });
+  });
+
+  describe('applyRoutePendingsDual — fallback legado por nome', () => {
+    it('cliente moderno existente + item sem clientId é rejeitado', async () => {
+      const existing = [
+        { id: 'c1', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(
+        applyRoutePendingsDual(
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' }],
+          'r1',
+        ),
+      ).rejects.toThrow('não possui clientId');
+      expect(tx.set).not.toHaveBeenCalled();
+    });
+
+    it('cliente moderno com clientId correto é atualizado', async () => {
+      const existing = [
+        { id: 'c1', nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await applyRoutePendingsDual(
+        [{ serviceId: 'svc-aaa', clientId: 'c1', nome: 'Ana', valor: 50, desc: 'Rota' }],
+        'r1',
+      );
+
+      const ana = result.find((c) => c.id === 'c1');
+      expect(ana!.contas).toHaveLength(1);
+      expect(ana!.pendente).toBe(50);
+      expect(result).toHaveLength(1);
+    });
+
+    it('exatamente um cliente legado sem ID pode usar o fallback pelo nome', async () => {
+      const existing = [
+        { nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await applyRoutePendingsDual(
+        [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' }],
+        'r1',
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].contas).toHaveLength(1);
+      expect(result[0].pendente).toBe(50);
+    });
+
+    it('dois clientes legados com o mesmo nome geram conflito', async () => {
+      const existing = [
+        { nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
+        { nome: 'Ana', pendente: 0, contas: [], recebimentos: [] },
+      ];
+      const tx = makeTx({
+        get: vi.fn().mockResolvedValue({
+          exists: () => true,
+          data: () => ({ clientes: existing }),
+        }),
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      await expect(
+        applyRoutePendingsDual(
+          [{ serviceId: 'svc-aaa', nome: 'Ana', valor: 50, desc: 'Rota' }],
+          'r1',
+        ),
+      ).rejects.toThrow('Conflito');
+      expect(tx.set).not.toHaveBeenCalled();
+    });
+
+    it('cliente realmente novo continua funcionando conforme o comportamento atual', async () => {
+      const tx = makeTx();
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      const result = await applyRoutePendingsDual(
+        [{ serviceId: 'svc-aaa', nome: 'Novo Cliente', valor: 50, desc: 'Rota' }],
+        'r1',
+      );
+
+      expect(result).toHaveLength(1);
+      expect(result[0].nome).toBe('Novo Cliente');
+      expect(typeof result[0].id).toBe('string');
+      expect(result[0].contas).toHaveLength(1);
+      expect(result[0].pendente).toBe(50);
     });
   });
 });
