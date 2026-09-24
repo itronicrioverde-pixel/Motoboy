@@ -31,6 +31,10 @@ import {
   installMotoBridge,
   loadMotoIntoPanel,
 } from './features/moto/presentation/panel-bridge';
+import {
+  installJornadaBridge,
+  loadJornadaIntoPanel,
+} from './features/jornada/presentation/panel-bridge';
 import { bootstrapPanel } from './legacy/panel.js';
 import type { AuthUser } from './features/auth/domain/auth-user';
 import { createPanelHydration } from './shared/application/panel-hydration';
@@ -99,6 +103,7 @@ installPaymentsBridge();
 installIncomeBridge();
 installReceivablesBridge();
 installMotoBridge();
+installJornadaBridge();
 
 // Etapa 1B: o painel só inicializa dentro de uma entrada autenticada única.
 // O login NÃO é montado antes do primeiro estado da autenticação — assim quem
@@ -172,6 +177,7 @@ function enterAuthenticatedApp(user: AuthUser): void {
   void loadManutencoesIntoPanel();
   void loadFaturamentoIntoPanel();
   void loadRotasIntoPanel();
+  void loadJornadaIntoPanel();
 
   // Clientes e moto: hidratação independente e concorrente.
   // Cada um inicia imediatamente — não bloqueiam um ao outro.

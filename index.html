@@ -431,6 +431,17 @@
   }
   .sync-badge.pending{ color:var(--orange); background:var(--orange-dim); border:1px solid rgba(255,122,26,.35); }
   .sync-badge.failure{ color:var(--red); background:rgba(255,107,118,.13); border:1px solid rgba(255,107,118,.4); }
+  .drawer-hidden{ display:none !important; }
+  .view-hidden{ display:none !important; }
+  .jornada-title{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .jornada-title .label{ font-size:11px; letter-spacing:.05em; font-weight:700; color:var(--muted); text-transform:uppercase; }
+  .jornada-rows{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-top:12px; }
+  .jornada-row{ display:flex; flex-direction:column; gap:2px; }
+  .jornada-row .k{ font-size:11px; color:var(--muted); font-weight:600; }
+  .jornada-row .v{ font-size:15px; font-weight:700; }
+  .jornada-cost{ font-size:12px; color:var(--muted); margin-top:12px; }
+  .jornada-actions{ display:flex; gap:8px; margin-top:14px; }
+  .jornada-actions .btn-primary, .jornada-actions .btn-secondary{ margin-top:0; flex:1; text-align:center; }
   .edit-reason-field{ border-top:1px dashed var(--line); padding-top:12px; }
   .record-actions{ display:flex; align-items:center; justify-content:flex-end; gap:5px; }
   .record-action-btn{
@@ -1361,13 +1372,13 @@
         </button>
       </li>
       <li>
-        <button type="button" class="drawer-item" data-view="rotas">
+        <button type="button" class="drawer-item drawer-hidden" data-view="rotas">
           <svg class="icon" viewBox="0 0 24 24"><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="5" r="2.2"/><path d="M6 16.8V13a4 4 0 0 1 4-4h4a4 4 0 0 0 4-4"/></svg>
           <span class="label">Rotas</span>
         </button>
       </li>
       <li>
-        <button type="button" class="drawer-item" data-view="historico-rotas">
+        <button type="button" class="drawer-item drawer-hidden" data-view="historico-rotas">
           <svg class="icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
           <span class="label">Histórico de rotas</span>
         </button>
@@ -1424,9 +1435,14 @@
     </div>
 
     <section>
+      <div class="section-head"><h2>JORNADA</h2></div>
+      <div class="list-card" id="jornadaCard"></div>
+    </section>
+
+    <section>
       <div class="section-head"><h2>ACESSOS RÁPIDOS</h2></div>
       <div class="quick-actions" aria-label="Ações principais">
-        <button type="button" class="quick-action" id="dashboardRouteShortcut">
+        <button type="button" class="quick-action drawer-hidden" id="dashboardRouteShortcut">
           <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="19" r="2.2"/><circle cx="18" cy="5" r="2.2"/><path d="M6 16.8V13a4 4 0 0 1 4-4h4a4 4 0 0 0 4-4"/></svg>
           Nova rota
         </button>
@@ -1757,8 +1773,8 @@
 
   </main>
 
-  <!-- ===== VIEW: ROTAS ===== -->
-  <main class="view" id="view-rotas">
+  <!-- ===== VIEW: ROTAS (oculta no beta; fluxo preservado para o futuro) ===== -->
+  <main class="view view-hidden" id="view-rotas">
 
     <div class="info-banner">
       <svg class="icon" viewBox="0 0 24 24"><path d="M12 9v4"/><path d="M12 17h.01"/><circle cx="12" cy="12" r="9"/></svg>
@@ -1842,7 +1858,7 @@
   </main>
 
   <!-- ===== VIEW: HISTÓRICO DE ROTAS ===== -->
-  <main class="view" id="view-historico-rotas">
+  <main class="view view-hidden" id="view-historico-rotas">
     <div class="info-banner">
       <svg class="icon" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
       <div>

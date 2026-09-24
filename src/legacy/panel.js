@@ -188,6 +188,7 @@ export function bootstrapPanel() {
       .replace(/'/g, '&#039;');
   }
   let refuels = Array.isArray(localState.refuels) ? localState.refuels : [];
+  let jornadas = Array.isArray(localState.jornadas) ? localState.jornadas : [];
 
   const fuelIcon = `<svg class="icon" viewBox="0 0 24 24"><path d="M4 21V6a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v15"/><path d="M4 11h8"/><path d="M14 8h2.5L19 11v6a1.5 1.5 0 0 1-3 0v-2a1 1 0 0 0-1-1h-1"/><path d="M2 21h14"/></svg>`;
   const wrenchIcon = `<svg class="icon" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.7 2.7-2-2Z"/></svg>`;
@@ -321,6 +322,7 @@ export function bootstrapPanel() {
         entradas,
         confirmedRoutes,
         clientes,
+        jornadas,
         motoKm,
         consumoManualDefinido,
         manualConsumption: consumoManualDefinido ? CONSUMO_ATUAL : null
@@ -1089,7 +1091,7 @@ export function bootstrapPanel() {
       setView(btn.dataset.view);
     });
   });
-  document.getElementById('dashboardRouteShortcut').addEventListener('click', () => setView('rotas'));
+  document.getElementById('dashboardRouteShortcut').addEventListener('click', () => setView('dashboard'));
   document.getElementById('dashboardFuelShortcut').addEventListener('click', () => setView('abastecimentos'));
 
   // No celular, recolhe o painel de confirmação enquanto o teclado ocupa a tela.
@@ -4133,7 +4135,215 @@ export function bootstrapPanel() {
     return value < 0 ? '- ' + fmtBRL(Math.abs(value)) : fmtBRL(value);
   }
 
+  // ---------- jornada: início/fim pelo hodômetro (beta) ----------
+  // O custo estimado é SÓ uma estimativa: nunca vira despesa nem entrada.
+  let jornadaWriteBusy = false;
+
+  function nowHHMM(){
+    const d = new Date();
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function jornadaEntityToVM(e){
+    return {
+      fsId: e.id,
+      status: e.status,
+      kmInicial: Number(e.kmInicial) || 0,
+      dataInicioISO: e.dataInicioISO || '',
+      horaInicioISO: e.horaInicioISO || '',
+      kmFinal: e.kmFinal === null || e.kmFinal === undefined ? null : Number(e.kmFinal),
+      dataFimISO: e.dataFimISO || null,
+      horaFimISO: e.horaFimISO || null,
+      consumoReferencia: e.consumoReferencia === null || e.consumoReferencia === undefined ? null : Number(e.consumoReferencia),
+      precoReferencia: e.precoReferencia === null || e.precoReferencia === undefined ? null : Number(e.precoReferencia),
+      custoEstimado: e.custoEstimado === null || e.custoEstimado === undefined ? null : Number(e.custoEstimado)
+    };
+  }
+
+  // Ponte: recebe as jornadas do Firestore e preserva as pendências locais (sem fsId).
+  window.__applyRemoteJornada = function(entities){
+    if(!Array.isArray(entities)) return;
+    const remoteVMs = entities.map(jornadaEntityToVM);
+    jornadas = mergeRemoteWithPending(remoteVMs, jornadas);
+    saveLocalState();
+    renderJornadaCard();
+    renderDashboard();
+  };
+
+  function jornadaOpenRecord(){
+    return jornadas.find(function(j){ return j.status === 'open'; }) || null;
+  }
+
+  function jornadaUltimaFechada(){
+    return jornadas.find(function(j){ return j.status === 'closed'; }) || null;
+  }
+
+  function renderJornadaCard(){
+    const card = document.getElementById('jornadaCard');
+    if(!card) return;
+    const open = jornadaOpenRecord();
+    const last = jornadaUltimaFechada();
+    if(open){
+      const percorrido = (typeof motoKm === 'number' && motoKm >= open.kmInicial)
+        ? fmtKm(motoKm - open.kmInicial) : '—';
+      card.innerHTML =
+        '<div class="jornada-title"><span class="label">Jornada em andamento</span>' + syncBadgeHTML(open) + '</div>' +
+        '<div class="jornada-rows">' +
+          '<div class="jornada-row"><span class="k">KM INICIAL</span><span class="v">' + fmtKm(open.kmInicial) + '</span></div>' +
+          '<div class="jornada-row"><span class="k">KM ATUAL</span><span class="v">' + fmtKm(motoKm) + '</span></div>' +
+          '<div class="jornada-row"><span class="k">PERCORRIDO</span><span class="v">' + percorrido + '</span></div>' +
+        '</div>' +
+        (open.horaInicioISO || open.dataInicioISO
+          ? '<div class="jornada-cost">Início às ' + safeText(open.horaInicioISO || '') + (open.dataInicioISO && open.dataInicioISO !== localTodayISO() ? ' · ' + safeText(open.dataInicioISO) : '') + '</div>'
+          : '') +
+        '<div class="jornada-actions">' +
+          '<button type="button" class="btn-primary" id="jornadaCloseBtn">Encerrar jornada</button>' +
+        '</div>';
+      const closeBtn = document.getElementById('jornadaCloseBtn');
+      if(closeBtn) closeBtn.addEventListener('click', closeJornadaFromCard);
+      return;
+    }
+    if(last){
+      const percurso = (last.kmFinal !== null && last.kmFinal >= last.kmInicial)
+        ? fmtKm(last.kmFinal - last.kmInicial) : '—';
+      const referencias = [last.consumoReferencia && last.consumoReferencia > 0 ? last.consumoReferencia + ' km/L' : null, last.precoReferencia && last.precoReferencia > 0 ? fmtBRL(last.precoReferencia) + '/L' : null].filter(Boolean).join(' · ');
+      card.innerHTML =
+        '<div class="jornada-title"><span class="label">Jornada encerrada</span>' + syncBadgeHTML(last) + '</div>' +
+        '<div class="jornada-rows">' +
+          '<div class="jornada-row"><span class="k">PERCURSO</span><span class="v">' + percurso + '</span></div>' +
+          '<div class="jornada-row"><span class="k">CUSTO ESTIMADO</span><span class="v">' + (last.custoEstimado !== null && last.custoEstimado !== undefined ? fmtBRL(last.custoEstimado) : '—') + '</span></div>' +
+        '</div>' +
+        '<div class="jornada-cost">Estimativa, não vira despesa.' + (referencias ? ' Referência: ' + referencias + '.' : '') + '</div>' +
+        '<div class="jornada-actions">' +
+          '<button type="button" class="btn-primary" id="jornadaStartBtn">Iniciar nova jornada</button>' +
+        '</div>';
+      const startBtn = document.getElementById('jornadaStartBtn');
+      if(startBtn) startBtn.addEventListener('click', startJornadaFromCard);
+      return;
+    }
+    card.innerHTML =
+      '<div class="jornada-title"><span class="label">Nenhuma jornada registrada</span></div>' +
+      '<div class="jornada-actions">' +
+        '<button type="button" class="btn-primary" id="jornadaStartBtn">Iniciar jornada</button>' +
+      '</div>';
+    const startBtn = document.getElementById('jornadaStartBtn');
+    if(startBtn) startBtn.addEventListener('click', startJornadaFromCard);
+  }
+
+  function startJornadaFromCard(){
+    if(jornadaWriteBusy){
+      showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
+      return;
+    }
+    const record = {
+      fsId: null,
+      status: 'open',
+      kmInicial: Number.isFinite(motoKm) ? motoKm : 0,
+      dataInicioISO: localTodayISO(),
+      horaInicioISO: nowHHMM(),
+      kmFinal: null,
+      dataFimISO: null,
+      horaFimISO: null,
+      consumoReferencia: null,
+      precoReferencia: null,
+      custoEstimado: null,
+      syncState: 'pending'
+    };
+    jornadas.unshift(record);
+    saveLocalState();
+    renderJornadaCard();
+    renderDashboard();
+    jornadaWriteBusy = true;
+    const uidAtWrite = currentUid();
+    settleLocalAdd(record, function(r){
+      return window.__motoboyJornada ? window.__motoboyJornada.start(r) : undefined;
+    }, {
+      isPresent: (r) => jornadas.indexOf(r) !== -1,
+      isSameOwner: () => uidAtWrite === currentUid(),
+      onPersistenceConfirmed(r, id){
+        r.fsId = id;
+        r.syncState = 'saved';
+        saveLocalState();
+        renderJornadaCard();
+        renderDashboard();
+        showToast('Jornada iniciada pelo hodômetro.', {kind:'success'});
+      },
+      onPersistenceFailed(r){
+        r.syncState = 'failed';
+        saveLocalState();
+        renderJornadaCard();
+        renderDashboard();
+        showToast('Não foi possível iniciar a jornada no servidor. Ela ficou marcada como "Não salva".', {kind:'error'});
+      },
+      onOrphanRemoval(remoteId){
+        if(window.__motoboyJornada) window.__motoboyJornada.close(remoteId, {}).catch(function(){});
+      },
+      onSettled(){ jornadaWriteBusy = false; }
+    });
+  }
+
+  function closeJornadaFromCard(){
+    if(jornadaWriteBusy){
+      showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
+      return;
+    }
+    const record = jornadaOpenRecord();
+    if(!record){
+      showToast('Nenhuma jornada em andamento.', {kind:'warning'});
+      return;
+    }
+    if(!record.fsId){
+      showToast('A jornada ainda não foi sincronizada. Aguarde a confirmação e tente encerrar de novo.', {kind:'warning'});
+      return;
+    }
+    if(typeof motoKm !== 'number' || motoKm < record.kmInicial){
+      showToast('O km atual está menor que o km inicial da jornada.', {kind:'warning'});
+      return;
+    }
+    const kmFinal = Math.round(motoKm);
+    const dataFimISO = localTodayISO();
+    const horaFimISO = nowHHMM();
+    const consumoReferencia = CONSUMO_ATUAL > 0 ? CONSUMO_ATUAL : null;
+    const origemConsumo = consumoManualDefinido ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null);
+    const precoReferencia = PRECO_ATUAL > 0 ? PRECO_ATUAL : null;
+    const origemPreco = precoReferencia ? 'abastecimento' : null;
+    const uidAtWrite = currentUid();
+    jornadaWriteBusy = true;
+    window.__motoboyJornada.close(record.fsId, {
+      kmFinal: kmFinal,
+      dataFimISO: dataFimISO,
+      horaFimISO: horaFimISO,
+      consumoReferencia: consumoReferencia,
+      origemConsumo: origemConsumo,
+      precoReferencia: precoReferencia,
+      origemPreco: origemPreco
+    }).then(function(){
+      if(uidAtWrite !== currentUid()) return;
+      record.status = 'closed';
+      record.kmFinal = kmFinal;
+      record.dataFimISO = dataFimISO;
+      record.horaFimISO = horaFimISO;
+      record.consumoReferencia = consumoReferencia;
+      record.origemConsumo = origemConsumo;
+      record.precoReferencia = precoReferencia;
+      record.origemPreco = origemPreco;
+      record.custoEstimado = (consumoReferencia && precoReferencia)
+        ? Math.round(((kmFinal - record.kmInicial) / consumoReferencia * precoReferencia) * 100) / 100
+        : null;
+      record.syncState = 'saved';
+      saveLocalState();
+      renderJornadaCard();
+      renderDashboard();
+      showToast(record.custoEstimado !== null
+        ? 'Jornada encerrada. Custo estimado de ' + fmtBRL(record.custoEstimado) + '.'
+        : 'Jornada encerrada.', {kind:'success'});
+    }).catch(function(){
+      showToast('Não foi possível encerrar a jornada no servidor. Tente de novo.', {kind:'error'});
+    }).finally(function(){ jornadaWriteBusy = false; });
+  }
+
   function renderDashboard(){
+    renderJornadaCard();
     const monthKey = selectedMonthKey();
     const monthEntries = monthItems(entradas, monthKey);
     const monthRefuels = monthItems(refuels, monthKey);
@@ -4329,9 +4539,9 @@ export function bootstrapPanel() {
     // Inicia rota ativa
     window.__motoboyActiveRoute.start(waypoints);
 
-    // Mostra overlay
+    // Mostra overlay (o fluxo de rotas segue no overlay, independente da view).
     overlay.hidden = false;
-    setView('rotas'); // mantém na view de rotas
+    setView('dashboard');
 
     // Inicializa mapa Leaflet no overlay — defer para garantir layout computado
     function initActiveRouteMap(){
