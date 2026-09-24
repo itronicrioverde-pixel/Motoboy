@@ -180,20 +180,27 @@ interface ReceiptPayloadToCompare {
 /**
  * Compara o payload imutável de uma entrada já persistida com a submissão atual.
  * createdAt/updatedAt NÃO fazem parte do conteúdo da submissão.
+ *
+ * `compareClientName` é true apenas quando a submissão preservou um clientName
+ * (envios do painel atual). Envio antigo sem clientName deriva o nome do
+ * cadastro atual — que pode ter sido renomeado — e portanto clientName/desc
+ * NÃO são comparados: a validação fica restrita a cliente (clientId), valor,
+ * data e origem, prevalece o nome/desc da entrada persistida.
  */
 function assertSameReceiptPayload(
   persisted: ReceiptPayloadToCompare,
   incoming: ReceiptPayloadToCompare,
+  compareClientName: boolean,
 ): void {
   const differs =
     persisted.receiptOperationId !== incoming.receiptOperationId ||
     persisted.source !== incoming.source ||
     String(persisted.clientId ?? '') !== String(incoming.clientId ?? '') ||
-    persisted.clientName !== incoming.clientName ||
+    (compareClientName && persisted.clientName !== incoming.clientName) ||
     Number(persisted.valor) !== Number(incoming.valor) ||
     persisted.data !== incoming.data ||
     persisted.dateISO !== incoming.dateISO ||
-    (persisted.desc !== undefined && persisted.desc !== incoming.desc);
+    (compareClientName && persisted.desc !== undefined && persisted.desc !== incoming.desc);
   if (!differs) return;
   throw new Error(
     `Conflito de receiptOperationId "${incoming.receiptOperationId}": ` +
@@ -664,10 +671,14 @@ export async function applyRoutePendingsDual(
  * A proteção global e autoritativa da operação é o documento
  * users/{uid}/entradas/{receiptOperationId}, lido dentro da mesma
  * runTransaction antes de qualquer escrita. Se ele já existir, o payload
- * imutável completo é comparado (cliente, valor, data, origem, desc);
- * createdAt/updatedAt não fazem parte da submissão. O histórico
- * recebimentos[] de TODOS os clientes também é verificado para impedir
- * reaplicação em dados legados que não possuem a entrada financeira.
+ * imutável é comparado (cliente, valor, data, origem e — quando a submissão
+ * preservou um clientName — nome/desc); createdAt/updatedAt não fazem parte
+ * da submissão. Envios antigos sem clientName não comparam nome/desc (o nome
+ * derivaria do cadastro atual, possivelmente renomeado): valida-se cliente,
+ * valor, data e origem, e o nome e os timestamps da entrada persistida
+ * prevalecem. O histórico recebimentos[] de TODOS os clientes também é
+ * verificado para impedir reaplicação em dados legados que não possuem a
+ * entrada financeira.
  *
  * Pré-condições:
  * - receiptOperationId é não vazio.
@@ -757,7 +768,7 @@ export async function applyReceiptDual(
     // Proteção global autoritativa: a entrada já existente impede reaplicação.
     if (entradasSnap.exists()) {
       const persisted = entradasSnap.data() as ReceiptPayloadToCompare;
-      assertSameReceiptPayload(persisted, incomingPayload);
+      assertSameReceiptPayload(persisted, incomingPayload, Boolean(input.clientName?.trim()));
       resultClientes = existing;
       resultBillingEntry = {
         receiptOperationId: persisted.receiptOperationId ?? receiptOperationId,

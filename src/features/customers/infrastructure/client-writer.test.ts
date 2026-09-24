@@ -1526,6 +1526,44 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
       expect(r2.clientes[0].recebimentos).toHaveLength(1);
     });
 
+    it('tentativa antiga sem clientName: entrada existente com nome diferente do cadastro retorna already-applied sem comparar nome/desc', async () => {
+      const existing = [{
+        id: 'c1', nome: 'Ana Maria', pendente: 30,
+        contas: [{ id: 'conta-1', saldo: 30, recebido: 0 }],
+        recebimentos: [{ receiptOperationId: 'receipt-legacy-1', valor: 20 }],
+      }];
+      const { tx, seed } = makeBufferedTx(() => ({ clientes: existing }), () => {});
+      seed('users/uid-1/entradas/receipt-legacy-1', {
+        receiptOperationId: 'receipt-legacy-1',
+        source: 'client_receipt',
+        clientId: 'c1',
+        clientName: 'Ana',
+        desc: 'Recebimento de Ana',
+        valor: 20,
+        data: '21/09/2026',
+        dateISO: '2026-09-21',
+        createdAt: 111,
+        updatedAt: 222,
+      });
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        await fn(tx);
+      });
+
+      // Envio sem clientName (tentativa antiga): valida cliente/valor/data/origem.
+      const result = await applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-legacy-1',
+      }));
+
+      expect(result.status).toBe('already-applied');
+      // Nome e timestamps da entrada persistida prevalecem, sem nova escrita.
+      expect(result.billingEntry.clientName).toBe('Ana');
+      expect(result.billingEntry.createdAt).toBe(111);
+      expect(result.billingEntry.updatedAt).toBe(222);
+      expect(tx.set).not.toHaveBeenCalled();
+      expect(result.clientes[0].nome).toBe('Ana Maria');
+      expect(result.clientes[0].pendente).toBe(30);
+    });
+
     it('duas operações legítimas com IDs diferentes acumulam recebimentos', async () => {
       const existing = [{
         id: 'c1', nome: 'Ana', pendente: 50,

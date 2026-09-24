@@ -373,4 +373,52 @@ describe('receipt retry preserva o payload original', () => {
     expect(result.billingEntry.desc).toBe('Recebimento de Ana Maria');
     expect(result.clientes[0].pendente).toBe(30);
   });
+
+  it('resposta perdida + tentativa antiga (sem clientName) + renomeação: retry valida cliente/valor/data/origem e devolve a entrada persistida', async () => {
+    const versioned = createVersionedStore();
+    seedClients(versioned, makeClient('Ana'));
+    installRunTransaction(versioned, { commitThenThrow: (i) => i === 1 });
+    const { manager } = makeHarness(makeFakeStorage());
+
+    const entradaRef = 'users/uid-1/entradas/receipt-rename-1';
+
+    // Tentativa gravada por uma versão antiga do painel: SEM clientName.
+    const legacyDraft: ReceiptDraft = {
+      clientId: 'c1',
+      valor: 20,
+      dateISO: '2026-09-21',
+      dateLabel: '21/09/2026',
+    };
+
+    // 1ª tentativa: confirmou no Firestore (entrada gravada com o nome vigente
+    // "Ana") e a resposta se perdeu.
+    await expect(manager.submit(legacyDraft)).rejects.toThrow('resposta perdida na rede');
+    const firstEntry = versioned.docs.get(entradaRef)!.data as {
+      clientName: string;
+      createdAt: number;
+      updatedAt: number;
+    };
+    expect(firstEntry.clientName).toBe('Ana');
+
+    // Renomeação do cadastro antes do retry.
+    renameClient(versioned, 'Ana Maria');
+
+    const pending = manager.loadPending();
+    expect(pending).not.toBeNull();
+    expect(pending!.clientName).toBeUndefined();
+
+    const result = await manager.retry();
+    expect(result.status).toBe('already-applied');
+    // Sem clientName, nome/desc não são comparados: valida-se cliente, valor,
+    // data e origem; o NOME e os timestamps da entrada persistida prevalecem.
+    expect(result.billingEntry.clientName).toBe('Ana');
+    expect(result.billingEntry.desc).toBe('Recebimento de Ana');
+    expect(result.billingEntry.createdAt).toBe(firstEntry.createdAt);
+    expect(result.billingEntry.updatedAt).toBe(firstEntry.updatedAt);
+    // Sem nova escrita: entrada única e saldo/histórico inalterados.
+    expect(versioned.docs.get(entradaRef)!.version).toBe(1);
+    expect(result.clientes[0].nome).toBe('Ana Maria');
+    expect(result.clientes[0].pendente).toBe(30);
+    expect(result.clientes[0].recebimentos).toHaveLength(1);
+  });
 });
