@@ -1402,3 +1402,47 @@ A DEC-025 introduziu o `receiptOperationId` e a escrita atômica em `clients/dat
 - `receipt-submission-manager.test.ts` (22 → 23): submissão e retry repassam o `clientName` original ao gateway.
 - `receipt-retry-payload.test.ts` (novo, 6 testes; integração manager + gateway + store reais): resposta perdida (commit + exceção) seguida de renomeação → retry `already-applied` com nome e timestamps originais; recarga do armazenamento local com novo manager; renomeação anterior à submissão; payload financeiro diferente mantém conflito mesmo com `clientName` preservado; tentativa antiga sem `clientName` aplica com fallback para o nome atual; **resposta perdida + tentativa antiga (sem `clientName`) + renomeação** → retry valida cliente/valor/data/origem e devolve a entrada persistida (nome/timestamps), sem nova escrita.
 - Total do projeto: 854 → **864** (41 arquivos).
+
+---
+
+## DEC-027 — Feature Jornada (início/fim pelo hodômetro)
+
+**Status:** Aprovada
+**Data:** 24/09/2026
+
+### Contexto
+
+O beta oculta a navegação de Rotas e ganha um rastreio diário pelo hodômetro. Não existia nenhuma coleção `jornada`; o único dado de quilometragem era `odometer` em abastecimentos e `currentKm` da moto.
+
+### Decisão
+
+- Criar a coleção Firestore `users/{uid}/jornadas` (um documento por jornada), já coberta pela regra vigente `users/{userId}/**` — **sem alteração em `firestore.rules`**.
+- Implementar a feature em Clean Architecture (`src/features/jornada/` com domain/application/infrastructure/presentation + composition root), reutilizando o ciclo salvo/pendente/falhou e a mescla de recarga da Etapa 1 (`settleLocalAdd` / `mergeRemoteWithPending`).
+- Exibir um card no dashboard para iniciar/encerrar a jornada pelo km atual da moto.
+
+### Regras de domínio
+
+- No máximo uma jornada em aberto por usuário (novo início é rejeitado enquanto houver uma em aberto).
+- `kmFinal >= kmInicial`; o fim nunca pode ser anterior ao início (data e hora).
+- Fechamento idempotente: fechar uma jornada já fechada retorna o registro como está, sem escrever nem duplicar.
+- O consumo de referência vem da config da moto (`moto`) ou do histórico de abastecimentos (`historico`); o preço de referência, do último abastecimento (`abastecimento`). Origem `manual` fica disponível para uso futuro.
+- O **custo estimado** é calculado como `distância ÷ consumo × preço` e é **somente estimativa: nunca é gravado em entradas nem despesas**.
+
+### Motivo
+
+Medir percurso e custo diário estimado sem acoplar ao financeiro, evitando lançamento duplicado: o custo estimado não entra no faturamento e a nova subárvore não exige mudança nas regras publicadas (já isolam por UID).
+
+### Consequências
+
+- Nova coleção isolada por dono; o roteiro manual e a CI (Etapa 3) cobrem o fluxo de abertura/fechamento.
+- No mesmo aparelho, uma jornada aberta rejeita um novo início (evita dupla).
+- Multi-dispositivo: a checagem de "1 em aberto" é feita no serviço; dois aparelhos abrindo quase simultaneamente podem gerar jornada dupla — mitigação futura por transação Firestore, não implementada nesta etapa.
+- Sem deploy do servidor; nenhuma nova Cloud Function.
+
+### Testes
+
+- `src/features/jornada/domain/jornada.test.ts` (8 testes): distância e custo estimado (valores inválidos, sem referências, km final menor que o inicial).
+- `src/features/jornada/application/jornada-service.test.ts` (10 testes): abertura com 1 em aberto, km inicial inválido, km final menor que o inicial, fim antes do início (data e hora), custo estimado, idempotência de fechamento, jornada inexistente.
+- `src/features/jornada/infrastructure/firestore-jornada-repository.test.ts` (4 testes): conversão do snapshot (aberta, fechada com referências, status desconhecido, defaults).
+- `src/legacy/jornada-wiring.test.ts` (10 testes): ponte no painel, mescla de pendências, conexão em `main.ts`, ocultação de Rotas, origem do custo.
+- Total do projeto: 896 → **927** (46 → 47 arquivos) ao final da Etapa 2.
