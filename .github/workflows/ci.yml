@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - review/**
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  check-web:
+    name: Web (typecheck + teste + build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Check (typecheck + testes + build)
+        run: npm run check
+
+      - name: Auditoria de dependências de produção
+        run: npm audit --omit=dev
+        continue-on-error: true
+
+  check-functions:
+    name: Functions (typecheck + teste + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: functions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Check functions (typecheck + testes + build)
+        run: npm run check
+
+  emulator-functions:
+    name: Functions no Firestore Emulator (test:emulator)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: functions
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17 (pré-requisito dos emuladores do Firebase)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: functions/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Suíte de integração no emulador
+        working-directory: .
+        run: npx --yes firebase-tools@latest emulators:exec --only firestore --project demo-motoboy "npm --prefix functions run test:emulator"
