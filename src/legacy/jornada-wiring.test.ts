@@ -41,18 +41,32 @@ describe('painel recebe jornadas do Firestore e mescla pendências', () => {
     expect(jornadaSlice).not.toContain('__motoboyEntradas');
   });
 
-  it('a origem do custo vem de moto-config (manual) ou histórico de abastecimentos', () => {
-    expect(panelSource).toContain("const origemConsumo = isManualConsumption ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null)");
-    expect(panelSource).toContain("const origemPreco = precoReferencia ? 'abastecimento' : null");
+  it('a origem do consumo/preço é resolvida por jornada-close-form e gravada no fecho', () => {
+    expect(panelSource).toContain("resolved.origemConsumo,");
+    expect(panelSource).toContain("origemPreco: resolved.origemPreco");
+    expect(panelSource).toContain('import { resolveJornadaCloseReferences }');
+    expect(panelSource).toContain('resolveJornadaCloseReferences({');
   });
 
-  it('informar o hodômetro usa o mesmo formulário e o fechamento é idempotente', () => {
+  it('o retry reenvia a mesma jornada em aberto (sem formulário) e o fechamento exige consumo', () => {
     expect(indexSource).toContain('id="jornadaKmInput"');
     expect(indexSource).toContain('id="jornadaHistoryList"');
+    expect(panelSource).toContain('retryJornadaStart');
+    expect(panelSource).toContain("getElementById('jornadaRetryBtn')");
+    expect(panelSource).toContain("addEventListener('click', retryJornadaStart)");
+    expect(panelSource).toContain("import { jornadaStartPlan }");
+    expect(panelSource).toContain("jornadaStartPlan(jornadaOpenRecord())");
     expect(panelSource).toContain('commitJornadaClose');
     expect(panelSource).toContain("if(!saved){");
     expect(panelSource).toContain('syncMotoToFirestore();');
-    expect(panelSource).toContain('computeEstimatedLiters(record.kmInicial, kmFinal, consumption)');
+  });
+
+  it('o km da moto considera também as leituras das jornadas', () => {
+    expect(panelSource).toContain('...jornadas.map(item => Number(item.kmFinal ?? item.kmInicial) || 0)');
+  });
+
+  it('os campos de combustível são ocultados por regra própria', () => {
+    expect(indexSource).toContain('.jornada-fuel-fields.hidden{ display:none; }');
   });
 });
 

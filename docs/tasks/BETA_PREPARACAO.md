@@ -41,9 +41,9 @@ autenticação real, Firestore real e comportamento multi-dispositivo.
 | 3.3 | Avançar o km da moto (Minha Moto ou via abastecimento) | KM ATUAL da moto sobe; o card da jornada em aberto segue mostrando apenas KM INICIAL e o aviso para informar o hodômetro final |
 | 3.4 | Recarregar a página | A jornada continua em aberto (persistida no Firestore) |
 | 3.5 | "Iniciar jornada" com uma já em aberto | Rejeitado com aviso (uma em aberto por usuário); reenviar a MESMA leitura devolve a jornada existente |
-| 3.6 | "Encerrar jornada" | Modal pede o km final (pré-preenchido), consumo e preço; preview mostra percurso · litros · custo; salvar → toast com o custo estimado |
+| 3.6 | "Encerrar jornada" | Modal pede o km final; o consumo (km/L) é OBRIGATÓRIO — digitado ou o vigente da moto — e o preview mostra percurso · litros · custo; preço fica opcional; salvar → toast com o custo estimado |
 | 3.7 | Conferir Faturamento | NENHUMA despesa/entrada criada com o custo estimado |
-| 3.8 | Offline: iniciar jornada | Badge **Sincronizando**/**Não salvo**; encerrar exige sincronia (aviso) |
+| 3.8 | Offline: iniciar jornada | Badge **Sincronizando**/**Não salvo**; "Tentar salvar novamente" reenvia a MESMA jornada sem abrir formulário; encerrar exige sincronia (aviso) |
 | 3.9 | Última jornada fechada | Card mostra PERCURSO + GASOLINA ESTIMADA + CUSTO ESTIMADO + referências (km/L · R$/L) |
 | 3.10 | Card fechado → "Histórico de jornadas" | Lista mostra as jornadas encerradas (data · percurso · litros); a mais recente marcada como "última" |
 
@@ -68,7 +68,7 @@ roteiro manual acima e NÃO podem ser validadas por `vitest run`:
 | Regras do Firestore no servidor (isolamento por UID) | Manual; testes de repositório mockam `firebase/firestore` |
 | Ciclo salvo/pendente/falhou (módulo puro) | Automática — `pending-local-write.test.ts` (17) |
 | Wiring das pontes no monólito | Automática estática — `pending-sync-wiring.test.ts` (15) |
-| Regras de jornada (1 aberta, km final, idempotência de abertura e fechamento, custo e litros) | Automática — `jornada/**` (25 testes) |
+| Regras de jornada (1 aberta, km final, idempotência de abertura e fechamento, custo e litros) | Automática — `jornada/**` (37 testes) |
 | Jornada no Firestore (persistência real, reload, 2 aparelhos, histórico) | Manual (3.4–3.10); repositório mocka Firestore |
 | Functions no Firestore Emulator | Automática — `functions test:emulator` (gate `FIRESTORE_EMULATOR_HOST`) |
 | Desempenho/UX tátil no celular | Manual — revisar em aparelho real antes do beta |

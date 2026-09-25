@@ -16,6 +16,8 @@ import { createClientDual, updateClientDual, removeClientDual } from '../feature
 import { createRouteConfirmationOrchestrator } from '../features/rotas/application/route-confirmation-orchestrator';
 import { applyRouteFinancialPendings } from '../features/rotas/infrastructure/client-pendings-gateway';
 import { computeEstimatedLiters, computeEstimatedCost } from '../features/jornada/domain/jornada';
+import { jornadaStartPlan } from '../features/jornada/application/jornada-start-plan';
+import { resolveJornadaCloseReferences } from '../features/jornada/application/jornada-close-form';
 
 export function bootstrapPanel() {
   // ---------- estado local do aplicativo ----------
@@ -1135,7 +1137,8 @@ export function bootstrapPanel() {
   function recalculateMotoKmFromRecords(){
     const recordedKm = [
       ...refuels.map(item => Number(item.odometer) || 0),
-      ...maintenances.map(item => Number(item.km) || 0)
+      ...maintenances.map(item => Number(item.km) || 0),
+      ...jornadas.map(item => Number(item.kmFinal ?? item.kmInicial) || 0)
     ];
     motoKm = Math.max(DEFAULT_MOTO_KM, ...recordedKm);
     const el = document.getElementById('motoKmValue');
@@ -4248,7 +4251,7 @@ export function bootstrapPanel() {
       const closeBtn = document.getElementById('jornadaCloseBtn');
       if(closeBtn) closeBtn.addEventListener('click', closeJornadaFromCard);
       const retryBtn = document.getElementById('jornadaRetryBtn');
-      if(retryBtn) retryBtn.addEventListener('click', function(){ startJornadaFromCard(true); });
+      if(retryBtn) retryBtn.addEventListener('click', retryJornadaStart);
       return;
     }
     if(last){
@@ -4374,34 +4377,34 @@ export function bootstrapPanel() {
       showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
       return;
     }
+    // Com uma abertura ainda não confirmada (sem fsId), reenviar a MESMA jornada.
+    const plan = jornadaStartPlan(jornadaOpenRecord());
+    if(plan.action === 'retry'){
+      retryJornadaStart();
+      return;
+    }
     openJornadaForm('start', null);
   }
 
-  function createJornadaFromOdometer(kmInput){
-    if(!Number.isFinite(kmInput) || kmInput < 0){
-      setJornadaFormError('Informe um km válido.');
+  // "Tentar salvar novamente": reenvia a jornada em aberto que ficou "Não salva",
+  // SEM abrir formulário e SEM criar registro novo — o reenvio é idempotente no
+  // servidor (mesmo kmInicial/data/hora devolvem a abertura existente).
+  function retryJornadaStart(){
+    if(jornadaWriteBusy){
+      showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
       return;
     }
-    const record = {
-      fsId: null,
-      status: 'open',
-      kmInicial: Math.round(kmInput),
-      dataInicioISO: localTodayISO(),
-      horaInicioISO: nowHHMM(),
-      kmFinal: null,
-      dataFimISO: null,
-      horaFimISO: null,
-      consumoReferencia: null,
-      precoReferencia: null,
-      custoEstimado: null,
-      syncState: 'pending'
-    };
-    jornadas.unshift(record);
+    const plan = jornadaStartPlan(jornadaOpenRecord());
+    if(plan.action !== 'retry') return;
+    const record = plan.record;
     saveLocalState();
     renderJornadaCard();
-    renderDashboard();
     jornadaWriteBusy = true;
     const uidAtWrite = currentUid();
+    runJournadaStartSettle(record, uidAtWrite);
+  }
+
+  function runJournadaStartSettle(record, uidAtWrite){
     settleLocalAdd(record, function(r){
       return window.__motoboyJornada ? window.__motoboyJornada.start(r) : undefined;
     }, {
@@ -4432,6 +4435,34 @@ export function bootstrapPanel() {
     });
   }
 
+  function createJornadaFromOdometer(kmInput){
+    if(!Number.isFinite(kmInput) || kmInput < 0){
+      setJornadaFormError('Informe um km válido.');
+      return;
+    }
+    const record = {
+      fsId: null,
+      status: 'open',
+      kmInicial: Math.round(kmInput),
+      dataInicioISO: localTodayISO(),
+      horaInicioISO: nowHHMM(),
+      kmFinal: null,
+      dataFimISO: null,
+      horaFimISO: null,
+      consumoReferencia: null,
+      precoReferencia: null,
+      custoEstimado: null,
+      syncState: 'pending'
+    };
+    jornadas.unshift(record);
+    saveLocalState();
+    renderJornadaCard();
+    renderDashboard();
+    jornadaWriteBusy = true;
+    const uidAtWrite = currentUid();
+    runJournadaStartSettle(record, uidAtWrite);
+  }
+
   function closeJornadaFromCard(){
     if(jornadaWriteBusy){
       showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
@@ -4445,8 +4476,9 @@ export function bootstrapPanel() {
     openJornadaForm('close', record);
   }
 
-  // Fechamento: usa o resultado do servidor (saved) como fonte da verdade e registra o km final.
-  function commitJornadaClose(record, kmFinal, consumption, price, isManualConsumption, isManualPrice){
+  // Fechamento: valida o formulário (consumo obrigatório), usa o resultado do
+  // servidor (saved) como fonte da verdade e registra o km final.
+  function commitJornadaClose(record, kmFinal, consumption, price){
     if(jornadaWriteBusy){
       showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
       return;
@@ -4459,27 +4491,29 @@ export function bootstrapPanel() {
       showToast('A jornada ainda não foi sincronizada. Aguarde a confirmação e tente encerrar de novo.', {kind:'warning'});
       return;
     }
-    if(!Number.isFinite(kmFinal) || kmFinal < record.kmInicial){
-      setJornadaFormError('Informe um km final válido para a jornada.');
+    const resolved = resolveJornadaCloseReferences({
+      kmInicial: record.kmInicial,
+      kmFinal: kmFinal,
+      consumptionInput: consumption,
+      priceInput: price
+    }, jornadaFuelDefaults());
+    if(!resolved.ok || !Number.isFinite(resolved.kmFinal)){
+      setJornadaFormError(resolved.error);
       return;
     }
-    const cleanKmFinal = Math.round(kmFinal);
+    const cleanKmFinal = Math.round(resolved.kmFinal);
     const dataFimISO = localTodayISO();
     const horaFimISO = nowHHMM();
-    const consumoReferencia = isManualConsumption ? consumption : (CONSUMO_ATUAL > 0 ? CONSUMO_ATUAL : null);
-    const origemConsumo = isManualConsumption ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null);
-    const precoReferencia = isManualPrice ? price : (PRECO_ATUAL > 0 ? PRECO_ATUAL : null);
-    const origemPreco = precoReferencia ? 'abastecimento' : null;
     const uidAtWrite = currentUid();
     jornadaWriteBusy = true;
     window.__motoboyJornada.close(record.fsId, {
       kmFinal: cleanKmFinal,
       dataFimISO: dataFimISO,
       horaFimISO: horaFimISO,
-      consumoReferencia: consumoReferencia,
-      origemConsumo: origemConsumo,
-      precoReferencia: precoReferencia,
-      origemPreco: origemPreco
+      consumoReferencia: resolved.consumoReferencia,
+      origemConsumo: resolved.origemConsumo,
+      precoReferencia: resolved.precoReferencia,
+      origemPreco: resolved.origemPreco
     }).then(function(saved){
       if(uidAtWrite !== currentUid()) return;
       if(!saved){
@@ -4489,10 +4523,10 @@ export function bootstrapPanel() {
       record.kmFinal = saved.kmFinal !== undefined ? saved.kmFinal : cleanKmFinal;
       record.dataFimISO = saved.dataFimISO || dataFimISO;
       record.horaFimISO = saved.horaFimISO || horaFimISO;
-      record.consumoReferencia = saved.consumoReferencia !== undefined ? saved.consumoReferencia : consumoReferencia;
-      record.origemConsumo = saved.origemConsumo || origemConsumo;
-      record.precoReferencia = saved.precoReferencia !== undefined ? saved.precoReferencia : precoReferencia;
-      record.origemPreco = saved.origemPreco || origemPreco;
+      record.consumoReferencia = saved.consumoReferencia !== undefined ? saved.consumoReferencia : resolved.consumoReferencia;
+      record.origemConsumo = saved.origemConsumo || resolved.origemConsumo;
+      record.precoReferencia = saved.precoReferencia !== undefined ? saved.precoReferencia : resolved.precoReferencia;
+      record.origemPreco = saved.origemPreco || resolved.origemPreco;
       record.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null;
       record.syncState = 'saved';
       registrarKm(record.kmFinal);
@@ -4528,9 +4562,7 @@ export function bootstrapPanel() {
       commitJornadaClose(record,
         jornadaFormNumber(),
         getJornadaFuelValue('jornadaConsumptionInput'),
-        getJornadaFuelValue('jornadaPriceInput'),
-        Boolean(document.getElementById('jornadaConsumptionInput').value),
-        Boolean(document.getElementById('jornadaPriceInput').value)
+        getJornadaFuelValue('jornadaPriceInput')
       );
     }
   }
