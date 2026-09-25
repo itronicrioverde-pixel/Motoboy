@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { computeDistance, computeEstimatedCost } from './jornada';
+import { computeDistance, computeEstimatedCost, computeEstimatedLiters } from './jornada';
 
 describe('computeDistance — km percorridos entre oddômetros', () => {
   it('km final maior que o inicial', () => {
@@ -35,5 +35,20 @@ describe('computeEstimatedCost — custo estimado nunca é despesa', () => {
 
   it('km final menor que o inicial anula o custo', () => {
     expect(computeEstimatedCost(145, 100, 20, 6)).toBeNull();
+  });
+});
+
+describe('litros estimados pela leitura do hodômetro', () => {
+  it('calcula o combustível para uma jornada sem arredondar antes do custo', () => {
+    expect(computeEstimatedLiters(42700, 42825, 25)).toBe(5);
+    expect(computeEstimatedCost(42700, 42825, 25, 6.05)).toBe(30.25);
+  });
+
+  it('sem média válida não inventa consumo, mas conserva a distância', () => {
+    expect(computeDistance(42700, 42825)).toBe(125);
+    expect(computeEstimatedLiters(42700, 42825, null)).toBeNull();
+    expect(computeEstimatedLiters(42700, 42825, 0)).toBeNull();
+    expect(computeEstimatedLiters(42700, 42825, Infinity)).toBeNull();
+    expect(computeEstimatedLiters(42825, 42700, 25)).toBeNull();
   });
 });

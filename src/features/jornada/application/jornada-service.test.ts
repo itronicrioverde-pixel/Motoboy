@@ -51,6 +51,14 @@ describe('JornadaService.start — no máximo uma jornada em aberto', () => {
     expect(repo.add).not.toHaveBeenCalled();
   });
 
+  it('devolve a abertura existente após resposta perdida, sem criar duplicata', async () => {
+    const existing = makeJornada();
+    const repo = fakeRepo({ findOpen: vi.fn(async () => existing) });
+    const result = await new JornadaService(repo).start({ kmInicial: 100, dataInicioISO: '2026-09-24', horaInicioISO: '08:00' });
+    expect(result).toBe(existing);
+    expect(repo.add).not.toHaveBeenCalled();
+  });
+
   it('rejeita km inicial inválido', async () => {
     const service = new JornadaService(fakeRepo());
     await expect(service.start({ kmInicial: -1, dataInicioISO: '2026-09-24', horaInicioISO: '08:00' }))

@@ -84,6 +84,17 @@ export function computeDistance(kmInicial: number, kmFinal: number): number | nu
   return kmFinal - kmInicial;
 }
 
+/** Litros estimados pelo percurso e pelo consumo de referência (km/L). */
+export function computeEstimatedLiters(
+  kmInicial: number,
+  kmFinal: number,
+  consumoReferencia: number | null,
+): number | null {
+  const distance = computeDistance(kmInicial, kmFinal);
+  if (distance === null || consumoReferencia === null || !Number.isFinite(consumoReferencia) || consumoReferencia <= 0) return null;
+  return distance / consumoReferencia;
+}
+
 /**
  * Custo estimado (R$) de uma jornada: distância ÷ consumo (km/L) × preço (R$/L).
  * Null quando falta consumo, preço ou distância válidos. NUNCA é despesa.
@@ -94,11 +105,10 @@ export function computeEstimatedCost(
   consumoReferencia: number | null,
   precoReferencia: number | null,
 ): number | null {
-  const distance = computeDistance(kmInicial, kmFinal);
-  if (distance === null) return null;
-  if (!(consumoReferencia && consumoReferencia > 0)) return null;
-  if (!(precoReferencia && precoReferencia > 0)) return null;
-  const cost = (distance / consumoReferencia) * precoReferencia;
+  const liters = computeEstimatedLiters(kmInicial, kmFinal, consumoReferencia);
+  if (liters === null) return null;
+  if (!(precoReferencia && Number.isFinite(precoReferencia) && precoReferencia > 0)) return null;
+  const cost = liters * precoReferencia;
   return Math.round(cost * 100) / 100;
 }
 

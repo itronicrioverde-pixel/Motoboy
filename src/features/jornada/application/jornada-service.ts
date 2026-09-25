@@ -63,6 +63,10 @@ export class JornadaService {
     validateNew(data);
     const open = await this.repo.findOpen();
     if (open) {
+      // Reenvio após resposta perdida: devolve a abertura já salva.
+      if (open.kmInicial === data.kmInicial && open.dataInicioISO === data.dataInicioISO && open.horaInicioISO === data.horaInicioISO) {
+        return open;
+      }
       throw new JornadaValidationError('Já existe uma jornada em aberto. Feche-a antes de iniciar outra.');
     }
     return this.repo.add({

@@ -1441,8 +1441,16 @@ Medir percurso e custo diário estimado sem acoplar ao financeiro, evitando lan�
 
 ### Testes
 
-- `src/features/jornada/domain/jornada.test.ts` (8 testes): distância e custo estimado (valores inválidos, sem referências, km final menor que o inicial).
-- `src/features/jornada/application/jornada-service.test.ts` (10 testes): abertura com 1 em aberto, km inicial inválido, km final menor que o inicial, fim antes do início (data e hora), custo estimado, idempotência de fechamento, jornada inexistente.
+- `src/features/jornada/domain/jornada.test.ts` (10 testes): distância e custo estimado (valores inválidos, sem referências, km final menor que o inicial) e litros estimados pelo hodômetro.
+- `src/features/jornada/application/jornada-service.test.ts` (11 testes): abertura com 1 em aberto, reenvio idempotente da abertura, km inicial inválido, km final menor que o inicial, fim antes do início (data e hora), custo estimado, idempotência de fechamento, jornada inexistente.
 - `src/features/jornada/infrastructure/firestore-jornada-repository.test.ts` (4 testes): conversão do snapshot (aberta, fechada com referências, status desconhecido, defaults).
-- `src/legacy/jornada-wiring.test.ts` (10 testes): ponte no painel, mescla de pendências, conexão em `main.ts`, ocultação de Rotas, origem do custo.
-- Total do projeto: 896 → **927** (46 → 47 arquivos) ao final da Etapa 2.
+- `src/legacy/jornada-wiring.test.ts` (11 testes): ponte no painel, mescla de pendências, conexão em `main.ts`, ocultação de Rotas, origem do custo, formulário de hodômetro e fechamento idempotente.
+- Total do projeto: 896 → **931** (46 → 47 arquivos) ao final da Etapa 2 e do refinamento do hodômetro.
+
+### Atualização — 25/09/2026: hodômetro informado e histórico
+
+- O hodômetro passa a ser **informado pelo motoboy em formulário modal** na abertura e no encerramento (km final, consumo e preço editáveis); a abertura deixa de usar automaticamente o `currentKm` da moto. A origem manual do consumo registra-se como `moto`.
+- O card de jornada em aberto mostra apenas o KM INICIAL; o card encerrado mostra também a **gasolina estimada** (litros) e o dashboard ganha o **histórico de jornadas encerradas** (`#jornadaHistory`).
+- **Reenvio idempotente da abertura:** se já existir uma jornada em aberto com o mesmo `kmInicial`, `dataInicioISO` e `horaInicioISO`, o `start` devolve a existente em vez de duplicar (resposta perdida no `settleLocalAdd`).
+- `panel-bridge.close` passa a retornar a jornada fechada (`Jornada | null`); o painel usa os dados salvos do servidor como fonte da verdade e registra o km final no `currentKm` da moto (`registrarKm` + `syncMotoToFirestore`).
+- `computeEstimatedLiters` centraliza a estimativa de litros; o custo estimado continua sendo derivado e **nunca** vira despesa (regra inalterada).

@@ -34,7 +34,7 @@ describe('painel recebe jornadas do Firestore e mescla pendências', () => {
   });
 
   it('o custo estimado é derivado e nunca é gravado como despesa/entrada', () => {
-    expect(panelSource).toContain('custoEstimado = (consumoReferencia && precoReferencia)');
+    expect(panelSource).toContain("record.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null");
     // A jornada não salva em entradas: o bloco de jornada não chama __motoboyEntradas.
     const jornadaBlock = panelSource.indexOf('function startJornadaFromCard');
     const jornadaSlice = panelSource.slice(jornadaBlock, panelSource.indexOf('function renderDashboard(){', jornadaBlock));
@@ -42,8 +42,17 @@ describe('painel recebe jornadas do Firestore e mescla pendências', () => {
   });
 
   it('a origem do custo vem de moto-config (manual) ou histórico de abastecimentos', () => {
-    expect(panelSource).toContain("const origemConsumo = consumoManualDefinido ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null)");
+    expect(panelSource).toContain("const origemConsumo = isManualConsumption ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null)");
     expect(panelSource).toContain("const origemPreco = precoReferencia ? 'abastecimento' : null");
+  });
+
+  it('informar o hodômetro usa o mesmo formulário e o fechamento é idempotente', () => {
+    expect(indexSource).toContain('id="jornadaKmInput"');
+    expect(indexSource).toContain('id="jornadaHistoryList"');
+    expect(panelSource).toContain('commitJornadaClose');
+    expect(panelSource).toContain("if(!saved){");
+    expect(panelSource).toContain('syncMotoToFirestore();');
+    expect(panelSource).toContain('computeEstimatedLiters(record.kmInicial, kmFinal, consumption)');
   });
 });
 

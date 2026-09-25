@@ -53,7 +53,7 @@ declare global {
     /** Chamado pelo monólito para abrir/encerrar uma jornada. */
     __motoboyJornada?: {
       start(vm: JornadaVM): Promise<string | null>;
-      close(fsId: string | null | undefined, vm: JornadaVM): Promise<void>;
+      close(fsId: string | null | undefined, vm: JornadaVM): Promise<Jornada | null>;
     };
     /** Definido pelo monólito; recebe as jornadas do Firestore e re-renderiza. */
     __applyRemoteJornada?: (entities: Jornada[]) => void;
@@ -73,8 +73,8 @@ export function installJornadaBridge(): void {
       }
     },
     async close(fsId, vm) {
-      if (!fsId) return;
-      await jornadaService.close(fsId, vmToClose(vm));
+      if (!fsId) return null;
+      return jornadaService.close(fsId, vmToClose(vm));
     },
   };
 }

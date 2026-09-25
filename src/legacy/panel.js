@@ -15,6 +15,7 @@ import { createClientReceiptGateway } from '../features/customers/infrastructure
 import { createClientDual, updateClientDual, removeClientDual } from '../features/customers/infrastructure/client-writer';
 import { createRouteConfirmationOrchestrator } from '../features/rotas/application/route-confirmation-orchestrator';
 import { applyRouteFinancialPendings } from '../features/rotas/infrastructure/client-pendings-gateway';
+import { computeEstimatedLiters, computeEstimatedCost } from '../features/jornada/domain/jornada';
 
 export function bootstrapPanel() {
   // ---------- estado local do aplicativo ----------
@@ -4155,7 +4156,9 @@ export function bootstrapPanel() {
       dataFimISO: e.dataFimISO || null,
       horaFimISO: e.horaFimISO || null,
       consumoReferencia: e.consumoReferencia === null || e.consumoReferencia === undefined ? null : Number(e.consumoReferencia),
+      origemConsumo: e.origemConsumo || null,
       precoReferencia: e.precoReferencia === null || e.precoReferencia === undefined ? null : Number(e.precoReferencia),
+      origemPreco: e.origemPreco || null,
       custoEstimado: e.custoEstimado === null || e.custoEstimado === undefined ? null : Number(e.custoEstimado)
     };
   }
@@ -4165,6 +4168,9 @@ export function bootstrapPanel() {
     if(!Array.isArray(entities)) return;
     const remoteVMs = entities.map(jornadaEntityToVM);
     jornadas = mergeRemoteWithPending(remoteVMs, jornadas);
+    const journeyKm = Math.max(0, ...jornadas.map(j => Number(j.kmFinal ?? j.kmInicial) || 0));
+    registrarKm(journeyKm);
+    syncMotoToFirestore();
     saveLocalState();
     renderJornadaCard();
     renderDashboard();
@@ -4175,42 +4181,87 @@ export function bootstrapPanel() {
   }
 
   function jornadaUltimaFechada(){
-    return jornadas.find(function(j){ return j.status === 'closed'; }) || null;
+    const closed = jornadas.filter(function(j){ return j.status === 'closed'; });
+    if(closed.length === 0) return null;
+    closed.sort(function(a, b){
+      const dataA = (a.dataFimISO || '') + ' ' + (a.horaFimISO || '');
+      const dataB = (b.dataFimISO || '') + ' ' + (b.horaFimISO || '');
+      return dataB.localeCompare(dataA);
+    });
+    return closed[0];
+  }
+
+  function jornadaNewestFirst(){
+    return jornadas.slice().sort(function(a, b){
+      const ka = a.status === 'closed' ? 1 : 0;
+      const kb = b.status === 'closed' ? 1 : 0;
+      if(ka !== kb) return kb - ka;
+      return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
+    });
+  }
+
+  function fmtLiters(liters){
+    if(typeof liters !== 'number' || !Number.isFinite(liters)) return '—';
+    return liters.toFixed(1).replace('.', ',') + ' L';
+  }
+
+  function renderJornadaHistory(){
+    const list = document.getElementById('jornadaHistoryList');
+    if(!list) return;
+    const closed = jornadaNewestFirst().filter(function(j){ return j.status === 'closed'; });
+    if(closed.length === 0){
+      list.innerHTML = '<div class="jornada-history-item">Nenhuma jornada encerrada ainda.</div>';
+      return;
+    }
+    list.innerHTML = closed.map(function(j, index){
+      const percurso = (j.kmFinal !== null && j.kmFinal >= j.kmInicial) ? fmtKm(j.kmFinal - j.kmInicial) : '—';
+      const liters = (j.kmFinal !== null && j.consumoReferencia && j.consumoReferencia > 0)
+        ? computeEstimatedLiters(j.kmInicial, j.kmFinal, j.consumoReferencia) : null;
+      return '<div class="jornada-history-item">' +
+        '<b>' + safeText(dateLabelFromISO(j.dataFimISO || '')) + '</b>' +
+        ' · ' + percurso +
+        (liters !== null ? ' · ' + fmtLiters(liters) : '') +
+        (index === 0 ? ' · <i>última</i>' : '') +
+      '</div>';
+    }).join('');
   }
 
   function renderJornadaCard(){
     const card = document.getElementById('jornadaCard');
     if(!card) return;
+    renderJornadaHistory();
     const open = jornadaOpenRecord();
     const last = jornadaUltimaFechada();
     if(open){
-      const percorrido = (typeof motoKm === 'number' && motoKm >= open.kmInicial)
-        ? fmtKm(motoKm - open.kmInicial) : '—';
       card.innerHTML =
         '<div class="jornada-title"><span class="label">Jornada em andamento</span>' + syncBadgeHTML(open) + '</div>' +
         '<div class="jornada-rows">' +
           '<div class="jornada-row"><span class="k">KM INICIAL</span><span class="v">' + fmtKm(open.kmInicial) + '</span></div>' +
-          '<div class="jornada-row"><span class="k">KM ATUAL</span><span class="v">' + fmtKm(motoKm) + '</span></div>' +
-          '<div class="jornada-row"><span class="k">PERCORRIDO</span><span class="v">' + percorrido + '</span></div>' +
         '</div>' +
         (open.horaInicioISO || open.dataInicioISO
-          ? '<div class="jornada-cost">Início às ' + safeText(open.horaInicioISO || '') + (open.dataInicioISO && open.dataInicioISO !== localTodayISO() ? ' · ' + safeText(open.dataInicioISO) : '') + '</div>'
+          ? '<div class="jornada-cost">Início às ' + safeText(open.horaInicioISO || '') + (open.dataInicioISO && open.dataInicioISO !== localTodayISO() ? ' · ' + safeText(open.dataInicioISO) : '') + '. Ao encerrar, informe o hodômetro final.</div>'
           : '') +
         '<div class="jornada-actions">' +
-          '<button type="button" class="btn-primary" id="jornadaCloseBtn">Encerrar jornada</button>' +
+          '<button type="button" class="btn-primary" id="jornadaCloseBtn">Encerrar</button>' +
+          (open.syncState === 'failed' ? '<button type="button" class="btn-secondary" id="jornadaRetryBtn">Tentar salvar novamente</button>' : '') +
         '</div>';
       const closeBtn = document.getElementById('jornadaCloseBtn');
       if(closeBtn) closeBtn.addEventListener('click', closeJornadaFromCard);
+      const retryBtn = document.getElementById('jornadaRetryBtn');
+      if(retryBtn) retryBtn.addEventListener('click', function(){ startJornadaFromCard(true); });
       return;
     }
     if(last){
       const percurso = (last.kmFinal !== null && last.kmFinal >= last.kmInicial)
         ? fmtKm(last.kmFinal - last.kmInicial) : '—';
+      const liters = (last.kmFinal !== null && last.consumoReferencia && last.consumoReferencia > 0)
+        ? computeEstimatedLiters(last.kmInicial, last.kmFinal, last.consumoReferencia) : null;
       const referencias = [last.consumoReferencia && last.consumoReferencia > 0 ? last.consumoReferencia + ' km/L' : null, last.precoReferencia && last.precoReferencia > 0 ? fmtBRL(last.precoReferencia) + '/L' : null].filter(Boolean).join(' · ');
       card.innerHTML =
         '<div class="jornada-title"><span class="label">Jornada encerrada</span>' + syncBadgeHTML(last) + '</div>' +
         '<div class="jornada-rows">' +
           '<div class="jornada-row"><span class="k">PERCURSO</span><span class="v">' + percurso + '</span></div>' +
+          '<div class="jornada-row"><span class="k">GASOLINA ESTIMADA</span><span class="v">' + (liters !== null ? fmtLiters(liters) : '—') + '</span></div>' +
           '<div class="jornada-row"><span class="k">CUSTO ESTIMADO</span><span class="v">' + (last.custoEstimado !== null && last.custoEstimado !== undefined ? fmtBRL(last.custoEstimado) : '—') + '</span></div>' +
         '</div>' +
         '<div class="jornada-cost">Estimativa, não vira despesa.' + (referencias ? ' Referência: ' + referencias + '.' : '') + '</div>' +
@@ -4230,15 +4281,111 @@ export function bootstrapPanel() {
     if(startBtn) startBtn.addEventListener('click', startJornadaFromCard);
   }
 
+  function clearJornadaFormError(){
+    const message = document.getElementById('jornadaFormMessage');
+    if(message) message.textContent = '';
+    jornadaFormError = null;
+  }
+
+  function setJornadaFormError(text){
+    const message = document.getElementById('jornadaFormMessage');
+    if(message) message.textContent = text;
+    jornadaFormError = text || null;
+  }
+
+  function jornadaFormNumber(){
+    const el = document.getElementById('jornadaKmInput');
+    const value = el ? parseBrazilianInput(el.value) : null;
+    return value === null ? NaN : value;
+  }
+
+  function getJornadaFuelValue(id){
+    const el = document.getElementById(id);
+    const value = el ? parseBrazilianInput(el.value) : null;
+    return value;
+  }
+
+  function updateJornadaPreview(){
+    const preview = document.getElementById('jornadaPreview');
+    if(jornadaFormMode !== 'close'){
+      if(preview) preview.textContent = '';
+      return;
+    }
+    const record = jornadaCloseTarget;
+    if(!record) return;
+    const kmFinal = jornadaFormNumber();
+    if(!Number.isFinite(kmFinal)){
+      setJornadaFormError('');
+      if(preview) preview.textContent = '';
+      return;
+    }
+    if(kmFinal < record.kmInicial){
+      setJornadaFormError('O km final não pode ser menor que o km inicial (' + fmtKm(record.kmInicial) + ').');
+      if(preview) preview.textContent = '';
+      return;
+    }
+    clearJornadaFormError();
+    const consumption = getJornadaFuelValue('jornadaConsumptionInput');
+    const price = getJornadaFuelValue('jornadaPriceInput');
+    const percurso = kmFinal - record.kmInicial;
+    const liters = computeEstimatedLiters(record.kmInicial, kmFinal, consumption);
+    const cost = computeEstimatedCost(record.kmInicial, kmFinal, consumption, price);
+    const parts = [fmtKm(percurso)];
+    if(liters !== null) parts.push(fmtLiters(liters));
+    if(cost !== null) parts.push('custo ' + fmtBRL(cost));
+    if(preview) preview.textContent = parts.join(' · ');
+  }
+
+  function openJornadaForm(mode, record){
+    jornadaFormMode = mode;
+    jornadaCloseTarget = mode === 'close' ? record : null;
+    const fuelFields = document.getElementById('jornadaFuelFields');
+    const title = document.getElementById('jornadaModalTitle');
+    const desc = document.getElementById('jornadaModalDesc');
+    const preview = document.getElementById('jornadaPreview');
+    const kmInput = document.getElementById('jornadaKmInput');
+    const fuelInputs = ['jornadaConsumptionInput', 'jornadaPriceInput'].map(id => document.getElementById(id));
+    if(mode === 'start'){
+      if(title) title.textContent = 'Iniciar jornada';
+      if(desc) desc.textContent = 'Leitura inicial do hodômetro';
+      if(fuelFields) fuelFields.classList.add('hidden');
+      if(preview) preview.textContent = 'A jornada só é confirmada depois que o servidor responder.';
+      setJornadaFormError('');
+      if(kmInput) kmInput.value = '';
+    } else {
+      if(title) title.textContent = 'Encerrar jornada';
+      if(desc) desc.textContent = 'Informe o hodômetro final';
+      if(fuelFields) fuelFields.classList.remove('hidden');
+      if(fuelInputs[0]) fuelInputs[0].value = editableNumber(CONSUMO_ATUAL > 0 ? CONSUMO_ATUAL : null, 2);
+      if(fuelInputs[1]) fuelInputs[1].value = editableNumber(PRECO_ATUAL > 0 ? PRECO_ATUAL : null, 2);
+      setJornadaFormError('');
+      if(kmInput) kmInput.value = '';
+      updateJornadaPreview();
+    }
+    jornadaModalCtl.open();
+    setTimeout(function(){
+      if(kmInput && typeof kmInput.focus === 'function') kmInput.focus();
+    }, 50);
+  }
+
+  // O usuário informa o hodômetro num formulário; só então o registro nasce localmente.
   function startJornadaFromCard(){
     if(jornadaWriteBusy){
       showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
       return;
     }
+    openJornadaForm('start', null);
+  }
+
+  function createJornadaFromOdometer(kmInput){
+    if(!Number.isFinite(kmInput) || kmInput < 0){
+      setJornadaFormError('Informe um km válido.');
+      return;
+    }
     const record = {
       fsId: null,
       status: 'open',
-      kmInicial: Number.isFinite(motoKm) ? motoKm : 0,
+      kmInicial: Math.round(kmInput),
       dataInicioISO: localTodayISO(),
       horaInicioISO: nowHHMM(),
       kmFinal: null,
@@ -4263,9 +4410,12 @@ export function bootstrapPanel() {
       onPersistenceConfirmed(r, id){
         r.fsId = id;
         r.syncState = 'saved';
+        registrarKm(r.kmInicial);
+        syncMotoToFirestore();
         saveLocalState();
         renderJornadaCard();
         renderDashboard();
+        jornadaModalCtl.close();
         showToast('Jornada iniciada pelo hodômetro.', {kind:'success'});
       },
       onPersistenceFailed(r){
@@ -4292,55 +4442,110 @@ export function bootstrapPanel() {
       showToast('Nenhuma jornada em andamento.', {kind:'warning'});
       return;
     }
+    openJornadaForm('close', record);
+  }
+
+  // Fechamento: usa o resultado do servidor (saved) como fonte da verdade e registra o km final.
+  function commitJornadaClose(record, kmFinal, consumption, price, isManualConsumption, isManualPrice){
+    if(jornadaWriteBusy){
+      showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
+      return;
+    }
+    if(!record || record.status !== 'open'){
+      showToast('Nenhuma jornada em andamento.', {kind:'warning'});
+      return;
+    }
     if(!record.fsId){
       showToast('A jornada ainda não foi sincronizada. Aguarde a confirmação e tente encerrar de novo.', {kind:'warning'});
       return;
     }
-    if(typeof motoKm !== 'number' || motoKm < record.kmInicial){
-      showToast('O km atual está menor que o km inicial da jornada.', {kind:'warning'});
+    if(!Number.isFinite(kmFinal) || kmFinal < record.kmInicial){
+      setJornadaFormError('Informe um km final válido para a jornada.');
       return;
     }
-    const kmFinal = Math.round(motoKm);
+    const cleanKmFinal = Math.round(kmFinal);
     const dataFimISO = localTodayISO();
     const horaFimISO = nowHHMM();
-    const consumoReferencia = CONSUMO_ATUAL > 0 ? CONSUMO_ATUAL : null;
-    const origemConsumo = consumoManualDefinido ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null);
-    const precoReferencia = PRECO_ATUAL > 0 ? PRECO_ATUAL : null;
+    const consumoReferencia = isManualConsumption ? consumption : (CONSUMO_ATUAL > 0 ? CONSUMO_ATUAL : null);
+    const origemConsumo = isManualConsumption ? 'moto' : (consumoReal && consumoReal > 0 ? 'historico' : null);
+    const precoReferencia = isManualPrice ? price : (PRECO_ATUAL > 0 ? PRECO_ATUAL : null);
     const origemPreco = precoReferencia ? 'abastecimento' : null;
     const uidAtWrite = currentUid();
     jornadaWriteBusy = true;
     window.__motoboyJornada.close(record.fsId, {
-      kmFinal: kmFinal,
+      kmFinal: cleanKmFinal,
       dataFimISO: dataFimISO,
       horaFimISO: horaFimISO,
       consumoReferencia: consumoReferencia,
       origemConsumo: origemConsumo,
       precoReferencia: precoReferencia,
       origemPreco: origemPreco
-    }).then(function(){
+    }).then(function(saved){
       if(uidAtWrite !== currentUid()) return;
+      if(!saved){
+        throw new Error('Fechamento da jornada retornou sem dados.');
+      }
       record.status = 'closed';
-      record.kmFinal = kmFinal;
-      record.dataFimISO = dataFimISO;
-      record.horaFimISO = horaFimISO;
-      record.consumoReferencia = consumoReferencia;
-      record.origemConsumo = origemConsumo;
-      record.precoReferencia = precoReferencia;
-      record.origemPreco = origemPreco;
-      record.custoEstimado = (consumoReferencia && precoReferencia)
-        ? Math.round(((kmFinal - record.kmInicial) / consumoReferencia * precoReferencia) * 100) / 100
-        : null;
+      record.kmFinal = saved.kmFinal !== undefined ? saved.kmFinal : cleanKmFinal;
+      record.dataFimISO = saved.dataFimISO || dataFimISO;
+      record.horaFimISO = saved.horaFimISO || horaFimISO;
+      record.consumoReferencia = saved.consumoReferencia !== undefined ? saved.consumoReferencia : consumoReferencia;
+      record.origemConsumo = saved.origemConsumo || origemConsumo;
+      record.precoReferencia = saved.precoReferencia !== undefined ? saved.precoReferencia : precoReferencia;
+      record.origemPreco = saved.origemPreco || origemPreco;
+      record.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null;
       record.syncState = 'saved';
+      registrarKm(record.kmFinal);
+      syncMotoToFirestore();
       saveLocalState();
       renderJornadaCard();
       renderDashboard();
+      jornadaModalCtl.close();
       showToast(record.custoEstimado !== null
         ? 'Jornada encerrada. Custo estimado de ' + fmtBRL(record.custoEstimado) + '.'
         : 'Jornada encerrada.', {kind:'success'});
     }).catch(function(){
+      setJornadaFormError('Não foi possível encerrar a jornada no servidor. Tente de novo.');
       showToast('Não foi possível encerrar a jornada no servidor. Tente de novo.', {kind:'error'});
     }).finally(function(){ jornadaWriteBusy = false; });
   }
+
+  function handleJornadaFormSubmit(){
+    if(jornadaWriteBusy){
+      showToast('Aguarde a confirmação da ação anterior.', {kind:'warning'});
+      return;
+    }
+    if(jornadaFormMode === 'start'){
+      createJornadaFromOdometer(jornadaFormNumber());
+      return;
+    }
+    if(jornadaFormMode === 'close'){
+      const record = jornadaCloseTarget;
+      if(!record){
+        showToast('Nenhuma jornada em andamento.', {kind:'warning'});
+        return;
+      }
+      commitJornadaClose(record,
+        jornadaFormNumber(),
+        getJornadaFuelValue('jornadaConsumptionInput'),
+        getJornadaFuelValue('jornadaPriceInput'),
+        Boolean(document.getElementById('jornadaConsumptionInput').value),
+        Boolean(document.getElementById('jornadaPriceInput').value)
+      );
+    }
+  }
+
+  const jornadaModalCtl = wireModal(null, 'jornadaModal', 'jornadaBackdrop', 'jornadaModalClose', 'jornadaModalCancel');
+  const jornadaModalSave = document.getElementById('jornadaModalSave');
+  if(jornadaModalSave) jornadaModalSave.addEventListener('click', handleJornadaFormSubmit);
+  ['jornadaKmInput', 'jornadaConsumptionInput', 'jornadaPriceInput'].forEach(function(id){
+    const el = document.getElementById(id);
+    if(el) el.addEventListener('input', updateJornadaPreview);
+  });
+
+  let jornadaFormMode = null;      // null | 'start' | 'close'
+  let jornadaCloseTarget = null;   // registro em aberto sendo encerrado
+  let jornadaFormError = null;
 
   function renderDashboard(){
     renderJornadaCard();
