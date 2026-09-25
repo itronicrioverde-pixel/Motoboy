@@ -67,11 +67,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17 (pré-requisito dos emuladores do Firebase)
-        uses: actions/setup-java@v4
+      - name: Setup Java 21 (pré-requisito dos emuladores do Firebase)
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: Setup Node 22
         uses: actions/setup-node@v4
