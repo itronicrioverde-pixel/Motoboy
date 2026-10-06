@@ -332,8 +332,8 @@ servem para unicidade/idempotência e nunca são credenciais ou segredos.
 | Diff | `git diff --check` sem erro; somente avisos esperados de LF → CRLF no Windows | Conferência feita antes da publicação autorizada da branch |
 
 A execução publicada
-[`37394350187`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/37394350187)
-passou nos **quatro jobs** no commit `70216f9169edc06a507d284277c551add4d7c05a`:
+[`37395331898`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/37395331898)
+passou nos **quatro jobs** no commit `ff8a1d93cef4106a302fe980e3ea6f0e10ae1979`:
 check web, check Functions, Emulator web e Emulator Functions. A etapa
 `npm audit --omit=dev` do job web usa `continue-on-error` e **falhou**;
 portanto, quatro jobs verdes não significam auditoria limpa. Confirmar
@@ -363,12 +363,22 @@ sempre a execução correspondente ao HEAD publicado.
   de resolver tudo exige `firebase-admin@14.5.0` (upgrade major); isso não
   foi feito nesta etapa. Esses achados exigem avaliação própria antes de
   considerar a auditoria aprovada.
+- O aviso alto de `node-forge` trata de **verificação de assinatura RSA** e
+  [não indica versão corrigida](https://github.com/advisories/GHSA-86w9-cpqp-85rv).
+  No `firebase-admin@12.7.0` instalado, o único `require('node-forge')`
+  encontrado está em `credential-internal.js` para ler a **chave privada**
+  (`privateKeyFromPem`). Além disso, `functions/src/index.ts` exporta somente
+  `scaffoldInfo`, sem callable nem import de Admin no bundle de produção.
+  Isso não demonstra um caminho de exploração no código implantável atual,
+  mas **não equivale a auditoria limpa**: qualquer callable futuro que use
+  Admin precisará de nova revisão de dependências antes do deploy.
 - Depois do patch do lockfile, `npm run check` web passou com tipagem global,
   65 arquivos/1.009 testes e build. `npm run check` das Functions também
   passou com tipagem, 2 arquivos/22 testes e build quando executado com
-  permissão local suficiente para o esbuild ler o workspace. A CI do novo
-  HEAD ainda deve validar os quatro jobs, inclusive os Emulators. Nenhuma
-  regra ou aplicação foi implantada.
+  permissão local suficiente para o esbuild ler o workspace. A CI do commit
+  com o lockfile atualizado passou nos quatro jobs, inclusive os Emulators;
+  a etapa `npm audit` web falhou novamente (4 alertas altos, não bloqueante
+  por `continue-on-error`). Nenhuma regra ou aplicação foi implantada.
 
 ### Estado do roteiro de liberação em 05/10
 
@@ -378,9 +388,9 @@ sempre a execução correspondente ao HEAD publicado.
 | 2 — Gravações e retry | Criação, recarga, falha, reconexão e retry exercitados na UI demo; resposta perdida após commit coberta somente no Emulator. Edição e exclusão de abastecimento, manutenção e entrada manual passaram na UI demo aprovada; cliente, recebimento e abastecimento também foram exercitados via HTTP LAN sem Web Crypto | Executar 2.1–2.10 no aparelho/projeto beta, especialmente resposta perdida após commit e toque duplo no retry pela interface |
 | 3 — Jornada | Abertura, recarga, fechamento, custo só estimado, histórico, conflito entre aparelhos, tentativa offline, troca de UID e retry demonstrados em navegador demo e Emulator | Executar 3.1–3.11 no aparelho/projeto beta, incluindo hodômetro real, teclado virtual e histórico com jornada aberta e encerrada |
 | 4 — Regressão | Navegação, totais e recarga exercitados no navegador demo; viewport 390 × 844 sem overflow horizontal | Conferir navegação, valores e interação tátil em aparelho físico com as contas de teste |
-| CI | Checks locais aprovados e quatro jobs verdes no commit `70216f9`; auditoria web não está verde | Confirmar quatro jobs verdes para o HEAD com o lockfile atualizado; avaliar separadamente os alertas restantes das dependências |
+| CI | Checks locais aprovados e quatro jobs verdes no commit `ff8a1d9`; auditoria web e auditoria separada das Functions não estão verdes | Revalidar qualquer commit posterior e avaliar os alertas restantes antes de introduzir runtime Admin em callable |
 
 O proprietário autorizou commit/push da branch e o login sintético em 05/10;
-o ensaio acima cobriu o login. Os quatro jobs passaram no commit `70216f9`.
+o ensaio acima cobriu o login. Os quatro jobs passaram no commit `ff8a1d9`.
 O beta ainda não pode ser declarado liberado até a CI do HEAD final e a
 execução do roteiro em aparelho físico. O proprietário fará a etapa no celular.
