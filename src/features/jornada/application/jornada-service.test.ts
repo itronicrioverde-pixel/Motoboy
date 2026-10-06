@@ -28,7 +28,7 @@ function fakeRepo(overrides: Partial<JornadaRepository> = {}): JornadaRepository
     list: vi.fn(async () => []),
     findOpen: vi.fn(async () => null),
     add: vi.fn(async (data) => makeJornada({ ...data })),
-    close: vi.fn(async () => undefined),
+    close: vi.fn(async (id, patch) => makeJornada({ id, status: 'closed', ...patch })),
     ...overrides,
   };
 }

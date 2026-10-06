@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { resolveJornadaCloseReferences } from './jornada-close-form';
+import { parseJornadaFormValue } from '../presentation/jornada-form-values';
 
 /** Sem consumo vigente nem preço: o fluxo deve bloquear o encerramento. */
 const EMPTY_DEFAULTS = { consumoAtual: 0, consumoManual: false, consumoReal: null, precoAtual: 0 };
@@ -53,6 +54,25 @@ describe('resolveJornadaCloseReferences — sem consumo não encerra', () => {
     );
     expect(invalid.ok).toBe(false);
     if (!invalid.ok) expect(invalid.error).toContain('maior que zero');
+  });
+
+  it('texto de consumo inválido não vira campo vazio nem usa o consumo anterior', () => {
+    const invalid = resolveJornadaCloseReferences(
+      { kmInicial: 100, kmFinal: 200, consumptionInput: parseJornadaFormValue('1,2,3'), priceInput: null },
+      { consumoAtual: 25, consumoManual: true, consumoReal: null, precoAtual: 6 },
+    );
+    expect(invalid.ok).toBe(false);
+  });
+
+  it('preço digitado inválido não reaproveita o preço anterior', () => {
+    for (const input of ['0', '1,2,3']) {
+      const invalid = resolveJornadaCloseReferences(
+        { kmInicial: 100, kmFinal: 200, consumptionInput: 25, priceInput: parseJornadaFormValue(input) },
+        { consumoAtual: 25, consumoManual: true, consumoReal: null, precoAtual: 6 },
+      );
+      expect(invalid.ok).toBe(false);
+      if (!invalid.ok) expect(invalid.error).toContain('preço válido');
+    }
   });
 
   it('sem consumo digitado usa o consumo vigente; do histórico vem "historico"', () => {

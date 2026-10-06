@@ -8,11 +8,11 @@
 
 import {
   collection,
-  addDoc,
-  updateDoc,
   doc,
   getDocs,
+  getDocsFromServer,
   query,
+  runTransaction,
   orderBy,
   limit,
   where,
@@ -21,6 +21,8 @@ import {
   type QueryDocumentSnapshot,
 } from 'firebase/firestore';
 import { db } from '../../../config/firebase.js';
+import { JornadaAlreadyOpenError, JornadaValidationError } from '../application/jornada-service';
+import { jornadaOpeningId } from '../application/jornada-opening-id';
 import type {
   ConsumoOrigem,
   Jornada,
@@ -63,13 +65,23 @@ export function jornadaFromSnapshot(snapshot: QueryDocumentSnapshot<DocumentData
   };
 }
 
+function sameOpening(jornada: Jornada, data: NewJornada): boolean {
+  return jornada.kmInicial === data.kmInicial
+    && jornada.dataInicioISO === data.dataInicioISO
+    && jornada.horaInicioISO === data.horaInicioISO;
+}
+
 export class FirestoreJornadaRepository implements JornadaRepository {
   /** getUid é injetado para nunca gravar no dono errado. */
   constructor(private readonly getUid: () => string | null) {}
 
-  private collectionRef(): CollectionReference<DocumentData> {
+  private requireUid(): string {
     const uid = this.getUid();
     if (!uid) throw new Error('Sem usuário autenticado.');
+    return uid;
+  }
+
+  private collectionRef(uid = this.requireUid()): CollectionReference<DocumentData> {
     return collection(db, 'users', uid, 'jornadas');
   }
 
@@ -79,7 +91,7 @@ export class FirestoreJornadaRepository implements JornadaRepository {
   }
 
   async findOpen(): Promise<Jornada | null> {
-    const snap = await getDocs(
+    const snap = await getDocsFromServer(
       query(this.collectionRef(), where('status', '==', 'open'), limit(1)),
     );
     if (snap.empty) return null;
@@ -87,6 +99,29 @@ export class FirestoreJornadaRepository implements JornadaRepository {
   }
 
   async add(data: NewJornada): Promise<Jornada> {
+    const uid = this.requireUid();
+    const id = jornadaOpeningId(data);
+    const ref = doc(this.collectionRef(uid), id);
+    // Coleções anteriores à trava continuam válidas. Uma leitura do servidor
+    // impede abrir outra jornada enquanto uma delas ainda estiver em aberto.
+    const legacyOpen = await getDocsFromServer(
+      query(this.collectionRef(uid), where('status', '==', 'open'), limit(1)),
+    );
+    if (!legacyOpen.empty) {
+      const existing = jornadaFromSnapshot(legacyOpen.docs[0]);
+      if (sameOpening(existing, data)) return existing;
+      throw new JornadaAlreadyOpenError();
+    }
+    // O ID das versões anteriores era aleatório. Reconhece também uma
+    // abertura legada já fechada antes de tentar criar seu sucessor.
+    const sameDay = await getDocsFromServer(
+      query(this.collectionRef(uid), where('dataInicioISO', '==', data.dataInicioISO)),
+    );
+    const legacyMatch = sameDay.docs
+      .filter((snapshot) => snapshot.id !== id)
+      .map(jornadaFromSnapshot)
+      .find((jornada) => sameOpening(jornada, data));
+    if (legacyMatch) return legacyMatch;
     const now = Date.now();
     const payload = {
       status: 'open' as const,
@@ -104,22 +139,50 @@ export class FirestoreJornadaRepository implements JornadaRepository {
       createdAt: now,
       updatedAt: now,
     };
-    const ref = await addDoc(this.collectionRef(), payload);
-    return { id: ref.id, ...payload };
+    const stateRef = doc(db, 'users', uid, 'jornadaState', 'current');
+    return runTransaction(db, async (tx) => {
+      const state = await tx.get(stateRef);
+      const attempted = await tx.get(ref);
+      if (attempted.exists()) {
+        const existing = jornadaFromSnapshot(attempted);
+        if (!sameOpening(existing, data)) {
+          throw new JornadaValidationError('Identidade da jornada em conflito; nenhuma abertura foi gravada.');
+        }
+        return existing;
+      }
+      const activeId = state.exists() ? state.data().activeJornadaId : null;
+      if (activeId !== null && activeId !== undefined) {
+        if (typeof activeId !== 'string' || !/^(?:[A-Za-z0-9]{20}|j1_(?:[a-f0-9]{2}){1,500})$/.test(activeId)) {
+          throw new JornadaValidationError('Controle da jornada inválido; nenhuma abertura foi gravada.');
+        }
+        const active = await tx.get(doc(this.collectionRef(uid), activeId));
+        if (active.exists() && active.data().status === 'open') {
+          const existing = jornadaFromSnapshot(active);
+          if (sameOpening(existing, data)) return existing;
+          throw new JornadaAlreadyOpenError();
+        }
+      }
+      tx.set(ref, payload);
+      tx.set(stateRef, { activeJornadaId: ref.id, updatedAt: now });
+      return { id: ref.id, ...payload };
+    });
   }
 
-  async close(id: string, patch: JornadaClosePatch): Promise<void> {
-    await updateDoc(doc(this.collectionRef(), id), {
-      status: 'closed',
-      kmFinal: patch.kmFinal,
-      dataFimISO: patch.dataFimISO,
-      horaFimISO: patch.horaFimISO,
-      consumoReferencia: patch.consumoReferencia,
-      origemConsumo: patch.origemConsumo,
-      precoReferencia: patch.precoReferencia,
-      origemPreco: patch.origemPreco,
-      custoEstimado: patch.custoEstimado,
-      updatedAt: patch.updatedAt,
+  async close(id: string, patch: JornadaClosePatch): Promise<Jornada> {
+    const uid = this.requireUid();
+    const ref = doc(this.collectionRef(uid), id);
+    const stateRef = doc(db, 'users', uid, 'jornadaState', 'current');
+    return runTransaction(db, async (tx) => {
+      const currentSnapshot = await tx.get(ref);
+      if (!currentSnapshot.exists()) throw new JornadaValidationError('Jornada não encontrada.');
+      const current = jornadaFromSnapshot(currentSnapshot);
+      if (current.status === 'closed') return current;
+      const state = await tx.get(stateRef);
+      tx.update(ref, { status: 'closed', ...patch });
+      if (state.exists() && state.data().activeJornadaId === id) {
+        tx.set(stateRef, { activeJornadaId: null, updatedAt: patch.updatedAt });
+      }
+      return { ...current, status: 'closed', ...patch };
     });
   }
 }

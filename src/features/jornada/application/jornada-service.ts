@@ -26,6 +26,20 @@ export class JornadaValidationError extends Error {
   }
 }
 
+export class JornadaAlreadyOpenError extends JornadaValidationError {
+  constructor() {
+    super('Já existe uma jornada em aberto. Feche-a antes de iniciar outra.');
+    this.name = 'JornadaAlreadyOpenError';
+  }
+}
+
+export class JornadaAlreadyFinishedError extends JornadaValidationError {
+  constructor() {
+    super('Esta tentativa corresponde a uma jornada já encerrada.');
+    this.name = 'JornadaAlreadyFinishedError';
+  }
+}
+
 function isValidKm(value: number): boolean {
   return Number.isFinite(value) && value >= 0;
 }
@@ -67,7 +81,7 @@ export class JornadaService {
       if (open.kmInicial === data.kmInicial && open.dataInicioISO === data.dataInicioISO && open.horaInicioISO === data.horaInicioISO) {
         return open;
       }
-      throw new JornadaValidationError('Já existe uma jornada em aberto. Feche-a antes de iniciar outra.');
+      throw new JornadaAlreadyOpenError();
     }
     return this.repo.add({
       kmInicial: data.kmInicial,
@@ -125,7 +139,6 @@ export class JornadaService {
       custoEstimado,
       updatedAt: Date.now(),
     };
-    await this.repo.close(jornada.id, patch);
-    return { ...jornada, status: 'closed', ...patch };
+    return this.repo.close(jornada.id, patch);
   }
 }

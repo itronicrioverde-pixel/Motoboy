@@ -88,7 +88,7 @@ export function resolveJornadaCloseReferences(
       precoReferencia: null,
       origemPreco: null,
     };
-  } else if (defaults.consumoAtual > 0) {
+  } else if (Number.isFinite(defaults.consumoAtual) && defaults.consumoAtual > 0) {
     consumoReferencia = defaults.consumoAtual;
     origemConsumo =
       defaults.consumoManual || !(defaults.consumoReal && defaults.consumoReal > 0)
@@ -109,7 +109,17 @@ export function resolveJornadaCloseReferences(
   let precoReferencia: number | null;
   if (isPositive(inputs.priceInput)) {
     precoReferencia = inputs.priceInput;
-  } else if (defaults.precoAtual > 0) {
+  } else if (isInvalidTypedValue(inputs.priceInput)) {
+    return {
+      ok: false,
+      error: 'Informe um preço válido (maior que zero) ou deixe o campo vazio.',
+      kmFinal: null,
+      consumoReferencia: null,
+      origemConsumo: null,
+      precoReferencia: null,
+      origemPreco: null,
+    };
+  } else if (Number.isFinite(defaults.precoAtual) && defaults.precoAtual > 0) {
     precoReferencia = defaults.precoAtual;
   } else {
     precoReferencia = null;

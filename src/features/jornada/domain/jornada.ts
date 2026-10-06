@@ -121,5 +121,6 @@ export interface JornadaRepository {
   /** A jornada em aberto do dono, se existir. */
   findOpen(): Promise<Jornada | null>;
   add(data: NewJornada): Promise<Jornada>;
-  close(id: string, patch: JornadaClosePatch): Promise<void>;
+  /** Retorna o estado confirmado; uma corrida pode ter fechado antes com outro patch. */
+  close(id: string, patch: JornadaClosePatch): Promise<Jornada>;
 }

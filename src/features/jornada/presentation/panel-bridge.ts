@@ -7,6 +7,7 @@
  */
 
 import { jornadaService } from '../index';
+import { JornadaAlreadyFinishedError, JornadaAlreadyOpenError } from '../application/jornada-service';
 import type { CloseJornada, Jornada, NewJornada } from '../index';
 import type { LoadResult } from '../../../shared/application/load-result';
 import { loadOk, loadFail } from '../../../shared/application/load-result';
@@ -54,6 +55,7 @@ declare global {
     __motoboyJornada?: {
       start(vm: JornadaVM): Promise<string | null>;
       close(fsId: string | null | undefined, vm: JornadaVM): Promise<Jornada | null>;
+      refresh(): Promise<Jornada[]>;
     };
     /** Definido pelo monólito; recebe as jornadas do Firestore e re-renderiza. */
     __applyRemoteJornada?: (entities: Jornada[]) => void;
@@ -66,8 +68,10 @@ export function installJornadaBridge(): void {
     async start(vm) {
       try {
         const created = await jornadaService.start(vmToNew(vm));
+        if (created.status === 'closed') throw new JornadaAlreadyFinishedError();
         return created.id;
       } catch (error) {
+        if (error instanceof JornadaAlreadyOpenError || error instanceof JornadaAlreadyFinishedError) throw error;
         console.error('[Jornada] Erro ao iniciar:', error);
         return null; // offline/erro: fica só no cache local
       }
@@ -75,6 +79,9 @@ export function installJornadaBridge(): void {
     async close(fsId, vm) {
       if (!fsId) return null;
       return jornadaService.close(fsId, vmToClose(vm));
+    },
+    async refresh() {
+      return jornadaService.list();
     },
   };
 }
