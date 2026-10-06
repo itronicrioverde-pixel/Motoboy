@@ -310,15 +310,14 @@ servem para unicidade/idempotência e nunca são credenciais ou segredos.
 | HTTP LAN real (`http://192.168.0.167:5176`) sem Web Crypto | A reprodução confirmou `window.crypto === undefined` e inicialmente encontrou crash no bootstrap do código oculto de Rotas. Após centralizar também esses geradores em `generateUuid()`, o painel abriu. A UI criou **1 cliente**, salvou **1 abastecimento de R$ 30,50** com documento + marcador no mesmo ID, e registrou **1 recebimento de R$ 20,00**, reduzindo o saldo sintético de R$ 50,00 para R$ 30,00 e criando uma única entrada com o mesmo `receiptOperationId`. Após recarga, o dashboard mostrou R$ 20,00 recebido, R$ 30,50 em despesas e resultado de -R$ 10,50. | Navegador no mesmo computador acessando pelo IP da LAN; comprova o contexto inseguro e o fallback, mas não substitui aparelho físico |
 | Ensaio de UI demo antes da autorização específica (`demo-motoboy-browser-final2-20261005`) | Auth e Firestore Emulators e Vite iniciaram; conta sintética criada e marcada como verificada apenas no Emulator. A revisão automática bloqueou o login antes do envio das credenciais; os serviços e a aba foram encerrados. | Registro histórico do bloqueio; o proprietário autorizou o login em seguida, e o novo ensaio está na linha abaixo |
 | Ensaio de UI autorizado (`demo-motoboy-browser-approved-20261005`) | Login da conta sintética, abastecimento de R$ 30,00 editado para R$ 36,00 com motivo e excluído; manutenção de R$ 25,00 editada para R$ 27,00 com motivo e excluída; entrada manual de R$ 40,00 editada para R$ 45,00 com motivo e excluída. Listas e totais voltaram a zero; após recarga a sessão permaneceu autenticada e os totais continuaram zerados. Leitura direta no Firestore Emulator encontrou **0 documentos** nas três coleções e hodômetro da moto em **1.510 km**. Após sair e desligar o Auth Emulator, o login exibiu **“Serviço temporariamente indisponível. Tente mais tarde.”**, sem informar se o e-mail existe. | Conta e dados exclusivamente sintéticos em projeto `demo-*`. Não cobre resposta perdida após commit pela UI, toque físico, teclado virtual nem projeto beta real |
-| Diff | `git diff --check` sem erro; somente avisos esperados de LF → CRLF no Windows | Worktree continua intencionalmente sem commit/push |
+| Diff | `git diff --check` sem erro; somente avisos esperados de LF → CRLF no Windows | Conferência feita antes da publicação autorizada da branch |
 
-A última CI publicada consultada foi a execução
-[`36186231275`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/36186231275),
-verde no commit `ef325fe6c39b0fd8de3463db3570561d37875fa7` com os três jobs então
-publicados. Ela não contém este patch sem commit nem o quarto job web no
-Emulator presente no workflow local, portanto não é evidência de CI verde para
-as alterações atuais. Uma nova consulta à branch em 05/10 confirmou que essa
-continua sendo a execução mais recente.
+A execução publicada
+[`37393716401`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/37393716401)
+passou nos **quatro jobs** no commit `1371412b59bb175cdb447b67f8b2bc1b2843ff12`:
+check web, check Functions, Emulator web e Emulator Functions. O commit
+documental que registra esse resultado exige nova CI antes da liberação;
+confirmar sempre a execução correspondente ao HEAD publicado.
 
 ### Estado do roteiro de liberação em 05/10
 
@@ -328,9 +327,9 @@ continua sendo a execução mais recente.
 | 2 — Gravações e retry | Criação, recarga, falha, reconexão e retry exercitados na UI demo; resposta perdida após commit coberta somente no Emulator. Edição e exclusão de abastecimento, manutenção e entrada manual passaram na UI demo aprovada; cliente, recebimento e abastecimento também foram exercitados via HTTP LAN sem Web Crypto | Executar 2.1–2.10 no aparelho/projeto beta, especialmente resposta perdida após commit e toque duplo no retry pela interface |
 | 3 — Jornada | Abertura, recarga, fechamento, custo só estimado, histórico, conflito entre aparelhos, tentativa offline, troca de UID e retry demonstrados em navegador demo e Emulator | Executar 3.1–3.11 no aparelho/projeto beta, incluindo hodômetro real, teclado virtual e histórico com jornada aberta e encerrada |
 | 4 — Regressão | Navegação, totais e recarga exercitados no navegador demo; viewport 390 × 844 sem overflow horizontal | Conferir navegação, valores e interação tátil em aparelho físico com as contas de teste |
-| CI | Checks locais do patch atual aprovados | Publicar o patch autorizado e aguardar os quatro jobs da CI no commit correspondente |
+| CI | Checks locais aprovados e quatro jobs verdes no commit `1371412` | Confirmar quatro jobs verdes para o HEAD publicado após este registro documental |
 
 O proprietário autorizou commit/push da branch e o login sintético em 05/10;
-o ensaio acima cobriu o login. O patch ainda não pode ser declarado liberado
-para beta até que os quatro jobs da CI cubram o commit publicado e o roteiro
-seja executado em aparelho físico. O proprietário fará a etapa no celular.
+o ensaio acima cobriu o login. Os quatro jobs passaram no commit `1371412`.
+O beta ainda não pode ser declarado liberado até a CI do HEAD final e a
+execução do roteiro em aparelho físico. O proprietário fará a etapa no celular.
