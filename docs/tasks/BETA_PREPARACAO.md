@@ -394,3 +394,31 @@ O proprietário autorizou commit/push da branch e o login sintético em 05/10;
 o ensaio acima cobriu o login. Os quatro jobs passaram no commit `ff8a1d9`.
 O beta ainda não pode ser declarado liberado até a CI do HEAD final e a
 execução do roteiro em aparelho físico. O proprietário fará a etapa no celular.
+
+### Ensaio complementar de UI: concorrência, recarga e reconexão — 06/10/2026
+
+No navegador local, com Vite e Auth + Firestore Emulators no projeto isolado
+`demo-motoboy-progress-20261006`, duas contas sintéticas verificadas foram
+usadas como A e B. Na conta A, um duplo clique em **Salvar abastecimento**
+para R$ 30,00 exibiu somente uma tentativa em andamento e terminou com um
+único documento no Firestore. A recarga preservou o valor; B exibiu totais
+zerados e nenhum abastecimento; ao retornar à A, o registro reapareceu.
+
+Para testar a falha antes do commit, o processo do Firestore Emulator foi
+interrompido. A criou outro abastecimento de R$ 14,00: a lista passou de
+**Sincronizando** para **Aguardando conexão**, manteve **Tentar novamente**
+e não incluiu os R$ 14,00 nos totais. Após recarga e novo login sintético,
+a tentativa continuou em A; B não a viu; ao voltar à A, continuou disponível.
+Depois de reiniciar os Emulators e recriar as mesmas contas com os mesmos UIDs,
+um duplo clique em **Tentar novamente** confirmou a tentativa. A leitura
+direta encontrou **1 abastecimento e 1 marcador `createAttempts`**, ambos
+com o ID `7dfab377-86a3-47c5-aa0e-ae19a4149c24`; após nova recarga, a
+UI mostrou R$ 14,00 confirmado e nenhum badge pendente.
+
+O reinício dos Emulators não importou o estado anterior: o primeiro registro
+de R$ 30,00 foi perdido **no ambiente sintético**, não excluído pelo app.
+Este ensaio cobre falha antes do commit, recarga, UID, reconexão e duplo
+clique na UI; **não** cobre resposta perdida após commit, que permanece
+testada apenas no Emulator em nível de infraestrutura. Também não substitui
+toque, teclado, rede e safe-area no Android físico nem usa o projeto beta real.
+Nenhum deploy ou regra foi alterado.
