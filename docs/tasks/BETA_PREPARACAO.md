@@ -422,3 +422,34 @@ clique na UI; **não** cobre resposta perdida após commit, que permanece
 testada apenas no Emulator em nível de infraestrutura. Também não substitui
 toque, teclado, rede e safe-area no Android físico nem usa o projeto beta real.
 Nenhum deploy ou regra foi alterado.
+
+### Ensaio complementar de UI: manutenção e entrada manual — 06/10/2026
+
+No projeto demo isolado `demo-motoboy-progress-1006`, a conta sintética A
+registrou, com o Firestore Emulator indisponível, uma manutenção de R$ 42,00
+(`Teste offline - troca de óleo`) e uma entrada manual de R$ 27,00
+(`Teste offline - gorjeta`). Ambos os itens passaram de **Sincronizando**
+para **Aguardando conexão**, ofereceram **Tentar novamente** e não entraram
+nos totais antes da confirmação. Após recarregar e entrar novamente com o
+mesmo UID, os dois continuaram pendentes. A conta sintética B não viu nenhum
+deles nas respectivas listas.
+
+Após religar Auth e Firestore Emulators e recriar as contas sintéticas com os
+mesmos UIDs, A acionou **Tentar novamente** em cada item com duplo clique.
+Ambos foram confirmados. A leitura direta do Firestore Emulator mostrou
+exatamente **1 documento `manutencoes`**, **1 documento `entradas`** e
+**2 marcadores `createAttempts`**, um por documento e com o mesmo ID:
+`916bd9cb-8885-40f6-9b6e-b496f8d21c5b` para a manutenção e
+`8eef26a4-07c1-4100-bd57-1e2c9c61f280` para a entrada. Os payloads
+persistidos mantiveram descrição, valor e data informados antes da falha.
+Depois de nova recarga, o painel exibiu R$ 27,00 recebidos, R$ 42,00 de
+despesas e resultado de -R$ 15,00, sem status pendente nesses registros.
+
+O segundo clique da entrada encontrou o botão já substituído pela UI após a
+confirmação; por isso o ensaio demonstra **um único resultado persistido**,
+mas não prova que duas requisições simultâneas chegaram ao Firestore. Como
+no ensaio de abastecimento, a falha simulada ocorreu **antes do commit**;
+resposta perdida após commit continua coberta somente pelos testes do
+Emulator. Os Emulators foram reiniciados sem importação de dados e o ensaio
+não substitui Android físico nem usa o projeto beta real. Nenhum deploy ou
+regra foi alterado.
