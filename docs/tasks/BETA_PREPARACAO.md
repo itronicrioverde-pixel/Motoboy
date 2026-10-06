@@ -332,11 +332,43 @@ servem para unicidade/idempotência e nunca são credenciais ou segredos.
 | Diff | `git diff --check` sem erro; somente avisos esperados de LF → CRLF no Windows | Conferência feita antes da publicação autorizada da branch |
 
 A execução publicada
-[`37393716401`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/37393716401)
-passou nos **quatro jobs** no commit `1371412b59bb175cdb447b67f8b2bc1b2843ff12`:
-check web, check Functions, Emulator web e Emulator Functions. O commit
-documental que registra esse resultado exige nova CI antes da liberação;
-confirmar sempre a execução correspondente ao HEAD publicado.
+[`37394350187`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/37394350187)
+passou nos **quatro jobs** no commit `70216f9169edc06a507d284277c551add4d7c05a`:
+check web, check Functions, Emulator web e Emulator Functions. A etapa
+`npm audit --omit=dev` do job web usa `continue-on-error` e **falhou**;
+portanto, quatro jobs verdes não significam auditoria limpa. Confirmar
+sempre a execução correspondente ao HEAD publicado.
+
+### Triagem da auditoria de dependências — 05/10/2026
+
+- No web, `firebase@12.18.0` → `@firebase/firestore@4.17.1` fixa
+  `@grpc/grpc-js` em `~1.9.0`, resolvido como `1.9.16`. A auditoria de
+  produção da CI aponta quatro alertas altos na cadeia de dependências.
+  Os dois avisos da biblioteca gRPC descrevem comportamento de **servidor**
+  ([autorização de certificados](https://github.com/advisories/GHSA-m9gg-hp2v-232j)
+  e [mensagens de erro](https://github.com/advisories/GHSA-f596-whhp-79r4)).
+  O pacote Firestore exporta uma entrada `browser` separada da `node`, e
+  `rg` no bundle Vite gerado não encontrou `grpc-js`, `getAuthContext` nem
+  `DownstreamTlsContext`. Essa evidência não mostra um caminho para explorar
+  os avisos pelo bundle **web atual**; se o mesmo pacote for executado em
+  Node/SSR, é necessário reavaliar. A [faixa fixada pelo Firebase](https://github.com/firebase/firebase-js-sdk/issues/10400)
+  não admite a versão gRPC corrigida; não usar `npm audit fix --force`, que
+  propõe downgrade incompatível do Firebase.
+- Nas Functions, o lockfile usava gRPC `1.14.4`. Foi atualizado somente
+  para `1.14.5`, versão corrigida e compatível com a faixa `^1.10.9`
+  declarada pelo dependente. `npm ls` confirmou uma cópia `1.14.5` após
+  instalação limpa. A auditoria das Functions **ainda falha** com 12
+  ocorrências (2 altas, 10 moderadas), principalmente por `node-forge`,
+  `qs` e `uuid` na cadeia do `firebase-admin@12.7.0`. A sugestão automática
+  de resolver tudo exige `firebase-admin@14.5.0` (upgrade major); isso não
+  foi feito nesta etapa. Esses achados exigem avaliação própria antes de
+  considerar a auditoria aprovada.
+- Depois do patch do lockfile, `npm run check` web passou com tipagem global,
+  65 arquivos/1.009 testes e build. `npm run check` das Functions também
+  passou com tipagem, 2 arquivos/22 testes e build quando executado com
+  permissão local suficiente para o esbuild ler o workspace. A CI do novo
+  HEAD ainda deve validar os quatro jobs, inclusive os Emulators. Nenhuma
+  regra ou aplicação foi implantada.
 
 ### Estado do roteiro de liberação em 05/10
 
@@ -346,9 +378,9 @@ confirmar sempre a execução correspondente ao HEAD publicado.
 | 2 — Gravações e retry | Criação, recarga, falha, reconexão e retry exercitados na UI demo; resposta perdida após commit coberta somente no Emulator. Edição e exclusão de abastecimento, manutenção e entrada manual passaram na UI demo aprovada; cliente, recebimento e abastecimento também foram exercitados via HTTP LAN sem Web Crypto | Executar 2.1–2.10 no aparelho/projeto beta, especialmente resposta perdida após commit e toque duplo no retry pela interface |
 | 3 — Jornada | Abertura, recarga, fechamento, custo só estimado, histórico, conflito entre aparelhos, tentativa offline, troca de UID e retry demonstrados em navegador demo e Emulator | Executar 3.1–3.11 no aparelho/projeto beta, incluindo hodômetro real, teclado virtual e histórico com jornada aberta e encerrada |
 | 4 — Regressão | Navegação, totais e recarga exercitados no navegador demo; viewport 390 × 844 sem overflow horizontal | Conferir navegação, valores e interação tátil em aparelho físico com as contas de teste |
-| CI | Checks locais aprovados e quatro jobs verdes no commit `1371412` | Confirmar quatro jobs verdes para o HEAD publicado após este registro documental |
+| CI | Checks locais aprovados e quatro jobs verdes no commit `70216f9`; auditoria web não está verde | Confirmar quatro jobs verdes para o HEAD com o lockfile atualizado; avaliar separadamente os alertas restantes das dependências |
 
 O proprietário autorizou commit/push da branch e o login sintético em 05/10;
-o ensaio acima cobriu o login. Os quatro jobs passaram no commit `1371412`.
+o ensaio acima cobriu o login. Os quatro jobs passaram no commit `70216f9`.
 O beta ainda não pode ser declarado liberado até a CI do HEAD final e a
 execução do roteiro em aparelho físico. O proprietário fará a etapa no celular.
