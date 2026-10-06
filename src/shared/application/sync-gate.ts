@@ -1,10 +1,10 @@
 /**
  * SyncGate — porta lógica para controlar sincronização.
  *
- * Usado pelo panel.js para bloquear/liberar escritas ao Firestore:
- * - clientsRemoteRead: bloqueia saveClientsToFirestore antes da leitura remota
- * - clientsHydrated: bloqueia syncClientsToFirestore antes da hidratação
+ * Usado pelo painel para bloquear ações até a hidratação remota:
+ * - clientsHydrated: impede mutações financeiras antes de carregar os clientes
  * - motoHydrated: bloqueia saveMotoToFirestore/syncMotoToFirestore
+ * A projeção financeira clients/data não utiliza writer debounced.
  *
  * A porta começa fechada. Somente a hidratação bem-sucedida a abre.
  * Enquanto fechada, qualquer tentativa de escrita é ignorada silenciosamente.

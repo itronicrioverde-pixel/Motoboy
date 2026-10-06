@@ -10,6 +10,8 @@ import { entradaToEntryVM } from './entrada-view-model';
 import type { EntradaEntryVM } from './entrada-view-model';
 import type { LoadResult } from '../../../shared/application/load-result';
 import { loadOk, loadFail } from '../../../shared/application/load-result';
+import { durableCreateManager } from '../../../shared/infrastructure/durable-create-runtime';
+import type { DurableCreateAttempt, DurableCreateResult } from '../../../shared/application/durable-create-manager';
 
 interface EntradaVM {
   fsId?: string | null;
@@ -30,7 +32,9 @@ function vmToEdit(vm: EntradaVM): EditEntrada {
 declare global {
   interface Window {
     __motoboyEntradas?: {
-      add(vm: EntradaVM): Promise<string | null>;
+      prepare(vm: EntradaVM): DurableCreateAttempt;
+      pending(): DurableCreateAttempt[];
+      retry(id: string): Promise<DurableCreateResult>;
       update(fsId: string | null | undefined, vm: EntradaVM): Promise<void>;
       remove(fsId: string | null | undefined): Promise<void>;
     };
@@ -40,15 +44,15 @@ declare global {
 
 export function installFaturamentoBridge(): void {
   window.__motoboyEntradas = {
-    async add(vm) {
-      try {
-        const created = await entradasService.add(vmToNew(vm));
-        return created.id;
-      } catch (error) {
-        console.error('[Faturamento] Erro ao adicionar:', error);
-        return null;
-      }
+    prepare(vm) {
+      const data = vmToNew(vm);
+      return durableCreateManager.prepare('entradas', (id, createdAt) => ({
+        createAttemptId: id, createdAt, updatedAt: createdAt, edited: false, editReason: null,
+        desc: data.desc, valor: data.valor, dateISO: data.dateISO,
+      }));
     },
+    pending: () => durableCreateManager.pending('entradas'),
+    retry: (id) => durableCreateManager.retry('entradas', id),
     async update(fsId, vm) {
       if (!fsId) return;
       await entradasService.update(fsId, vmToEdit(vm));

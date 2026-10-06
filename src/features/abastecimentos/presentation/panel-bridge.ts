@@ -9,6 +9,9 @@ import { abastecimentosService } from '../index';
 import type { Abastecimento, EditAbastecimento, NewAbastecimento } from '../index';
 import type { LoadResult } from '../../../shared/application/load-result';
 import { loadOk, loadFail } from '../../../shared/application/load-result';
+import { computeLiters } from '../domain/abastecimento';
+import { durableCreateManager } from '../../../shared/infrastructure/durable-create-runtime';
+import type { DurableCreateAttempt, DurableCreateResult } from '../../../shared/application/durable-create-manager';
 
 /** Formato do registro como o monólito o mantém em `refuels`. */
 interface RefuelVM {
@@ -39,7 +42,9 @@ declare global {
   interface Window {
     /** Chamado pelo monólito ao criar/editar/excluir um abastecimento. */
     __motoboyAbastecimentos?: {
-      add(vm: RefuelVM): Promise<string | null>;
+      prepare(vm: RefuelVM): DurableCreateAttempt;
+      pending(): DurableCreateAttempt[];
+      retry(id: string): Promise<DurableCreateResult>;
       update(fsId: string | null | undefined, vm: RefuelVM): Promise<void>;
       remove(fsId: string | null | undefined): Promise<void>;
     };
@@ -51,15 +56,17 @@ declare global {
 /** Instala o write-through para o monólito usar (deve rodar cedo, no boot). */
 export function installAbastecimentosBridge(): void {
   window.__motoboyAbastecimentos = {
-    async add(vm) {
-      try {
-        const created = await abastecimentosService.add(vmToNew(vm));
-        return created.id;
-      } catch (error) {
-        console.error('[Abastecimentos] Erro ao adicionar:', error);
-        return null; // offline/erro: fica só no cache local
-      }
+    prepare(vm) {
+      const data = vmToNew(vm);
+      return durableCreateManager.prepare('abastecimentos', (id, createdAt) => ({
+        createAttemptId: id, createdAt, updatedAt: createdAt, edited: false, editReason: null,
+        dateISO: data.dateISO, location: data.location, paidValue: data.paidValue,
+        pricePerLiter: data.pricePerLiter, liters: computeLiters(data.paidValue, data.pricePerLiter),
+        odometer: data.odometer ?? null,
+      }));
     },
+    pending: () => durableCreateManager.pending('abastecimentos'),
+    retry: (id) => durableCreateManager.retry('abastecimentos', id),
     async update(fsId, vm) {
       if (!fsId) return;
       await abastecimentosService.update(fsId, vmToEdit(vm));

@@ -8,6 +8,8 @@ import { manutencoesService } from '../index';
 import type { EditManutencao, Manutencao, NewManutencao } from '../index';
 import type { LoadResult } from '../../../shared/application/load-result';
 import { loadOk, loadFail } from '../../../shared/application/load-result';
+import { durableCreateManager } from '../../../shared/infrastructure/durable-create-runtime';
+import type { DurableCreateAttempt, DurableCreateResult } from '../../../shared/application/durable-create-manager';
 
 /** Formato do registro como o monólito mantém em `maintenances`. */
 interface MaintenanceVM {
@@ -37,7 +39,9 @@ function vmToEdit(vm: MaintenanceVM): EditManutencao {
 declare global {
   interface Window {
     __motoboyManutencoes?: {
-      add(vm: MaintenanceVM): Promise<string | null>;
+      prepare(vm: MaintenanceVM): DurableCreateAttempt;
+      pending(): DurableCreateAttempt[];
+      retry(id: string): Promise<DurableCreateResult>;
       update(fsId: string | null | undefined, vm: MaintenanceVM): Promise<void>;
       remove(fsId: string | null | undefined): Promise<void>;
     };
@@ -47,15 +51,16 @@ declare global {
 
 export function installManutencoesBridge(): void {
   window.__motoboyManutencoes = {
-    async add(vm) {
-      try {
-        const created = await manutencoesService.add(vmToNew(vm));
-        return created.id;
-      } catch (error) {
-        console.error('[Manutenções] Erro ao adicionar:', error);
-        return null;
-      }
+    prepare(vm) {
+      const data = vmToNew(vm);
+      return durableCreateManager.prepare('manutencoes', (id, createdAt) => ({
+        createAttemptId: id, createdAt, updatedAt: createdAt, edited: false, editReason: null,
+        category: data.category, desc: data.desc, valor: data.valor,
+        km: data.km ?? null, dateISO: data.dateISO,
+      }));
     },
+    pending: () => durableCreateManager.pending('manutencoes'),
+    retry: (id) => durableCreateManager.retry('manutencoes', id),
     async update(fsId, vm) {
       if (!fsId) return;
       await manutencoesService.update(fsId, vmToEdit(vm));

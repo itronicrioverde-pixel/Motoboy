@@ -8,6 +8,7 @@
  *
  * Chamadas consecutivas do mesmo usuário resultam em apenas uma gravação
  * com o snapshot mais recente (debounce padrão com clear/reset).
+ * Se já existe gravação em voo, o próximo snapshot espera a conclusão dela.
  *
  * Em falha, preserva o snapshot e UID para retry. O chamador pode chamar
  * retry() para reenviar. Duas chamadas de retry() não criam duas gravações.
@@ -19,6 +20,7 @@
  */
 
 import { doc, setDoc } from 'firebase/firestore';
+import type { DocumentReference } from 'firebase/firestore';
 import { db } from '../../config/firebase.js';
 import { currentUid } from '../../features/auth/application/auth-service';
 import type { SyncGate } from '../application/sync-gate';
@@ -33,6 +35,7 @@ export interface FirestoreWriterOptions {
   readonly gate: SyncGate;
   readonly debounceMs?: number;
   readonly onError?: (error: unknown) => void;
+  readonly persist?: (ref: DocumentReference, snapshot: Record<string, unknown>) => Promise<unknown>;
 }
 
 /**
@@ -40,52 +43,82 @@ export interface FirestoreWriterOptions {
  *
  * @param pathBuilder  Função que retorna os segmentos do caminho do documento.
  *                     Recebe o UID capturado no agendamento.
- * @param options      Opções: gate, debounceMs, onError callback.
+ * @param options      Opções: gate, debounceMs, onError e persistência específica.
  */
 export function createFirestoreWriter(
   pathBuilder: (uid: string) => string[],
   options: FirestoreWriterOptions,
 ): FirestoreWriteHandle {
-  const { gate, debounceMs = 500, onError } = options;
+  const { gate, debounceMs = 500, onError, persist } = options;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let scheduledUid: string | null = null;
   let scheduledSnapshot: Record<string, unknown> | null = null;
-  let retryPending = false;
+  let ready = false;
+  let inFlight = false;
+  let generation = 0;
 
-  function cancel(): void {
+  function clearPending(): void {
     if (timer !== null) {
       clearTimeout(timer);
       timer = null;
     }
     scheduledUid = null;
     scheduledSnapshot = null;
-    retryPending = false;
+    ready = false;
   }
 
-  function executeWrite(uidAtSchedule: string, snap: Record<string, unknown>): void {
-    const uidNow = currentUid();
-    if (!uidNow || uidNow !== uidAtSchedule) return;
-    if (!gate.isOpen) return;
+  function cancel(): void {
+    generation += 1;
+    clearPending();
+  }
 
-    const segments = pathBuilder(uidNow);
-    const ref = doc(db, segments.join('/'));
-    setDoc(ref, snap ?? {}, { merge: true })
+  function flush(): void {
+    if (inFlight || !ready || !scheduledUid || !scheduledSnapshot) return;
+    const uidNow = currentUid();
+    if (!uidNow || uidNow !== scheduledUid || !gate.isOpen) {
+      clearPending();
+      return;
+    }
+
+    const uidAtSchedule = scheduledUid;
+    const snap = scheduledSnapshot;
+    const writeGeneration = generation;
+    clearPending();
+    inFlight = true;
+    let write: Promise<unknown>;
+    try {
+      const segments = pathBuilder(uidNow);
+      const ref = doc(db, segments.join('/'));
+      write = persist ? persist(ref, snap) : setDoc(ref, snap, { merge: true });
+    } catch (error) {
+      // Uma persistência específica também pode falhar antes de devolver Promise.
+      write = Promise.reject(error);
+    }
+    write
       .then(() => {
-        scheduledUid = null;
-        scheduledSnapshot = null;
-        retryPending = false;
+        inFlight = false;
+        // Um agendamento feito durante esta escrita continua intacto.
+        if (ready) flush();
       })
       .catch(function (err) {
+        inFlight = false;
+        // Só restaura o snapshot falho quando nenhum mais novo o substituiu.
+        if (!scheduledSnapshot && generation === writeGeneration) {
+          scheduledUid = uidAtSchedule;
+          scheduledSnapshot = snap;
+          ready = false;
+        }
         console.error('[FirestoreWriter] Erro ao salvar:', err);
-        retryPending = false;
         if (onError) onError(err);
+        if (ready) flush();
       });
   }
 
   function schedule(snapshot: Record<string, unknown>): void {
     if (!gate.isOpen) return;
 
-    cancel();
+    generation += 1;
+    clearPending();
 
     const uid = currentUid();
     if (!uid) return;
@@ -95,29 +128,24 @@ export function createFirestoreWriter(
 
     timer = setTimeout(function () {
       timer = null;
-      const uidAtSchedule = scheduledUid;
-      const snap = scheduledSnapshot;
-
-      if (!uidAtSchedule || !snap) return;
-
-      executeWrite(uidAtSchedule, snap);
+      ready = true;
+      flush();
     }, debounceMs);
   }
 
   function retry(): void {
-    if (retryPending) return;
+    if (inFlight || timer !== null) return;
     if (!scheduledUid || !scheduledSnapshot) return;
     if (!gate.isOpen) return;
 
     const uidNow = currentUid();
     if (!uidNow || uidNow !== scheduledUid) {
-      scheduledUid = null;
-      scheduledSnapshot = null;
+      clearPending();
       return;
     }
 
-    retryPending = true;
-    executeWrite(scheduledUid, scheduledSnapshot);
+    ready = true;
+    flush();
   }
 
   return { cancel, schedule, retry };

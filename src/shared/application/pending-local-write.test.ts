@@ -186,7 +186,7 @@ describe('runRemoteWrite — update/remove aguardando confirmação', () => {
 });
 
 describe('mergeRemoteWithPending — recarga não apaga escrita pendente', () => {
-  type Veiculo = { fsId?: string | null; syncState: LocalWriteStatus; desc?: string };
+  type Veiculo = { fsId?: string | null; pendingCreateId?: string; syncState: LocalWriteStatus; desc?: string };
   const remote = (fsId: string): Veiculo => ({ fsId, syncState: 'saved' });
 
   it('preserva registros locais sem id remoto (pendente/falhou) após uma recarga', () => {
@@ -221,5 +221,14 @@ describe('mergeRemoteWithPending — recarga não apaga escrita pendente', () =>
   it('não preserva registros locais confirmados fora do remoto (removidos em outro aparelho)', () => {
     const merged = mergeRemoteWithPending<Veiculo>([], [{ fsId: 'gone', syncState: 'saved' }]);
     expect(merged).toHaveLength(0);
+  });
+
+  it('resposta perdida: mantém apenas a tentativa visível até retry confirmar o ID remoto', () => {
+    const pending: Veiculo = { fsId: null, pendingCreateId: 'stable-id', syncState: 'awaiting', desc: 'não confirmado' };
+    const merged = mergeRemoteWithPending<Veiculo>(
+      [remote('stable-id'), remote('outro-id')],
+      [pending],
+    );
+    expect(merged).toEqual([remote('outro-id'), pending]);
   });
 });

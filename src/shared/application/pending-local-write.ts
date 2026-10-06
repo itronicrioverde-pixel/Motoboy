@@ -4,8 +4,8 @@
  *
  * O painel mantém em memória/localStorage a fonte de verdade da UI enquanto o
  * Firestore é a persistência remota. Este módulo (sem Firebase, DOM ou
- * localStorage) centraliza as regras dessas transições para abastecimentos,
- * manutenções e entradas manuais:
+ * localStorage) permanece no fluxo legado de Jornada. Abastecimentos,
+ * manutenções e entradas manuais usam durable-create-manager:
  *  - só confirma "salvo" quando o id remoto chega;
  *  - marca "falhou" sem descartar o registro nem avisar sucesso;
  *  - protege contra exclusão durante uma criação ainda pendente (limpeza de
@@ -14,16 +14,16 @@
  *  - mescla a carga remota preservando as pendências locais (recarga
  *    concorrente com uma gravação em andamento).
  *
- * Nunca faz retry que crie registros duplicados: quem chama é responsável por
- * bloquear o reenvio (lock) e por substituir o registro no lugar (sem novo
- * insert) quando o usuário tentar de novo.
+ * O settleLocalAdd não oferece identidade durável após recarga. Não o use
+ * em novas criações financeiras; nelas a tentativa é persistida antes do envio.
  */
 
-export type LocalWriteStatus = 'saved' | 'pending' | 'failed';
+export type LocalWriteStatus = 'saved' | 'pending' | 'awaiting' | 'failed';
 
 export interface LocalSyncRecord {
   fsId?: string | null;
   syncState?: LocalWriteStatus;
+  pendingCreateId?: string;
 }
 
 export interface LocalWriteCallbacks<T extends LocalSyncRecord> {
@@ -126,5 +126,6 @@ export function mergeRemoteWithPending<T extends LocalSyncRecord>(
   local: T[],
 ): T[] {
   const preserved = local.filter((item) => !(typeof item.fsId === 'string' && item.fsId));
-  return [...remote, ...preserved];
+  const pendingIds = new Set(preserved.map((item) => item.pendingCreateId).filter(Boolean));
+  return [...remote.filter((item) => !item.fsId || !pendingIds.has(item.fsId)), ...preserved];
 }

@@ -86,6 +86,34 @@ describe('FirestoreWriter', () => {
         { merge: true },
       );
     });
+
+    it('serializa gravações em voo e preserva o snapshot agendado depois', async () => {
+      const gate = createTestGate();
+      const writer = createFirestoreWriter(
+        (uid) => ['users', uid, 'moto', 'data'],
+        { gate },
+      );
+      let completeFirst!: () => void;
+      mockSetDoc.mockImplementationOnce(() => new Promise<void>((resolve) => {
+        completeFirst = resolve;
+      }));
+
+      writer.schedule({ currentKm: 100 });
+      vi.advanceTimersByTime(500);
+      writer.schedule({ currentKm: 200 });
+      vi.advanceTimersByTime(500);
+
+      // O segundo snapshot espera o primeiro terminar para não ser sobrescrito.
+      expect(mockSetDoc).toHaveBeenCalledTimes(1);
+      completeFirst();
+      await vi.runAllTimersAsync();
+      expect(mockSetDoc).toHaveBeenCalledTimes(2);
+      expect(mockSetDoc).toHaveBeenLastCalledWith(
+        expect.objectContaining({ _path: 'users/uid-1/moto/data' }),
+        { currentKm: 200 },
+        { merge: true },
+      );
+    });
   });
 
   describe('UID capture', () => {
@@ -208,9 +236,48 @@ describe('FirestoreWriter', () => {
         { merge: true },
       );
     });
+
+    it('cancel durante escrita em voo impede retry após falha daquela escrita', async () => {
+      const writer = createFirestoreWriter(
+        (uid) => ['users', uid, 'moto', 'data'],
+        { gate: createTestGate() },
+      );
+      let failFirst!: (error: Error) => void;
+      mockSetDoc.mockImplementationOnce(() => new Promise<void>((_resolve, reject) => {
+        failFirst = reject;
+      }));
+
+      writer.schedule({ currentKm: 100 });
+      vi.advanceTimersByTime(500);
+      writer.cancel();
+      failFirst(new Error('network'));
+      await vi.runAllTimersAsync();
+      writer.retry();
+      await vi.runAllTimersAsync();
+
+      expect(mockSetDoc).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('pathBuilder', () => {
+    it('permite persistência específica sem usar setDoc genérico', async () => {
+      const persist = vi.fn().mockResolvedValue(undefined);
+      const writer = createFirestoreWriter(
+        (uid) => ['users', uid, 'moto', 'data'],
+        { gate: createTestGate(), persist },
+      );
+
+      writer.schedule({ currentKm: 2000 });
+      vi.advanceTimersByTime(500);
+      await vi.runAllTimersAsync();
+
+      expect(persist).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ _path: 'users/uid-1/moto/data' }),
+        { currentKm: 2000 },
+      );
+      expect(mockSetDoc).not.toHaveBeenCalled();
+    });
+
     it('constrói caminho correto para clientes', () => {
       const gate = createTestGate();
       const writer = createFirestoreWriter(
@@ -300,6 +367,35 @@ describe('FirestoreWriter', () => {
   });
 
   describe('retry', () => {
+    it('erro síncrono da persistência específica preserva snapshot para retry', async () => {
+      const persist = vi.fn()
+        .mockImplementationOnce(() => { throw new Error('snapshot inválido'); })
+        .mockResolvedValueOnce(undefined);
+      const onError = vi.fn();
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const writer = createFirestoreWriter(
+          (uid) => ['users', uid, 'moto', 'data'],
+          { gate: createTestGate(), persist, onError },
+        );
+
+        writer.schedule({ currentKm: 2000 });
+        expect(() => vi.advanceTimersByTime(500)).not.toThrow();
+        await vi.runAllTimersAsync();
+        expect(onError).toHaveBeenCalledWith(expect.any(Error));
+
+        writer.retry();
+        await vi.runAllTimersAsync();
+        expect(persist).toHaveBeenCalledTimes(2);
+        expect(persist).toHaveBeenNthCalledWith(2,
+          expect.objectContaining({ _path: 'users/uid-1/moto/data' }),
+          { currentKm: 2000 },
+        );
+      } finally {
+        consoleSpy.mockRestore();
+      }
+    });
+
     it('retry reenvia snapshot após falha', async () => {
       const gate = createTestGate();
       const writer = createFirestoreWriter(
