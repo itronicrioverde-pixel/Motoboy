@@ -19,6 +19,25 @@ com `projectId` iniciado por `demo-`; não são usados no build de produção.
 As contas criadas nesse ambiente são descartáveis e não substituem o teste
 em dois dispositivos/contas do projeto de beta.
 
+### Como abrir esta revisão no celular, sem deploy
+
+1. No checkout `review/beta-preparacao`, configure `.env.local` com os seis
+   valores `VITE_FIREBASE_*` do **projeto beta** indicados em `.env.example`.
+   O arquivo é ignorado pelo Git; não envie seus valores no relato do teste.
+   Use duas contas descartáveis e confirme que pertencem ao projeto beta.
+2. No computador, execute `npm run dev -- --host 0.0.0.0`. Com o celular na
+   mesma rede Wi-Fi, abra `http://IP-DO-COMPUTADOR:5173/` (ou a porta que o
+   Vite imprimir). Use apenas a rede local de confiança e encerre o servidor
+   após o ensaio. Não é necessário fazer deploy de regras ou da aplicação.
+3. Execute os passos 1–4 abaixo com os dois usuários de teste. Registre
+   aparelho, navegador, data, número do passo, **passou/falhou** e, em falha,
+   texto exibido e captura de tela. Identifique as contas como A/B; não envie
+   senhas, chaves Firebase nem dados pessoais no relato.
+
+Se a tela de login abrir mas não autenticar, confira primeiro a configuração
+Firebase do projeto beta e a conectividade do celular; registre o erro antes
+de alterar qualquer regra ou dado.
+
 ---
 
 ## 1. Autenticação e isolamento por UID (não coberto por teste)
