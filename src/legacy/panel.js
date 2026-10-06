@@ -1,11 +1,10 @@
 import { Chart } from 'chart.js/auto';
 import { showToast } from '../shared/presentation/notifications/index';
-import { db } from '../config/firebase.js';
-import { doc, setDoc } from 'firebase/firestore';
 import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
 import { clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
 import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
+import { persistMotoSnapshot } from '../features/moto/infrastructure/moto-transaction-writer';
 import { settleLocalAdd, mergeRemoteWithPending } from '../shared/application/pending-local-write';
 import { applyReceiptResult } from '../features/customers/application/apply-receipt-result';
 import { createReceiptSubmissionManager } from '../features/customers/application/receipt-submission-manager';
@@ -18,15 +17,23 @@ import { applyRouteFinancialPendings } from '../features/rotas/infrastructure/cl
 import { computeEstimatedLiters, computeEstimatedCost } from '../features/jornada/domain/jornada';
 import { jornadaStartPlan } from '../features/jornada/application/jornada-start-plan';
 import { resolveJornadaCloseReferences } from '../features/jornada/application/jornada-close-form';
+import { listJornadaHistory, jornadaMoment } from '../features/jornada/presentation/jornada-history';
+import { mergeJornadaWithRemote } from '../features/jornada/presentation/jornada-merge';
+import { createLocalJornadaAttemptStore } from '../features/jornada/infrastructure/local-jornada-attempt-store';
+import { parseJornadaFormValue } from '../features/jornada/presentation/jornada-form-values';
+import { monthlyRefuelTotal } from '../features/abastecimentos/application/monthly-refuel-total';
+import { jornadaOpeningId } from '../features/jornada/application/jornada-opening-id';
+import { generateUuid } from '../shared/infrastructure/random-id';
 
-export function bootstrapPanel() {
+export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
   // ---------- estado local do aplicativo ----------
   const APP_NOW = new Date();
   // A chave v2 inicia uma base limpa e mantém a versão antiga recuperável no navegador.
   const LOCAL_STATE_KEY = 'motoboy-front-etapa1-v2-clean';
-  let localStorageAvailable = true;
+  let localStorageAvailable = !ignoreLocalCache;
 
   function readLocalState(){
+    if(ignoreLocalCache) return {};
     try{
       const saved = localStorage.getItem(LOCAL_STATE_KEY);
       return saved ? JSON.parse(saved) : {};
@@ -190,8 +197,65 @@ export function bootstrapPanel() {
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#039;');
   }
-  let refuels = Array.isArray(localState.refuels) ? localState.refuels : [];
-  let jornadas = Array.isArray(localState.jornadas) ? localState.jornadas : [];
+  function restoreCreateAttempts(cached, bridge, toRecord){
+    let attempts;
+    try {
+      attempts = bridge ? bridge.pending() : [];
+    } catch(error) {
+      console.error('[Criações pendentes] Armazenamento inacessível; cache preservado:', error);
+      return cached.map(item => item.pendingCreateId ? { ...item, syncState:'failed' } : item);
+    }
+    const durableIds = new Set(attempts.map(attempt => attempt.id));
+    const kept = cached.filter(item => !item.pendingCreateId || durableIds.has(item.pendingCreateId));
+    attempts.forEach(attempt => {
+      const record = toRecord(attempt);
+      const index = kept.findIndex(item => item.pendingCreateId === attempt.id);
+      if(index >= 0) kept[index] = record;
+      else kept.unshift(record);
+    });
+    return kept;
+  }
+  function pendingRefuelToVM(attempt){
+    const p = attempt.payload;
+    return {
+      fsId:null, pendingCreateId:attempt.id, pendingUid:attempt.uid, syncState:'awaiting',
+      local:p.location, quando:dateLabelFromISO(p.dateISO),
+      litros:p.liters.toFixed(1).replace('.', ',') + ' L', litrosValue:p.liters,
+      valor:p.paidValue, pricePerLiter:p.pricePerLiter, odometer:p.odometer, dateISO:p.dateISO
+    };
+  }
+  let refuels = restoreCreateAttempts(
+    Array.isArray(localState.refuels) ? localState.refuels : [],
+    window.__motoboyAbastecimentos, pendingRefuelToVM
+  );
+  const jornadaAttemptStore = ignoreLocalCache ? null : createLocalJornadaAttemptStore(localStorage);
+  function restoreJornadaAttempts(cached){
+    if(!jornadaAttemptStore || !currentUid()) return cached;
+    try{
+      const uid = currentUid();
+      const restored = cached.slice();
+      const durable = jornadaAttemptStore.list(uid);
+      restored.filter(item => !item.fsId && item.status === 'open').forEach(item => {
+        if(item.pendingCreateId && durable.some(saved => saved.pendingCreateId === item.pendingCreateId)) return;
+        if(!item.pendingCreateId) item.pendingCreateId = jornadaOpeningId(item);
+        item.pendingUid = uid;
+        item.syncState = 'failed';
+        jornadaAttemptStore.put(item);
+        durable.push(item);
+      });
+      durable.forEach(item => {
+        const index = restored.findIndex(cachedItem => cachedItem.pendingCreateId === item.pendingCreateId);
+        const retryable = { ...item, syncState:'failed' };
+        if(index >= 0) restored[index] = retryable;
+        else restored.unshift(retryable);
+      });
+      return restored;
+    }catch(error){
+      console.error('[Jornada] Tentativas locais indisponíveis:', error);
+      return cached;
+    }
+  }
+  let jornadas = restoreJornadaAttempts(Array.isArray(localState.jornadas) ? localState.jornadas : []);
 
   const fuelIcon = `<svg class="icon" viewBox="0 0 24 24"><path d="M4 21V6a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v15"/><path d="M4 11h8"/><path d="M14 8h2.5L19 11v6a1.5 1.5 0 0 1-3 0v-2a1 1 0 0 0-1-1h-1"/><path d="M2 21h14"/></svg>`;
   const wrenchIcon = `<svg class="icon" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.7 2.7-2-2Z"/></svg>`;
@@ -279,19 +343,23 @@ export function bootstrapPanel() {
     if(value === null || value === undefined || !Number.isFinite(Number(value))) return '';
     return Number(value).toFixed(digits).replace('.', ',');
   }
-  function recordActionsHTML(kind, index, label){
+  function recordActionsHTML(kind, index, label, record){
     const safeLabel = safeText(label);
+    if(record && record.pendingCreateId){
+      return `<div class="record-actions"><button type="button" class="record-action-btn retry" data-record-action="retry" data-record-kind="${kind}" data-index="${index}" aria-label="Tentar novamente ${safeLabel}">Tentar novamente</button></div>`;
+    }
     return `<div class="record-actions">
       <button type="button" class="record-action-btn edit" data-record-action="edit" data-record-kind="${kind}" data-index="${index}" aria-label="Editar ${safeLabel}">${editIcon}</button>
       <button type="button" class="record-action-btn delete" data-record-action="delete" data-record-kind="${kind}" data-index="${index}" aria-label="Excluir ${safeLabel}">${trashIcon}</button>
     </div>`;
   }
-  function wireRecordActions(container, onEdit, onDelete){
+  function wireRecordActions(container, onEdit, onDelete, onRetry){
     container.querySelectorAll('[data-record-action]').forEach(button => {
       button.addEventListener('click', () => {
         const index = Number(button.dataset.index);
         if(button.dataset.recordAction === 'edit') onEdit(index);
         if(button.dataset.recordAction === 'delete') onDelete(index);
+        if(button.dataset.recordAction === 'retry' && onRetry) onRetry(index);
       });
     });
   }
@@ -300,14 +368,46 @@ export function bootstrapPanel() {
     const status = document.getElementById('billingStorageStatus');
     if(!status) return;
     status.textContent = localStorageAvailable
-      ? 'O novo mês começa em zero e o histórico fica salvo neste dispositivo.'
-      : 'O navegador bloqueou o armazenamento local. Os dados durarão somente enquanto esta página estiver aberta.';
+      ? 'O novo mês começa em zero. Registros confirmados permanecem na sua conta.'
+      : 'Armazenamento local indisponível. Confira a conexão antes de registrar novos valores.';
   }
 
+  let motoRetryTimer = null;
+  let motoSyncErrorShown = false;
+  function scheduleMotoRetry(){
+    if(motoRetryTimer !== null) return;
+    motoRetryTimer = setTimeout(() => {
+      motoRetryTimer = null;
+      if(navigator.onLine){
+        motoWriter.retry();
+      } else {
+        scheduleMotoRetry();
+      }
+    }, 5000);
+  }
   const motoWriter = createFirestoreWriter(
     (uid) => ['users', uid, 'moto', 'data'],
-    { gate: motoHydrated, onError(err){ showToast('Erro ao sincronizar dados da moto no servidor.', {kind:'error'}); } },
+    {
+      gate: motoHydrated,
+      persist: async (ref, snapshot) => {
+        const saved = await persistMotoSnapshot(ref, snapshot);
+        motoSyncErrorShown = false;
+        if(motoRetryTimer !== null){ clearTimeout(motoRetryTimer); motoRetryTimer = null; }
+        window.__applyRemoteMoto?.(saved);
+      },
+      onError(){
+        if(!motoSyncErrorShown){
+          showToast('Erro ao sincronizar dados da moto. A tentativa será repetida quando houver conexão.', {kind:'error'});
+          motoSyncErrorShown = true;
+        }
+        scheduleMotoRetry();
+      },
+    },
   );
+  window.addEventListener('online', () => {
+    if(motoRetryTimer !== null){ clearTimeout(motoRetryTimer); motoRetryTimer = null; }
+    motoWriter.retry();
+  });
   function saveMotoToFirestore(){
     if(!motoHydrated.isOpen) return;
     motoWriter.schedule({
@@ -318,6 +418,11 @@ export function bootstrapPanel() {
   }
 
   function saveLocalState(){
+    if(ignoreLocalCache){
+      localStorageAvailable = false;
+      updateStorageStatus();
+      return;
+    }
     try{
       localStorage.setItem(LOCAL_STATE_KEY, JSON.stringify({
         refuels,
@@ -419,15 +524,16 @@ export function bootstrapPanel() {
         </div>
         <div class="record-side">
           <div class="amount">${fmtBRL(r.valor)}</div>
-          ${withActions ? recordActionsHTML('refuel', refuelIndex, 'abastecimento em ' + r.local) : ''}
+          ${withActions ? recordActionsHTML('refuel', refuelIndex, 'abastecimento em ' + r.local, r) : ''}
         </div>
       </div>
     `}).join('');
-    if(withActions) wireRecordActions(el, editRefuel, deleteRefuel);
+    if(withActions) wireRecordActions(el, editRefuel, deleteRefuel, retryRefuel);
   }
-  function refuelTotal(){ return refuels.reduce((s, r) => s + r.valor, 0); }
+  function confirmedRecords(records){ return records.filter(item => !item.pendingCreateId); }
+  function refuelTotal(){ return monthlyRefuelTotal(confirmedRecords(refuels), currentMonthKey()); }
   function latestRefuelPrice(){
-    const latest = refuels.find(item => item.litrosValue > 0 && item.valor > 0);
+    const latest = confirmedRecords(refuels).find(item => item.litrosValue > 0 && item.valor > 0);
     return latest ? (latest.pricePerLiter || latest.valor / latest.litrosValue) : null;
   }
   function localDateFromISO(iso){
@@ -450,7 +556,7 @@ export function bootstrapPanel() {
     periodEnd.setDate(periodEnd.getDate() + 7);
     const counts = [0, 0, 0, 0];
 
-    refuels.forEach(item => {
+    confirmedRecords(refuels).forEach(item => {
       const date = localDateFromISO(item.dateISO);
       if(!date || date < firstWeekStart || date >= periodEnd) return;
       const elapsedDays = Math.floor((date - firstWeekStart) / 86400000);
@@ -515,7 +621,7 @@ export function bootstrapPanel() {
     cutoff.setDate(cutoff.getDate() - 13);
     const latestByStation = {};
 
-    refuels.forEach(item => {
+    confirmedRecords(refuels).forEach(item => {
       const name = String(item.local || '').trim();
       const key = normalizedStationName(name);
       const date = localDateFromISO(item.dateISO);
@@ -542,7 +648,7 @@ export function bootstrapPanel() {
   function refreshStationNames(){
     const seen = {};
     const names = [];
-    refuels.forEach(item => {
+    confirmedRecords(refuels).forEach(item => {
       const key = normalizedStationName(item.local);
       if(!key || seen[key] || /nao informado/.test(key)) return;
       seen[key] = true;
@@ -714,33 +820,101 @@ export function bootstrapPanel() {
   }
   renderRefuelViews();
 
-  // ---------- confirmação de escrita: salvo / pendente / falhou ----------
-  // Locks anti duplo envio: enquanto uma gravação do fluxo está em voo, o
-  // próximo clique no Salvar/Excluir daquele mesmo fluxo é ignorado com aviso.
-  // O registro local fica "pendente" até o id remoto chegar; se a gravação
-  // falhar, vira "falhou" (Não salvo) e continua no painel para nova tentativa.
-  // Nenhum "salvo" é anunciado sem a confirmação remota.
+  // ---------- confirmação de escrita durável ----------
+  // Criações têm ID, UID e payload persistidos antes do envio; após falha ou
+  // recarga, o botão de retry reenvia a mesma tentativa. Edição e exclusão de
+  // registros confirmados continuam aguardando o remoto antes de mudar a UI.
   let refuelWriteBusy = false;
   let maintWriteBusy = false;
   let entryWriteBusy = false;
 
   function syncBadgeHTML(record){
     if(!record) return '';
+    if(record.pendingCreateId){
+      return record.syncState === 'pending'
+        ? ' <span class="sync-badge pending">Sincronizando</span>'
+        : record.syncState === 'failed'
+          ? ' <span class="sync-badge failure">Não confirmado</span>'
+          : ' <span class="sync-badge pending">Aguardando conexão</span>';
+    }
     if(record.syncState === 'failed') return ' <span class="sync-badge failure">Não salvo</span>';
     if(record.syncState === 'pending') return ' <span class="sync-badge pending">Sincronizando</span>';
     return '';
   }
 
+  const durableRetryUiInFlight = new WeakSet();
+  function retryDurableRecord(record, bridge, records, render, onConfirmed, onRemoved, onFailed, onSettled){
+    if(!record || !record.pendingCreateId || !bridge) return;
+    const id = record.pendingCreateId;
+    if(durableRetryUiInFlight.has(record)) return;
+    durableRetryUiInFlight.add(record);
+    record.syncState = 'pending';
+    saveLocalState();
+    render();
+    const waitingTimer = setTimeout(function(){
+      if(records.includes(record) && record.pendingCreateId === id && record.syncState === 'pending'){
+        record.syncState = 'awaiting';
+        saveLocalState();
+        render();
+      }
+    }, 4000);
+    Promise.resolve().then(() => bridge.retry(id))
+      .then(function(result){
+        if(record.pendingUid !== currentUid() || !records.includes(record)) return;
+        if(result === 'removed'){
+          onRemoved(record);
+          showToast('O registro já havia sido excluído no servidor. Não foi recriado.', {kind:'warning'});
+          return;
+        }
+        record.fsId = id;
+        delete record.pendingCreateId;
+        delete record.pendingUid;
+        record.syncState = 'saved';
+        onConfirmed(record);
+      })
+      .catch(function(error){
+        if(record.pendingUid !== currentUid() || !records.includes(record)) return;
+        record.syncState = 'failed';
+        saveLocalState();
+        render();
+        onFailed(error);
+      })
+      .finally(function(){
+        clearTimeout(waitingTimer);
+        durableRetryUiInFlight.delete(record);
+        if(onSettled) onSettled();
+      });
+  }
+  function retryRefuel(index){
+    const record = refuels[index];
+    const pendingId = record && record.pendingCreateId;
+    retryDurableRecord(record, window.__motoboyAbastecimentos, refuels, renderRefuelViews,
+      function(r){
+        applyRefuelDerivedAndRender(r);
+        if(refuelFormPendingCreateId === pendingId) resetRefuelForm();
+        refuelStatusToast(r, 'Abastecimento salvo');
+      },
+      function(r){
+        removeRefuelLocally(refuels.indexOf(r), r);
+        if(refuelFormPendingCreateId === pendingId) resetRefuelForm();
+      },
+      function(){ showToast('Abastecimento não confirmado. Confira a conexão e toque em Tentar novamente.', {kind:'error'}); },
+      function(){ refuelWriteBusy = false; }
+    );
+  }
+
   function refuelStatusToast(record, action){
     if(!record) return;
     const price = record.pricePerLiter || latestRefuelPrice();
-    const priceText = price ? ' O preço usado nas rotas agora é ' + fmtBRL(price) + ' por litro.' : '';
+    const priceText = price ? ' Preço de referência da gasolina: ' + fmtBRL(price) + ' por litro.' : '';
     showToast(`${action}.${priceText}`, {kind:'success'});
   }
 
   let editingRefuelIndex = null;
+  let refuelFormPendingCreateId = null;
   function resetRefuelForm(){
     editingRefuelIndex = null;
+    refuelFormPendingCreateId = null;
     document.getElementById('refuelLocation').value = '';
     document.getElementById('refuelLiterPriceInput').value = '';
     document.getElementById('refuelPaidValue').value = '';
@@ -770,6 +944,7 @@ export function bootstrapPanel() {
   function editRefuel(index){
     const item = refuels[index];
     if(!item) return;
+    if(item.pendingCreateId){ showToast('Confirme o abastecimento antes de editar.', {kind:'warning'}); return; }
     editingRefuelIndex = index;
     document.getElementById('refuelLocation').value = item.local === 'Posto não informado' ? '' : item.local;
     document.getElementById('refuelLiterPriceInput').value = editableNumber(refuelPricePerLiter(item), 2);
@@ -788,6 +963,7 @@ export function bootstrapPanel() {
     if(!ensureMotoInteractive()) return;
     const item = refuels[index];
     if(!item) return;
+    if(item.pendingCreateId){ showToast('Confirme o abastecimento antes de excluir.', {kind:'warning'}); return; }
     requestDeleteConfirmation(
       'Excluir abastecimento?',
       `${item.local} · ${fmtBRL(item.valor)}. O painel, o preço do litro e os gráficos serão recalculados.`,
@@ -814,8 +990,7 @@ export function bootstrapPanel() {
             .finally(function(){ refuelWriteBusy = false; });
           return;
         }
-        // Criação ainda pendente/falhou (sem fsId): remove só localmente. Se o
-        // documento remoto confirmar depois, o tombo remove o órfão.
+        // Apenas registro legado sem identidade durável cai neste caminho.
         removeRefuelLocally(currentIndex, item);
       }
     );
@@ -878,6 +1053,10 @@ export function bootstrapPanel() {
       showToast('Ainda guardando o abastecimento anterior. Aguarde a confirmação.', {kind:'warning'});
       return;
     }
+    if(refuelFormPendingCreateId){
+      retryRefuel(refuels.findIndex(item => item.pendingCreateId === refuelFormPendingCreateId));
+      return;
+    }
     const local = document.getElementById('refuelLocation').value.trim() || 'Posto não informado';
     const { liters, paid, price } = updateCalculatedRefuelLiters();
     if(!price || price <= 0 || !paid || paid <= 0){
@@ -891,11 +1070,17 @@ export function bootstrapPanel() {
       return;
     }
     const previous = editingRefuelIndex === null ? null : refuels[editingRefuelIndex];
+    if(previous && !previous.fsId){
+      showToast('Este abastecimento antigo não tem identidade remota segura para edição. Preserve o registro e confira a sincronização.', {kind:'warning'});
+      return;
+    }
     const chosenDateEl = document.getElementById('refuelDate');
     const chosenISO = readBrDateISO(chosenDateEl);
     if(!chosenISO){ showDateError(chosenDateEl, 'Informe uma data válida no formato DD/MM/AAAA.'); return; }
     if(chosenISO > localTodayISO()){ showDateError(chosenDateEl, 'A data não pode ser futura.', true); return; }
     clearDateError(chosenDateEl);
+    const wasEditing = editingRefuelIndex !== null;
+    const editReason = wasEditing ? (document.getElementById('refuelEditReason').value.trim() || null) : null;
     const record = {
       local,
       quando: dateLabelFromISO(chosenISO),
@@ -905,9 +1090,9 @@ export function bootstrapPanel() {
       pricePerLiter:price,
       odometer:odometer || null,
       dateISO: chosenISO,
+      editReason,
       fsId: previous ? (previous.fsId || null) : null
     };
-    const wasEditing = editingRefuelIndex !== null;
     const uidAtWrite = currentUid();
     if(wasEditing && record.fsId){
       // Edição de registro já confirmado no Firestore: só aplica na UI depois
@@ -922,7 +1107,7 @@ export function bootstrapPanel() {
             { chave:'valor', rotulo:'Valor', tipo:'money' },
             { chave:'litrosValue', rotulo:'Litros', tipo:'text' },
             { chave:'odometer', rotulo:'Km do painel', tipo:'text' }
-          ], document.getElementById('refuelEditReason') ? document.getElementById('refuelEditReason').value : '');
+          ], editReason || '');
           refuels[editingRefuelIndex] = record;
           record.syncState = 'saved';
           applyRefuelDerivedAndRender(record);
@@ -942,42 +1127,27 @@ export function bootstrapPanel() {
         { chave:'valor', rotulo:'Valor', tipo:'money' },
         { chave:'litrosValue', rotulo:'Litros', tipo:'text' },
         { chave:'odometer', rotulo:'Km do painel', tipo:'text' }
-      ], document.getElementById('refuelEditReason') ? document.getElementById('refuelEditReason').value : '');
+      ], editReason || '');
       refuels[editingRefuelIndex] = record;
     }
-    else refuels.unshift(record);
-    // Novo ou retry de um registro ainda sem id remoto: fica "pendente" até o
-    // Firestore confirmar. O formulário não é descartado nem o sucesso é
-    // anunciado antes da confirmação.
-    record.syncState = 'pending';
-    applyRefuelDerivedAndRender(record);
+    else {
+      try {
+        const attempt = window.__motoboyAbastecimentos.prepare(record);
+        record.pendingCreateId = attempt.id;
+        record.pendingUid = attempt.uid;
+        refuelFormPendingCreateId = attempt.id;
+        document.getElementById('btnSaveRefuel').textContent = 'Tentar novamente';
+      } catch(error) {
+        showToast('Não foi possível guardar a tentativa neste dispositivo. Nada foi enviado; confira o armazenamento local.', {kind:'error'});
+        return;
+      }
+      refuels.unshift(record);
+    }
+    record.syncState = 'awaiting';
+    saveLocalState();
+    renderRefuelViews();
     refuelWriteBusy = true;
-    settleLocalAdd(record, function(r){
-      return window.__motoboyAbastecimentos ? window.__motoboyAbastecimentos.add(r) : undefined;
-    }, {
-      isPresent: (r) => refuels.indexOf(r) !== -1,
-      isSameOwner: () => uidAtWrite === currentUid(),
-      onPersistenceConfirmed(r, id){
-        r.fsId = id;
-        r.syncState = 'saved';
-        saveLocalState();
-        renderRefuelViews();
-        resetRefuelForm();
-        refuelStatusToast(r, 'Abastecimento salvo');
-      },
-      onPersistenceFailed(r){
-        r.syncState = 'failed';
-        const idx = refuels.indexOf(r);
-        if(idx >= 0) editingRefuelIndex = idx; // mantém o formulário carregado p/ tentar de novo
-        saveLocalState();
-        renderRefuelViews();
-        showToast('Não foi possível salvar o abastecimento no servidor. Ele ficou marcado como "Não salvo" e pode ser tentado de novo.', {kind:'error'});
-      },
-      onOrphanRemoval(remoteId){
-        if(window.__motoboyAbastecimentos) window.__motoboyAbastecimentos.remove(remoteId).catch(function(){});
-      },
-      onSettled(){ refuelWriteBusy = false; }
-    });
+    retryRefuel(refuels.indexOf(record));
   });
 
   // Ponte: recebe os abastecimentos do Firestore (dono atual) e re-renderiza.
@@ -1117,7 +1287,18 @@ export function bootstrapPanel() {
   // ---------- minha moto / manutenções ----------
   const DEFAULT_MOTO_KM = 0;
   let motoKm = Number(localState.motoKm) > 0 ? Number(localState.motoKm) : DEFAULT_MOTO_KM;
-  let maintenances = Array.isArray(localState.maintenances) ? localState.maintenances : [];
+  function pendingMaintenanceToVM(attempt){
+    const p = attempt.payload;
+    return {
+      fsId:null, pendingCreateId:attempt.id, pendingUid:attempt.uid, syncState:'awaiting',
+      category:p.category, desc:p.desc, valor:p.valor, km:p.km,
+      data:dateLabelFromISO(p.dateISO), dateISO:p.dateISO
+    };
+  }
+  let maintenances = restoreCreateAttempts(
+    Array.isArray(localState.maintenances) ? localState.maintenances : [],
+    window.__motoboyManutencoes, pendingMaintenanceToVM
+  );
   const expenseCategories = {
     maintenance:{ label:'Manutenção', tag:'maint', icon:wrenchIcon, needsDescription:true, fieldLabel:'O QUE VOCÊ CONSERTOU OU TROCOU?', placeholder:'Ex: Troca de óleo' },
     wash:{ label:'Lavagem', tag:'wash', icon:washIcon, needsDescription:false },
@@ -1136,8 +1317,8 @@ export function bootstrapPanel() {
   function fmtKm(km){ return km.toLocaleString('pt-BR') + ' km'; }
   function recalculateMotoKmFromRecords(){
     const recordedKm = [
-      ...refuels.map(item => Number(item.odometer) || 0),
-      ...maintenances.map(item => Number(item.km) || 0),
+      ...confirmedRecords(refuels).map(item => Number(item.odometer) || 0),
+      ...confirmedRecords(maintenances).map(item => Number(item.km) || 0),
       ...jornadas.map(item => Number(item.kmFinal ?? item.kmInicial) || 0)
     ];
     motoKm = Math.max(DEFAULT_MOTO_KM, ...recordedKm);
@@ -1172,7 +1353,7 @@ export function bootstrapPanel() {
     }
   };
 
-  function maintTotal(){ return maintenances.reduce((s, m) => s + m.valor, 0); }
+  function maintTotal(){ return confirmedRecords(maintenances).reduce((s, m) => s + m.valor, 0); }
 
   function renderMaint(){
     const list = document.getElementById('maintList');
@@ -1196,11 +1377,11 @@ export function bootstrapPanel() {
         </div>
         <div class="record-side">
           <div class="amount">${fmtBRL(m.valor)}</div>
-          ${recordActionsHTML('maintenance', index, 'gasto ' + m.desc)}
+          ${recordActionsHTML('maintenance', index, 'gasto ' + m.desc, m)}
         </div>
       </div>
     `}).join('');
-    wireRecordActions(list, editMaintenance, deleteMaintenance);
+    wireRecordActions(list, editMaintenance, deleteMaintenance, retryMaintenance);
   }
   renderMaint();
 
@@ -1259,6 +1440,7 @@ export function bootstrapPanel() {
   const maintModalCtl = wireModal('btnOpenMaint','maintModal','modalBackdrop','modalClose','maintCancel');
   const entradaModalCtl = wireModal('btnOpenEntrada','entradaModal','entradaBackdrop','entradaClose','entradaCancel');
   let editingMaintenanceIndex = null;
+  let maintenanceFormPendingCreateId = null;
   function setMaintFormError(message){
     const status = document.getElementById('maintFormMessage');
     status.textContent = message;
@@ -1286,6 +1468,7 @@ export function bootstrapPanel() {
   }
   function resetMaintenanceFormMode(){
     editingMaintenanceIndex = null;
+    maintenanceFormPendingCreateId = null;
     document.getElementById('maintModalTitle').textContent = 'Registrar gasto';
     document.getElementById('maintModalDesc').textContent = 'Manutenção, lavagem ou gasto da operação';
     document.getElementById('maintSave').textContent = 'Salvar gasto';
@@ -1302,6 +1485,7 @@ export function bootstrapPanel() {
   function editMaintenance(index){
     const item = maintenances[index];
     if(!item) return;
+    if(item.pendingCreateId){ showToast('Confirme o gasto antes de editar.', {kind:'warning'}); return; }
     editingMaintenanceIndex = index;
     document.getElementById('maintModalTitle').textContent = 'Editar gasto';
     document.getElementById('maintModalDesc').textContent = 'Corrija os dados deste registro';
@@ -1322,6 +1506,7 @@ export function bootstrapPanel() {
     if(!ensureMotoInteractive()) return;
     const item = maintenances[index];
     if(!item) return;
+    if(item.pendingCreateId){ showToast('Confirme o gasto antes de excluir.', {kind:'warning'}); return; }
     requestDeleteConfirmation(
       'Excluir gasto?',
       `${item.desc} · ${fmtBRL(item.valor)}. O financeiro será recalculado.`,
@@ -1363,6 +1548,26 @@ export function bootstrapPanel() {
     renderFaturamento();
     renderDashboard();
   }
+  function retryMaintenance(index){
+    const record = maintenances[index];
+    const pendingId = record && record.pendingCreateId;
+    retryDurableRecord(record, window.__motoboyManutencoes, maintenances, renderMaint,
+      function(){
+        applyMaintDerivedAndRender();
+        if(maintenanceFormPendingCreateId === pendingId){
+          maintModalCtl.close();
+          resetMaintenanceFormMode();
+        }
+        showToast('Gasto salvo.', {kind:'success'});
+      },
+      function(r){
+        removeMaintLocally(maintenances.indexOf(r), r);
+        if(maintenanceFormPendingCreateId === pendingId) resetMaintenanceFormMode();
+      },
+      function(){ setMaintFormError('Gasto não confirmado. Confira a conexão e toque em Tentar novamente.'); },
+      function(){ maintWriteBusy = false; }
+    );
+  }
   document.getElementById('maintCategory').addEventListener('change', updateMaintenanceCategoryUI);
   document.getElementById('btnOpenMaint').addEventListener('click', resetMaintenanceFormMode);
   document.getElementById('dashboardMaintShortcut').addEventListener('click', () => {
@@ -1375,6 +1580,10 @@ export function bootstrapPanel() {
     if(!ensureMotoInteractive()) return;
     if(maintWriteBusy){
       showToast('Ainda guardando o gasto anterior. Aguarde a confirmação.', {kind:'warning'});
+      return;
+    }
+    if(maintenanceFormPendingCreateId){
+      retryMaintenance(maintenances.findIndex(item => item.pendingCreateId === maintenanceFormPendingCreateId));
       return;
     }
     const category = normalizeExpenseCategory(document.getElementById('maintCategory').value);
@@ -1406,11 +1615,17 @@ export function bootstrapPanel() {
     }
     clearMaintFormError();
     const previous = editingMaintenanceIndex === null ? null : maintenances[editingMaintenanceIndex];
+    if(previous && !previous.fsId){
+      setMaintFormError('Este gasto antigo não tem identidade remota segura para edição. Preserve o registro e confira a sincronização.');
+      return;
+    }
     const maintDateEl = document.getElementById('maintDate');
     const maintISO = readBrDateISO(maintDateEl);
     if(!maintISO){ showDateError(maintDateEl, 'Informe uma data válida no formato DD/MM/AAAA.'); return; }
     if(maintISO > localTodayISO()){ showDateError(maintDateEl, 'A data não pode ser futura.', true); return; }
     clearDateError(maintDateEl);
+    const wasEditing = editingMaintenanceIndex !== null;
+    const editReason = wasEditing ? (document.getElementById('maintEditReason').value.trim() || null) : null;
     const record = {
       category,
       desc,
@@ -1418,9 +1633,9 @@ export function bootstrapPanel() {
       km:km || null,
       data: dateLabelFromISO(maintISO),
       dateISO: maintISO,
+      editReason,
       fsId: previous ? (previous.fsId || null) : null
     };
-    const wasEditing = editingMaintenanceIndex !== null;
     const uidAtWrite = currentUid();
     if(wasEditing && record.fsId){
       // Edição de registro já confirmado: só aplica na UI depois do remoto.
@@ -1433,7 +1648,7 @@ export function bootstrapPanel() {
             { chave:'desc', rotulo:'Descrição', tipo:'text' },
             { chave:'valor', rotulo:'Valor', tipo:'money' },
             { chave:'km', rotulo:'Km', tipo:'text' }
-          ], document.getElementById('maintEditReason') ? document.getElementById('maintEditReason').value : '');
+          ], editReason || '');
           maintenances[editingMaintenanceIndex] = record;
           record.syncState = 'saved';
           applyMaintDerivedAndRender();
@@ -1453,40 +1668,27 @@ export function bootstrapPanel() {
         { chave:'desc', rotulo:'Descrição', tipo:'text' },
         { chave:'valor', rotulo:'Valor', tipo:'money' },
         { chave:'km', rotulo:'Km', tipo:'text' }
-      ], document.getElementById('maintEditReason') ? document.getElementById('maintEditReason').value : '');
+      ], editReason || '');
       maintenances[editingMaintenanceIndex] = record;
     }
-    else maintenances.unshift(record);
-    record.syncState = 'pending';
-    applyMaintDerivedAndRender();
+    else {
+      try {
+        const attempt = window.__motoboyManutencoes.prepare(record);
+        record.pendingCreateId = attempt.id;
+        record.pendingUid = attempt.uid;
+        maintenanceFormPendingCreateId = attempt.id;
+        document.getElementById('maintSave').textContent = 'Tentar novamente';
+      } catch(error) {
+        setMaintFormError('Não foi possível guardar a tentativa neste dispositivo. Nada foi enviado.');
+        return;
+      }
+      maintenances.unshift(record);
+    }
+    record.syncState = 'awaiting';
+    saveLocalState();
+    renderMaint();
     maintWriteBusy = true;
-    settleLocalAdd(record, function(r){
-      return window.__motoboyManutencoes ? window.__motoboyManutencoes.add(r) : undefined;
-    }, {
-      isPresent: (r) => maintenances.indexOf(r) !== -1,
-      isSameOwner: () => uidAtWrite === currentUid(),
-      onPersistenceConfirmed(r, id){
-        r.fsId = id;
-        r.syncState = 'saved';
-        saveLocalState();
-        renderMaint();
-        maintModalCtl.close();
-        resetMaintenanceFormMode();
-        showToast('Gasto salvo.', {kind:'success'});
-      },
-      onPersistenceFailed(r){
-        r.syncState = 'failed';
-        const idx = maintenances.indexOf(r);
-        if(idx >= 0) editingMaintenanceIndex = idx;
-        saveLocalState();
-        renderMaint();
-        setMaintFormError('Não foi possível salvar no servidor. O registro ficou marcado como "Não salvo" e pode ser tentado de novo.');
-      },
-      onOrphanRemoval(remoteId){
-        if(window.__motoboyManutencoes) window.__motoboyManutencoes.remove(remoteId).catch(function(){});
-      },
-      onSettled(){ maintWriteBusy = false; }
-    });
+    retryMaintenance(maintenances.indexOf(record));
   });
 
   function applyMaintDerivedAndRender(){
@@ -1526,11 +1728,23 @@ export function bootstrapPanel() {
   };
 
   // ---------- faturamento: entradas + despesas ----------
-  let entradas = Array.isArray(localState.entradas) ? localState.entradas : [];
+  function pendingEntryToVM(attempt){
+    const p = attempt.payload;
+    return {
+      fsId:null, pendingCreateId:attempt.id, pendingUid:attempt.uid, syncState:'awaiting',
+      desc:p.desc, valor:p.valor, data:dateLabelFromISO(p.dateISO), dateISO:p.dateISO
+    };
+  }
+  let entradas = restoreCreateAttempts(
+    Array.isArray(localState.entradas) ? localState.entradas : [],
+    window.__motoboyEntradas, pendingEntryToVM
+  );
   let editingEntryIndex = null;
+  let entryFormPendingCreateId = null;
 
   function resetEntryFormMode(){
     editingEntryIndex = null;
+    entryFormPendingCreateId = null;
     document.getElementById('entradaModalTitle').textContent = 'Registrar entrada';
     document.getElementById('entradaModalDesc').textContent = 'Quanto você recebeu e de onde';
     document.getElementById('entradaSave').textContent = 'Salvar entrada';
@@ -1543,6 +1757,7 @@ export function bootstrapPanel() {
   function editEntry(index){
     const item = entradas[index];
     if(!item || item.routeId || item.clientName) return;
+    if(item.pendingCreateId){ showToast('Confirme a entrada antes de editar.', {kind:'warning'}); return; }
     editingEntryIndex = index;
     document.getElementById('entradaModalTitle').textContent = 'Editar entrada';
     document.getElementById('entradaModalDesc').textContent = 'Corrija a descrição ou o valor recebido';
@@ -1558,6 +1773,7 @@ export function bootstrapPanel() {
   function deleteEntry(index){
     const item = entradas[index];
     if(!item || item.routeId || item.clientName) return;
+    if(item.pendingCreateId){ showToast('Confirme a entrada antes de excluir.', {kind:'warning'}); return; }
     requestDeleteConfirmation(
       'Excluir entrada?',
       `${item.desc} · ${fmtBRL(item.valor)}. O painel e os gráficos serão recalculados.`,
@@ -1593,6 +1809,28 @@ export function bootstrapPanel() {
     renderFaturamento();
     renderDashboard();
   }
+  function retryEntry(index){
+    const record = entradas[index];
+    const pendingId = record && record.pendingCreateId;
+    retryDurableRecord(record, window.__motoboyEntradas, entradas, renderFaturamento,
+      function(){
+        saveLocalState();
+        renderFaturamento();
+        renderDashboard();
+        if(entryFormPendingCreateId === pendingId){
+          entradaModalCtl.close();
+          resetEntryFormMode();
+        }
+        showToast('Entrada salva.', {kind:'success'});
+      },
+      function(r){
+        removeEntryLocally(entradas.indexOf(r), r);
+        if(entryFormPendingCreateId === pendingId) resetEntryFormMode();
+      },
+      function(){ showToast('Entrada não confirmada. Confira a conexão e toque em Tentar novamente.', {kind:'error'}); },
+      function(){ entryWriteBusy = false; }
+    );
+  }
   document.getElementById('btnOpenEntrada').addEventListener('click', resetEntryFormMode);
 
   // Ponte: recebe as entradas do bridge (view models já mapeados, com a identidade
@@ -1603,12 +1841,13 @@ export function bootstrapPanel() {
   // substituídas pela cópia remota — evita recebimento duplicado após reidratação.
   window.__applyRemoteEntradas = function(remoto){
     if(!Array.isArray(remoto)) return;
+    const pendingIds = new Set(entradas.filter(e => e.pendingCreateId).map(e => e.pendingCreateId));
     const locaisPreservadas = entradas.filter(function(e){
       if(e.routeId) return true;
       if(!e.fsId && !e.receiptOperationId) return true;
       return false;
     });
-    entradas = remoto.concat(locaisPreservadas);
+    entradas = remoto.filter(e => !pendingIds.has(e.fsId)).concat(locaisPreservadas);
     entradas.sort(function(a,b){ return String(b.dateISO||'').localeCompare(String(a.dateISO||'')); });
     saveLocalState();
     renderFaturamento();
@@ -1672,12 +1911,12 @@ export function bootstrapPanel() {
     return items.filter(item => String(item.dateISO || '').startsWith(monthKey));
   }
   function entradaTotal(monthKey){
-    return monthRecords(entradas, monthKey).reduce((sum, item) => sum + item.valor, 0);
+    return monthRecords(confirmedRecords(entradas), monthKey).reduce((sum, item) => sum + item.valor, 0);
   }
 
   function getDespesas(monthKey){
-    const combustivel = monthRecords(refuels, monthKey).map(r => ({ tipo:'Combustível', tag:'fuel', desc:r.local, data:r.quando, valor:r.valor, dateISO:r.dateISO, icon:fuelIcon }));
-    const manutencao = monthRecords(maintenances, monthKey).map(m => {
+    const combustivel = monthRecords(confirmedRecords(refuels), monthKey).map(r => ({ tipo:'Combustível', tag:'fuel', desc:r.local, data:r.quando, valor:r.valor, dateISO:r.dateISO, icon:fuelIcon }));
+    const manutencao = monthRecords(confirmedRecords(maintenances), monthKey).map(m => {
       const category = expenseCategoryInfo(m);
       return { tipo:category.label, tag:category.tag, desc:m.desc, data:m.data, valor:m.valor, dateISO:m.dateISO, icon:category.icon };
     });
@@ -1890,11 +2129,11 @@ export function bootstrapPanel() {
           </div>
           <div class="record-side">
             <div class="amount green">+ ${fmtBRL(e.valor)}</div>
-            ${editable ? recordActionsHTML('entry', entryIndex, 'entrada ' + e.desc) : ''}
+            ${editable ? recordActionsHTML('entry', entryIndex, 'entrada ' + e.desc, e) : ''}
           </div>
         </div>
       `}).join('');
-    wireRecordActions(entradaListEl, editEntry, deleteEntry);
+    wireRecordActions(entradaListEl, editEntry, deleteEntry, retryEntry);
 
     const despesaListEl = document.getElementById('despesaList');
     despesaListEl.innerHTML = despesas.length === 0
@@ -1920,6 +2159,10 @@ export function bootstrapPanel() {
       showToast('Ainda guardando a entrada anterior. Aguarde a confirmação.', {kind:'warning'});
       return;
     }
+    if(entryFormPendingCreateId){
+      retryEntry(entradas.findIndex(item => item.pendingCreateId === entryFormPendingCreateId));
+      return;
+    }
     const desc = document.getElementById('entradaDesc').value.trim();
     const valor = parseBrazilianInput(document.getElementById('entradaValor').value);
 
@@ -1929,19 +2172,25 @@ export function bootstrapPanel() {
     }
 
     const previous = editingEntryIndex === null ? null : entradas[editingEntryIndex];
+    if(previous && !previous.fsId){
+      showToast('Esta entrada antiga não tem identidade remota segura para edição. Preserve o registro e confira a sincronização.', {kind:'warning'});
+      return;
+    }
     const entradaDateEl = document.getElementById('entradaDate');
     const entradaISO = readBrDateISO(entradaDateEl);
     if(!entradaISO){ showDateError(entradaDateEl, 'Informe uma data válida no formato DD/MM/AAAA.'); return; }
     if(entradaISO > localTodayISO()){ showDateError(entradaDateEl, 'A data não pode ser futura.', true); return; }
     clearDateError(entradaDateEl);
+    const wasEditing = editingEntryIndex !== null;
+    const editReason = wasEditing ? (document.getElementById('entradaEditReason').value.trim() || null) : null;
     const record = {
       desc,
       valor,
       data: dateLabelFromISO(entradaISO),
       dateISO: entradaISO,
+      editReason,
       fsId: previous ? (previous.fsId || null) : null
     };
-    const wasEditing = editingEntryIndex !== null;
     const uidAtWrite = currentUid();
     if(wasEditing && record.fsId){
       // Edição de entrada manual já confirmada: só aplica na UI depois do remoto.
@@ -1953,7 +2202,7 @@ export function bootstrapPanel() {
           registrarEdicao(record, previous, [
             { chave:'desc', rotulo:'Descrição', tipo:'text' },
             { chave:'valor', rotulo:'Valor', tipo:'money' }
-          ], document.getElementById('entradaEditReason') ? document.getElementById('entradaEditReason').value : '');
+          ], editReason || '');
           entradas[editingEntryIndex] = record;
           record.syncState = 'saved';
           saveLocalState();
@@ -1974,49 +2223,34 @@ export function bootstrapPanel() {
       registrarEdicao(record, previous, [
         { chave:'desc', rotulo:'Descrição', tipo:'text' },
         { chave:'valor', rotulo:'Valor', tipo:'money' }
-      ], document.getElementById('entradaEditReason') ? document.getElementById('entradaEditReason').value : '');
+      ], editReason || '');
       entradas[editingEntryIndex] = record;
     }
-    else entradas.unshift(record);
+    else {
+      try {
+        const attempt = window.__motoboyEntradas.prepare(record);
+        record.pendingCreateId = attempt.id;
+        record.pendingUid = attempt.uid;
+        entryFormPendingCreateId = attempt.id;
+        document.getElementById('entradaSave').textContent = 'Tentar novamente';
+      } catch(error) {
+        showToast('Não foi possível guardar a tentativa neste dispositivo. Nada foi enviado.', {kind:'error'});
+        return;
+      }
+      entradas.unshift(record);
+    }
     if(!wasEditing){
       const billingYearSelect = document.getElementById('billingYear');
       const chosenYear = Number(entradaISO.slice(0, 4)) || APP_NOW.getFullYear();
       if(billingYearSelect) billingYearSelect.value = String(chosenYear);
       fillBillingMonthSelector(chosenYear, entradaISO.slice(0, 7));
     }
-    record.syncState = 'pending';
+    record.syncState = 'awaiting';
     saveLocalState();
     renderFaturamento();
     renderDashboard();
     entryWriteBusy = true;
-    settleLocalAdd(record, function(r){
-      return window.__motoboyEntradas ? window.__motoboyEntradas.add(r) : undefined;
-    }, {
-      isPresent: (r) => entradas.indexOf(r) !== -1,
-      isSameOwner: () => uidAtWrite === currentUid(),
-      onPersistenceConfirmed(r, id){
-        r.fsId = id;
-        r.syncState = 'saved';
-        saveLocalState();
-        renderFaturamento();
-        renderDashboard();
-        entradaModalCtl.close();
-        resetEntryFormMode();
-        showToast('Entrada salva.', {kind:'success'});
-      },
-      onPersistenceFailed(r){
-        r.syncState = 'failed';
-        const idx = entradas.indexOf(r);
-        if(idx >= 0) editingEntryIndex = idx;
-        saveLocalState();
-        renderFaturamento();
-        showToast('Não foi possível salvar a entrada no servidor. Ela ficou marcada como "Não salva" e pode ser tentada de novo.', {kind:'error'});
-      },
-      onOrphanRemoval(remoteId){
-        if(window.__motoboyEntradas) window.__motoboyEntradas.remove(remoteId).catch(function(){});
-      },
-      onSettled(){ entryWriteBusy = false; }
-    });
+    retryEntry(entradas.indexOf(record));
   });
 
   // ---------- rotas: montador de serviços (1 coleta + N entregas) ----------
@@ -2033,7 +2267,7 @@ export function bootstrapPanel() {
   // andar isso, gastou os litros do abastecimento mais recente. Consumo = distância ÷ litros.
   // Fazemos a média de todos os trechos disponíveis pra suavizar variação de trânsito/mão pesada.
   function calcularConsumoReal(){
-    const comKm = refuels
+    const comKm = confirmedRecords(refuels)
       .filter(r => r.odometer && r.odometer > 0 && r.litrosValue > 0)
       .sort((a, b) => a.odometer - b.odometer);
     if(comKm.length < 2) return null;
@@ -2075,13 +2309,13 @@ export function bootstrapPanel() {
     if(!consumoReal){
       valueEl.textContent = '—';
       badgeEl.textContent = 'faltam dados';
-      const comKm = refuels.filter(r => r.odometer && r.odometer > 0).length;
+      const comKm = confirmedRecords(refuels).filter(r => r.odometer && r.odometer > 0).length;
       noteEl.textContent = comKm === 0
         ? 'Anote o km do painel ao abastecer pra ver aqui quantos km por litro sua moto faz de verdade. Precisa de pelo menos dois abastecimentos com km.'
         : 'Já tem 1 abastecimento com km do painel. No próximo que você anotar o km, o consumo real aparece aqui.';
     }else{
       valueEl.textContent = consumoReal.toFixed(1).replace('.', ',') + ' km/L';
-      badgeEl.textContent = consumoManualDefinido ? 'calculado (usando o manual nas rotas)' : 'usado nas rotas';
+      badgeEl.textContent = consumoManualDefinido ? 'calculado; estimativas usam o valor manual' : 'referência para estimativas';
       const litroPreco = latestRefuelPrice();
       const custoPorKm = (litroPreco && consumoReal) ? litroPreco / consumoReal : null;
       noteEl.textContent = custoPorKm
@@ -2161,14 +2395,14 @@ export function bootstrapPanel() {
     consumoManualDefinido = true;
     saveLocalState();
     syncMotoToFirestore();
-    document.getElementById('motoConsumptionStatus').textContent = `${consumption.toFixed(1).replace('.', ',')} km/L salvos à mão e usados nas rotas.`;
+    document.getElementById('motoConsumptionStatus').textContent = `${consumption.toFixed(1).replace('.', ',')} km/L salvos à mão para estimar jornadas.`;
     renderMotoConsumo();
     renderRouteSummary();
     routeServices.forEach((s, i) => s.entregas.forEach((_, j) => updateServiceVerdict(i, j)));
   });
 
   function newEntrega(){ return { entrega:'', entregaCoords:null, distancia:null, tempo:null, valor:null, status:'idle', errorMsg:'', approx:false, approxConfirmed:false }; }
-  function newService(){ return { serviceId:'svc-'+crypto.randomUUID(), coleta:'', coletaCoords:null, cliente:'', paymentStatus:'received', entregas:[ newEntrega() ] }; }
+  function newService(){ return { serviceId:'svc-'+generateUuid(), coleta:'', coletaCoords:null, cliente:'', paymentStatus:'received', entregas:[ newEntrega() ] }; }
   let routeServices = [ newService() ];
   let confirmedRoutes = Array.isArray(localState.confirmedRoutes) ? localState.confirmedRoutes : [];
   let dragSrcIndex = null;
@@ -3443,8 +3677,8 @@ export function bootstrapPanel() {
   }
 
   const routeConfirmationOrchestrator = createRouteConfirmationOrchestrator({
-    generateRouteId: () => `rota-${crypto.randomUUID()}`,
-    generateServiceId: () => `svc-${crypto.randomUUID()}`,
+    generateRouteId: () => `rota-${generateUuid()}`,
+    generateServiceId: () => `svc-${generateUuid()}`,
     async saveRoute(route){
       if(!window.__motoboyRotas) throw new Error('Ponte de rotas indisponível.');
       await window.__motoboyRotas.save(route);
@@ -3829,7 +4063,7 @@ export function bootstrapPanel() {
         </div>
       </div>` : '';
     if(clientes.length === 0){
-      list.innerHTML = pendingBannerHTML || '<div class="cliente-empty">Nenhum cliente cadastrado ainda. Toca no + acima ou marque "Fica pra depois" em um serviço da rota.</div>';
+      list.innerHTML = pendingBannerHTML || '<div class="cliente-empty">Nenhum cliente cadastrado ainda. Toque no + acima para adicionar.</div>';
       if(pendingBannerHTML) wirePendingReceiptRetry(list);
       return;
     }
@@ -3866,7 +4100,7 @@ export function bootstrapPanel() {
   // no máximo uma aplicação financeira — nunca em recebimento duplicado.
   const receiptSubmissionManager = createReceiptSubmissionManager({
     currentUid,
-    generateReceiptOperationId: () => `receipt-${crypto.randomUUID()}`,
+    generateReceiptOperationId: () => `receipt-${generateUuid()}`,
     store: createLocalStorageReceiptAttemptStore(),
     gateway: createClientReceiptGateway(),
   });
@@ -4170,7 +4404,21 @@ export function bootstrapPanel() {
   window.__applyRemoteJornada = function(entities){
     if(!Array.isArray(entities)) return;
     const remoteVMs = entities.map(jornadaEntityToVM);
-    jornadas = mergeRemoteWithPending(remoteVMs, jornadas);
+    const reconciled = mergeJornadaWithRemote(remoteVMs, jornadas);
+    if(jornadaAttemptStore){
+      jornadas.filter(item => !item.fsId && item.pendingCreateId && !reconciled.items.includes(item))
+        .forEach(item => {
+          // Se uma tentativa foi substituída por uma jornada remota, ela não
+          // pode reaparecer em outra recarga. A falta de storage não bloqueia
+          // a projeção autoritativa recebida do servidor.
+          try{ jornadaAttemptStore.remove(item.pendingUid || currentUid(), item.pendingCreateId); }
+          catch(error){ console.error('[Jornada] Falha ao reconciliar tentativa:', error); }
+        });
+    }
+    jornadas = reconciled.items;
+    if(reconciled.discardedFailedOpenCount){
+      showToast('Outra jornada já foi confirmada. O início não salvo foi retirado do histórico.', {kind:'warning'});
+    }
     const journeyKm = Math.max(0, ...jornadas.map(j => Number(j.kmFinal ?? j.kmInicial) || 0));
     registrarKm(journeyKm);
     syncMotoToFirestore();
@@ -4184,47 +4432,35 @@ export function bootstrapPanel() {
   }
 
   function jornadaUltimaFechada(){
-    const closed = jornadas.filter(function(j){ return j.status === 'closed'; });
-    if(closed.length === 0) return null;
-    closed.sort(function(a, b){
-      const dataA = (a.dataFimISO || '') + ' ' + (a.horaFimISO || '');
-      const dataB = (b.dataFimISO || '') + ' ' + (b.horaFimISO || '');
-      return dataB.localeCompare(dataA);
-    });
-    return closed[0];
-  }
-
-  function jornadaNewestFirst(){
-    return jornadas.slice().sort(function(a, b){
-      const ka = a.status === 'closed' ? 1 : 0;
-      const kb = b.status === 'closed' ? 1 : 0;
-      if(ka !== kb) return kb - ka;
-      return Number(b.updatedAt || 0) - Number(a.updatedAt || 0);
-    });
+    return listJornadaHistory(jornadas).find(function(j){ return j.status === 'closed'; }) || null;
   }
 
   function fmtLiters(liters){
     if(typeof liters !== 'number' || !Number.isFinite(liters)) return '—';
-    return liters.toFixed(1).replace('.', ',') + ' L';
+    return liters.toLocaleString('pt-BR', {maximumFractionDigits:2}) + ' L';
   }
 
   function renderJornadaHistory(){
     const list = document.getElementById('jornadaHistoryList');
     if(!list) return;
-    const closed = jornadaNewestFirst().filter(function(j){ return j.status === 'closed'; });
-    if(closed.length === 0){
-      list.innerHTML = '<div class="jornada-history-item">Nenhuma jornada encerrada ainda.</div>';
+    const records = listJornadaHistory(jornadas);
+    document.getElementById('jornadaHistoryTitle').textContent = 'Histórico de jornadas (' + records.length + ')';
+    if(records.length === 0){
+      list.innerHTML = '<div class="jornada-history-item">Nenhuma jornada registrada ainda.</div>';
       return;
     }
-    list.innerHTML = closed.map(function(j, index){
-      const percurso = (j.kmFinal !== null && j.kmFinal >= j.kmInicial) ? fmtKm(j.kmFinal - j.kmInicial) : '—';
-      const liters = (j.kmFinal !== null && j.consumoReferencia && j.consumoReferencia > 0)
+    list.innerHTML = records.map(function(j){
+      const closed = j.status === 'closed';
+      const percurso = (closed && j.kmFinal !== null && j.kmFinal >= j.kmInicial) ? fmtKm(j.kmFinal - j.kmInicial) : '—';
+      const liters = (closed && j.kmFinal !== null && j.consumoReferencia && j.consumoReferencia > 0)
         ? computeEstimatedLiters(j.kmInicial, j.kmFinal, j.consumoReferencia) : null;
       return '<div class="jornada-history-item">' +
-        '<b>' + safeText(dateLabelFromISO(j.dataFimISO || '')) + '</b>' +
-        ' · ' + percurso +
-        (liters !== null ? ' · ' + fmtLiters(liters) : '') +
-        (index === 0 ? ' · <i>última</i>' : '') +
+        '<strong>' + (closed ? 'Jornada encerrada' : 'Jornada em andamento') + '</strong>' +
+        '<div class="jornada-history-dates"><span>Início: ' + safeText(jornadaMoment(j.dataInicioISO, j.horaInicioISO)) + '</span>' +
+        '<span>Fim: ' + (closed ? safeText(jornadaMoment(j.dataFimISO, j.horaFimISO)) : 'Em andamento') + '</span></div>' +
+        '<div class="jornada-history-values">Hodômetro: ' + fmtKm(j.kmInicial) + ' → ' + (closed && j.kmFinal !== null ? fmtKm(j.kmFinal) : '—') +
+        ' · Percurso: ' + percurso + ' · Gasolina estimada: ' + fmtLiters(liters) +
+        ' · Custo estimado: ' + (closed && j.custoEstimado !== null && j.custoEstimado !== undefined ? fmtBRL(j.custoEstimado) : '—') + '</div>' + syncBadgeHTML(j) +
       '</div>';
     }).join('');
   }
@@ -4298,14 +4534,22 @@ export function bootstrapPanel() {
 
   function jornadaFormNumber(){
     const el = document.getElementById('jornadaKmInput');
-    const value = el ? parseBrazilianInput(el.value) : null;
+    const value = el ? parseJornadaFormValue(el.value) : null;
     return value === null ? NaN : value;
   }
 
   function getJornadaFuelValue(id){
     const el = document.getElementById(id);
-    const value = el ? parseBrazilianInput(el.value) : null;
-    return value;
+    return el ? parseJornadaFormValue(el.value) : null;
+  }
+
+  function jornadaFuelDefaults(){
+    return {
+      consumoAtual: CONSUMO_ATUAL,
+      consumoManual: consumoManualDefinido,
+      consumoReal: consumoReal,
+      precoAtual: PRECO_ATUAL
+    };
   }
 
   function updateJornadaPreview(){
@@ -4328,15 +4572,22 @@ export function bootstrapPanel() {
       return;
     }
     clearJornadaFormError();
-    const consumption = getJornadaFuelValue('jornadaConsumptionInput');
-    const price = getJornadaFuelValue('jornadaPriceInput');
-    const percurso = kmFinal - record.kmInicial;
-    const liters = computeEstimatedLiters(record.kmInicial, kmFinal, consumption);
-    const cost = computeEstimatedCost(record.kmInicial, kmFinal, consumption, price);
-    const parts = [fmtKm(percurso)];
-    if(liters !== null) parts.push(fmtLiters(liters));
-    if(cost !== null) parts.push('custo ' + fmtBRL(cost));
-    if(preview) preview.textContent = parts.join(' · ');
+    const resolved = resolveJornadaCloseReferences({
+      kmInicial: record.kmInicial,
+      kmFinal: kmFinal,
+      consumptionInput: getJornadaFuelValue('jornadaConsumptionInput'),
+      priceInput: getJornadaFuelValue('jornadaPriceInput')
+    }, jornadaFuelDefaults());
+    if(!resolved.ok){
+      setJornadaFormError(resolved.error);
+      if(preview) preview.textContent = '';
+      return;
+    }
+    const liters = computeEstimatedLiters(record.kmInicial, kmFinal, resolved.consumoReferencia);
+    const cost = computeEstimatedCost(record.kmInicial, kmFinal, resolved.consumoReferencia, resolved.precoReferencia);
+    if(preview) preview.textContent = 'Percurso: ' + fmtKm(kmFinal - record.kmInicial) +
+      ' · Gasolina estimada: ' + fmtLiters(liters) +
+      ' · Custo estimado: ' + (cost === null ? '—' : fmtBRL(cost));
   }
 
   function openJornadaForm(mode, record){
@@ -4345,12 +4596,16 @@ export function bootstrapPanel() {
     const fuelFields = document.getElementById('jornadaFuelFields');
     const title = document.getElementById('jornadaModalTitle');
     const desc = document.getElementById('jornadaModalDesc');
+    const kmLabel = document.getElementById('jornadaKmLabel');
+    const saveButton = document.getElementById('jornadaModalSave');
     const preview = document.getElementById('jornadaPreview');
     const kmInput = document.getElementById('jornadaKmInput');
     const fuelInputs = ['jornadaConsumptionInput', 'jornadaPriceInput'].map(id => document.getElementById(id));
     if(mode === 'start'){
       if(title) title.textContent = 'Iniciar jornada';
       if(desc) desc.textContent = 'Leitura inicial do hodômetro';
+      if(kmLabel) kmLabel.textContent = 'Hodômetro inicial (km)';
+      if(saveButton) saveButton.textContent = 'Iniciar jornada';
       if(fuelFields) fuelFields.classList.add('hidden');
       if(preview) preview.textContent = 'A jornada só é confirmada depois que o servidor responder.';
       setJornadaFormError('');
@@ -4358,6 +4613,8 @@ export function bootstrapPanel() {
     } else {
       if(title) title.textContent = 'Encerrar jornada';
       if(desc) desc.textContent = 'Informe o hodômetro final';
+      if(kmLabel) kmLabel.textContent = 'Hodômetro final (km)';
+      if(saveButton) saveButton.textContent = 'Salvar e encerrar';
       if(fuelFields) fuelFields.classList.remove('hidden');
       if(fuelInputs[0]) fuelInputs[0].value = editableNumber(CONSUMO_ATUAL > 0 ? CONSUMO_ATUAL : null, 2);
       if(fuelInputs[1]) fuelInputs[1].value = editableNumber(PRECO_ATUAL > 0 ? PRECO_ATUAL : null, 2);
@@ -4397,6 +4654,7 @@ export function bootstrapPanel() {
     const plan = jornadaStartPlan(jornadaOpenRecord());
     if(plan.action !== 'retry') return;
     const record = plan.record;
+    if(!persistJornadaAttempt(record)) return;
     saveLocalState();
     renderJornadaCard();
     jornadaWriteBusy = true;
@@ -4413,6 +4671,7 @@ export function bootstrapPanel() {
       onPersistenceConfirmed(r, id){
         r.fsId = id;
         r.syncState = 'saved';
+        removeJornadaAttempt(r);
         registrarKm(r.kmInicial);
         syncMotoToFirestore();
         saveLocalState();
@@ -4421,18 +4680,57 @@ export function bootstrapPanel() {
         jornadaModalCtl.close();
         showToast('Jornada iniciada pelo hodômetro.', {kind:'success'});
       },
-      onPersistenceFailed(r){
+      onPersistenceFailed(r, cause){
+        if(cause && (cause.name === 'JornadaAlreadyOpenError' || cause.name === 'JornadaAlreadyFinishedError')){
+          // A transação rejeitou esta tentativa sem gravá-la. Não manter uma
+          // abertura local impossível de reenviar sobre a jornada vencedora.
+          jornadas = jornadas.filter(function(item){ return item !== r; });
+          removeJornadaAttempt(r);
+          saveLocalState();
+          renderJornadaCard();
+          renderDashboard();
+          jornadaModalCtl.close();
+          showToast(cause.name === 'JornadaAlreadyFinishedError'
+            ? 'Esta jornada já foi encerrada. Atualizando o histórico.'
+            : 'Outra jornada já está em andamento. Atualizando o histórico.', {kind:'warning'});
+          if(window.__motoboyJornada && window.__motoboyJornada.refresh){
+            window.__motoboyJornada.refresh().then(function(items){
+              if(uidAtWrite === currentUid()) window.__applyRemoteJornada(items);
+            }).catch(function(){
+              if(uidAtWrite === currentUid()) showToast('Não foi possível atualizar a jornada. Recarregue a página.', {kind:'error'});
+            });
+          }
+          return;
+        }
         r.syncState = 'failed';
         saveLocalState();
         renderJornadaCard();
         renderDashboard();
         showToast('Não foi possível iniciar a jornada no servidor. Ela ficou marcada como "Não salva".', {kind:'error'});
       },
-      onOrphanRemoval(remoteId){
-        if(window.__motoboyJornada) window.__motoboyJornada.close(remoteId, {}).catch(function(){});
-      },
+      onOrphanRemoval(){ /* Não encerrar jornada autoritativa em uma corrida de carga. */ },
       onSettled(){ jornadaWriteBusy = false; }
     });
+  }
+
+  function persistJornadaAttempt(record){
+    try{
+      if(!jornadaAttemptStore || !currentUid()) throw new Error('Armazenamento ou sessão indisponível.');
+      if(!record.pendingCreateId) record.pendingCreateId = jornadaOpeningId(record);
+      record.pendingUid = currentUid();
+      jornadaAttemptStore.put(record);
+      return true;
+    }catch(error){
+      console.error('[Jornada] Não foi possível guardar a tentativa:', error);
+      showToast('Não foi possível guardar a tentativa neste aparelho. Tente novamente.', {kind:'error'});
+      return false;
+    }
+  }
+
+  function removeJornadaAttempt(record){
+    if(!jornadaAttemptStore || !record.pendingCreateId || !record.pendingUid) return;
+    try{ jornadaAttemptStore.remove(record.pendingUid, record.pendingCreateId); }
+    catch(error){ console.error('[Jornada] Não foi possível limpar tentativa confirmada:', error); }
   }
 
   function createJornadaFromOdometer(kmInput){
@@ -4443,7 +4741,7 @@ export function bootstrapPanel() {
     const record = {
       fsId: null,
       status: 'open',
-      kmInicial: Math.round(kmInput),
+      kmInicial: kmInput,
       dataInicioISO: localTodayISO(),
       horaInicioISO: nowHHMM(),
       kmFinal: null,
@@ -4454,6 +4752,7 @@ export function bootstrapPanel() {
       custoEstimado: null,
       syncState: 'pending'
     };
+    if(!persistJornadaAttempt(record)) return;
     jornadas.unshift(record);
     saveLocalState();
     renderJornadaCard();
@@ -4501,7 +4800,7 @@ export function bootstrapPanel() {
       setJornadaFormError(resolved.error);
       return;
     }
-    const cleanKmFinal = Math.round(resolved.kmFinal);
+    const cleanKmFinal = resolved.kmFinal;
     const dataFimISO = localTodayISO();
     const horaFimISO = nowHHMM();
     const uidAtWrite = currentUid();
@@ -4519,24 +4818,26 @@ export function bootstrapPanel() {
       if(!saved){
         throw new Error('Fechamento da jornada retornou sem dados.');
       }
-      record.status = 'closed';
-      record.kmFinal = saved.kmFinal !== undefined ? saved.kmFinal : cleanKmFinal;
-      record.dataFimISO = saved.dataFimISO || dataFimISO;
-      record.horaFimISO = saved.horaFimISO || horaFimISO;
-      record.consumoReferencia = saved.consumoReferencia !== undefined ? saved.consumoReferencia : resolved.consumoReferencia;
-      record.origemConsumo = saved.origemConsumo || resolved.origemConsumo;
-      record.precoReferencia = saved.precoReferencia !== undefined ? saved.precoReferencia : resolved.precoReferencia;
-      record.origemPreco = saved.origemPreco || resolved.origemPreco;
-      record.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null;
-      record.syncState = 'saved';
-      registrarKm(record.kmFinal);
+      // Uma carga remota pode substituir o objeto local enquanto o fechamento está em voo.
+      const current = jornadas.find(function(j){ return j.fsId === record.fsId; }) || record;
+      current.status = 'closed';
+      current.kmFinal = saved.kmFinal !== undefined ? saved.kmFinal : cleanKmFinal;
+      current.dataFimISO = saved.dataFimISO || dataFimISO;
+      current.horaFimISO = saved.horaFimISO || horaFimISO;
+      current.consumoReferencia = saved.consumoReferencia !== undefined ? saved.consumoReferencia : resolved.consumoReferencia;
+      current.origemConsumo = saved.origemConsumo || resolved.origemConsumo;
+      current.precoReferencia = saved.precoReferencia !== undefined ? saved.precoReferencia : resolved.precoReferencia;
+      current.origemPreco = saved.origemPreco || resolved.origemPreco;
+      current.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null;
+      current.syncState = 'saved';
+      registrarKm(current.kmFinal);
       syncMotoToFirestore();
       saveLocalState();
       renderJornadaCard();
       renderDashboard();
       jornadaModalCtl.close();
-      showToast(record.custoEstimado !== null
-        ? 'Jornada encerrada. Custo estimado de ' + fmtBRL(record.custoEstimado) + '.'
+      showToast(current.custoEstimado !== null
+        ? 'Jornada encerrada. Custo estimado de ' + fmtBRL(current.custoEstimado) + '.'
         : 'Jornada encerrada.', {kind:'success'});
     }).catch(function(){
       setJornadaFormError('Não foi possível encerrar a jornada no servidor. Tente de novo.');
@@ -4568,8 +4869,10 @@ export function bootstrapPanel() {
   }
 
   const jornadaModalCtl = wireModal(null, 'jornadaModal', 'jornadaBackdrop', 'jornadaModalClose', 'jornadaModalCancel');
-  const jornadaModalSave = document.getElementById('jornadaModalSave');
-  if(jornadaModalSave) jornadaModalSave.addEventListener('click', handleJornadaFormSubmit);
+  document.getElementById('jornadaForm').addEventListener('submit', function(event){
+    event.preventDefault();
+    handleJornadaFormSubmit();
+  });
   ['jornadaKmInput', 'jornadaConsumptionInput', 'jornadaPriceInput'].forEach(function(id){
     const el = document.getElementById(id);
     if(el) el.addEventListener('input', updateJornadaPreview);
@@ -4582,9 +4885,9 @@ export function bootstrapPanel() {
   function renderDashboard(){
     renderJornadaCard();
     const monthKey = selectedMonthKey();
-    const monthEntries = monthItems(entradas, monthKey);
-    const monthRefuels = monthItems(refuels, monthKey);
-    const monthMaintenances = monthItems(maintenances, monthKey);
+    const monthEntries = monthItems(confirmedRecords(entradas), monthKey);
+    const monthRefuels = monthItems(confirmedRecords(refuels), monthKey);
+    const monthMaintenances = monthItems(confirmedRecords(maintenances), monthKey);
     const received = monthEntries.reduce((total, item) => total + item.valor, 0);
     const expenses = [...monthRefuels, ...monthMaintenances].reduce((total, item) => total + item.valor, 0);
     const result = received - expenses;
@@ -4715,7 +5018,7 @@ export function bootstrapPanel() {
   installStationCombobox(); // 2C: instala o combobox de posto (listeners uma única vez)
   if(consumoManualDefinido){
     document.getElementById('motoConsumptionInput').value = CONSUMO_ATUAL;
-    document.getElementById('motoConsumptionStatus').textContent = `${CONSUMO_ATUAL.toFixed(1).replace('.', ',')} km/L salvos à mão e usados nas rotas.`;
+    document.getElementById('motoConsumptionStatus').textContent = `${CONSUMO_ATUAL.toFixed(1).replace('.', ',')} km/L salvos à mão para estimar jornadas.`;
   }
   recalculateMotoKmFromRecords();
   recalcConsumoReal();

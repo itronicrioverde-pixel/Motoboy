@@ -2,137 +2,110 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
 
-/**
- * Verificação estática do painel legado (panel.js) + bridges para a confirmação
- * de escrita "salvo / pendente / falhou" de abastecimentos, manutenções e
- * entradas manuais.
- *
- * O monólito não pode ser unit-tested diretamente (efeitos colaterais, DOM);
- * seguimos o mesmo padrão de panel-sync.test.ts. As regras de transição com
- * promessas controladas vivem em src/shared/application/pending-local-write.ts
- * (testado em runtime); aqui garantimos que o painel realmente as usa e não
- * volta a anunciar sucesso antes da confirmação remota.
- */
+const panelSource = readFileSync(resolve(__dirname, './panel.js'), 'utf-8');
 
-const PANEL_PATH = resolve(__dirname, './panel.js');
-const panelSource = readFileSync(PANEL_PATH, 'utf-8');
-
-function sliceFrom(cursorMarker: string, untilMarker: string): string {
-  const start = panelSource.indexOf(cursorMarker);
-  const end = panelSource.indexOf(untilMarker, start);
-  if (start < 0 || end < 0) return '';
+function sliceFrom(startMarker: string, endMarker: string): string {
+  const start = panelSource.indexOf(startMarker);
+  const end = panelSource.indexOf(endMarker, start);
+  if (start < 0 || end < 0) throw new Error(`Marcador do painel ausente: ${startMarker}`);
   return panelSource.slice(start, end);
 }
 
-const REFUEL_BODY = sliceFrom("document.getElementById('btnSaveRefuel')", '// Ponte: recebe os abastecimentos');
-const MAINT_BODY = sliceFrom("document.getElementById('maintSave')", '// Ponte: recebe as manutenções');
-const ENTRY_BODY = sliceFrom("document.getElementById('entradaSave')", '// ---------- rotas: montador de serviços');
+const refuelSave = sliceFrom("document.getElementById('btnSaveRefuel').addEventListener", '// Ponte: recebe os abastecimentos');
+const maintenanceSave = sliceFrom("document.getElementById('maintSave').addEventListener", '// Ponte: recebe as manutenções');
+const entrySave = sliceFrom("document.getElementById('entradaSave').addEventListener", '// ---------- rotas: montador de serviços');
 
-describe('panel.js usa o ciclo pendente/salvo/falhou nos três fluxos', () => {
-  it('importa settleLocalAdd e mergeRemoteWithPending do módulo compartilhado', () => {
-    expect(panelSource).toContain(
-      "import { settleLocalAdd, mergeRemoteWithPending } from '../shared/application/pending-local-write';",
-    );
+describe('painel usa a criação durável nos três fluxos', () => {
+  it.each([
+    ['abastecimento', refuelSave, '__motoboyAbastecimentos', 'retryRefuel'],
+    ['manutenção', maintenanceSave, '__motoboyManutencoes', 'retryMaintenance'],
+    ['entrada', entrySave, '__motoboyEntradas', 'retryEntry'],
+  ])('%s: prepara antes do envio, persiste pendência e reusa ID no botão Salvar', (_name, body, bridge, retry) => {
+    expect(body).toContain(`window.${bridge}.prepare(record)`);
+    expect(body).toContain('record.pendingCreateId = attempt.id');
+    expect(body).toContain('record.pendingUid = attempt.uid');
+    expect(body).toMatch(/record\.pendingCreateId = attempt\.id;[\s\S]*saveLocalState\(\);[\s\S]*retry/);
+    expect(body).toContain(`${retry}(`);
+    expect(body).not.toContain(`window.${bridge}.add(`);
+    expect(body).not.toContain('settleLocalAdd(record,');
   });
 
-  it('abastecimento: marcador pending antes do remoto e nenhum sucesso imediato', () => {
-    expect(REFUEL_BODY).toContain(`record.syncState = 'pending';`);
-    expect(REFUEL_BODY).toContain('settleLocalAdd(record,');
-    expect(REFUEL_BODY).not.toContain('showToast(`${wasEditing');
+  it('ação de retry substitui editar/excluir, e o badge nunca diz salvo sem confirmação', () => {
+    const actions = sliceFrom('function recordActionsHTML(', 'function updateStorageStatus(');
+    expect(actions).toContain('if(record && record.pendingCreateId)');
+    expect(actions).toContain('data-record-action="retry"');
+    expect(actions).toContain('Tentar novamente');
+    const badge = sliceFrom('function syncBadgeHTML(', 'function retryRefuel(');
+    expect(badge).toContain('Aguardando conexão');
+    expect(badge).toContain('Não confirmado');
+    expect(badge).not.toContain('Salvo');
   });
 
-  it('abastecimento: falha vira "failed", mantém o formulário carregado e libera o lock', () => {
-    expect(REFUEL_BODY).toContain(`r.syncState = 'failed';`);
-    expect(REFUEL_BODY).toContain('editingRefuelIndex = idx;');
-    expect(REFUEL_BODY).toContain('onSettled(){ refuelWriteBusy = false; }');
-    expect(REFUEL_BODY).toContain('"Não salvo"');
+  it('confirma sucesso só depois do retry remoto, sem duas callbacks de clique simultâneo', () => {
+    const retry = sliceFrom('function retryDurableRecord(', 'function retryRefuel(');
+    expect(retry).toContain('durableRetryUiInFlight.has(record)');
+    expect(retry).toContain('bridge.retry(id)');
+    expect(retry).toMatch(/bridge\.retry\(id\)[\s\S]*\.then\(function\(result\)/);
+    expect(retry).toContain("record.syncState = 'saved'");
+    expect(retry).toContain('onConfirmed(record)');
+    expect(retry).toContain("record.syncState = 'failed'");
+    expect(retry).toContain("record.syncState = 'awaiting'");
+    expect(retry).toContain("result === 'removed'");
   });
 
-  it('abastecimento: edição confirmada só aplica na UI após `.then` do remoto', () => {
-    expect(REFUEL_BODY).toContain('window.__motoboyAbastecimentos.update(record.fsId, record)');
-    expect(REFUEL_BODY).toContain('A alteração não foi aplicada.');
-    expect(REFUEL_BODY).toMatch(/\.then\(function\(\)\{[\s\S]*Abastecimento atualizado/);
-    expect(REFUEL_BODY).toMatch(/\.finally\(function\(\)\{ refuelWriteBusy = false; \}\)/);
+  it('recarga reconstrói os três registros somente das tentativas por UID', () => {
+    expect(panelSource).toContain('function restoreCreateAttempts(');
+    expect(panelSource).toContain('bridge.pending()');
+    expect(panelSource).toContain('pendingRefuelToVM');
+    expect(panelSource).toContain('pendingMaintenanceToVM');
+    expect(panelSource).toContain('pendingEntryToVM');
+    expect(panelSource).toContain('pendingUid:attempt.uid');
+    expect(panelSource).toContain('pendingCreateId:attempt.id');
   });
 
-  it('abastecimento: exclusão aguarda o remoto e tem caminho local para criação pendente', () => {
-    const refuelDelete = sliceFrom('function deleteRefuel(', 'function removeRefuelLocally');
-    expect(refuelDelete).toContain('refuelWriteBusy');
-    expect(refuelDelete).toContain('.remove(item.fsId)');
-    expect(refuelDelete).toContain('removeRefuelLocally(currentIndex, item)');
-    expect(panelSource).toContain('function removeRefuelLocally');
+  it('recarga remota não duplica documento confirmado quando resposta original se perdeu', () => {
+    expect(panelSource).toContain('mergeRemoteWithPending(remoteVMs, refuels)');
+    expect(panelSource).toContain('mergeRemoteWithPending(remoteVMs, maintenances)');
+    expect(panelSource).toContain('remoto.filter(e => !pendingIds.has(e.fsId)).concat(locaisPreservadas)');
   });
 
-  it('manutenção: pendente/remoto/tombo/UID e sucesso só após confirmação', () => {
-    expect(MAINT_BODY).toContain('settleLocalAdd(record,');
-    expect(MAINT_BODY).toContain('onOrphanRemoval(remoteId)');
-    expect(MAINT_BODY).toContain('uidAtWrite === currentUid()');
-    expect(MAINT_BODY).toContain('onSettled(){ maintWriteBusy = false; }');
-    expect(MAINT_BODY).toContain('window.__motoboyManutencoes.update(record.fsId, record)');
-    expect(MAINT_BODY).not.toContain('showToast(`${wasEditing');
+  it('não permite alterar registros sem confirmação e não soma pendências no faturamento', () => {
+    expect(panelSource).toContain("if(item.pendingCreateId){ showToast('Confirme o abastecimento antes de editar.");
+    expect(panelSource).toContain("if(item.pendingCreateId){ showToast('Confirme o gasto antes de excluir.");
+    expect(panelSource).toContain("if(item.pendingCreateId){ showToast('Confirme a entrada antes de excluir.");
+    expect(panelSource).toContain('function confirmedRecords(records)');
+    expect(panelSource).toContain('monthRecords(confirmedRecords(entradas), monthKey)');
+    expect(panelSource).toContain('monthRecords(confirmedRecords(refuels), monthKey)');
+    expect(panelSource).toContain('monthRecords(confirmedRecords(maintenances), monthKey)');
   });
 
-  it('entrada manual: mesmo ciclo com pendente/falhou e edição aguardando remoto', () => {
-    expect(ENTRY_BODY).toContain('settleLocalAdd(record,');
-    expect(ENTRY_BODY).toContain(`record.syncState = 'pending';`);
-    expect(ENTRY_BODY).toContain(`r.syncState = 'failed';`);
-    expect(ENTRY_BODY).toContain('window.__motoboyEntradas.update(record.fsId, record)');
-    expect(ENTRY_BODY).toContain('onSettled(){ entryWriteBusy = false; }');
-    expect(ENTRY_BODY).not.toContain('showToast(`${wasEditing');
-    expect(ENTRY_BODY).not.toContain('/* falha remota: mantém o cache local sem fsId */');
-  });
-
-  it('exclusão de manutenção e de entrada aguardam o remoto', () => {
-    const maintDelete = sliceFrom('function deleteMaintenance(', 'function removeMaintLocally');
-    expect(maintDelete).toContain('.remove(item.fsId)');
-    expect(maintDelete).toContain('removeMaintLocally(currentIndex, item)');
-    const entryDelete = sliceFrom('function deleteEntry(', 'function removeEntryLocally');
-    expect(entryDelete).toContain('.remove(item.fsId)');
-    expect(entryDelete).toContain('removeEntryLocally(currentIndex, item)');
-  });
-
-  it('recarga remota mescla sem apagar pendências (refuels e manutenções)', () => {
-    const applyRefuels = sliceFrom('window.__applyRemoteAbastecimentos', '// ---------- menu / drawer ----------');
-    expect(applyRefuels).toContain('mergeRemoteWithPending(remoteVMs, refuels)');
-    const applyMaint = sliceFrom('window.__applyRemoteManutencoes', '// ---------- faturamento: entradas + despesas ----------');
-    expect(applyMaint).toContain('mergeRemoteWithPending(remoteVMs, maintenances)');
-  });
-
-  it('proteção de troca de UID presente nos três fluxos de escrita', () => {
-    expect(REFUEL_BODY).toContain('const uidAtWrite = currentUid();');
-    expect(MAINT_BODY).toContain('const uidAtWrite = currentUid();');
-    expect(ENTRY_BODY).toContain('const uidAtWrite = currentUid();');
-  });
-
-  it('badge de sync é renderizado nas listas de abastecimentos, manutenções e entradas', () => {
-    const uses = (panelSource.match(/syncBadgeHTML\([a-zA-Z]+\)/g) || []).map(m => m);
-    expect(uses).toEqual(expect.arrayContaining(['syncBadgeHTML(r)', 'syncBadgeHTML(m)', 'syncBadgeHTML(e)']));
-    expect(panelSource).toContain('syncBadgeHTML(record)');
-    expect(panelSource).toContain('class="sync-badge failure"');
-    expect(panelSource).toContain('class="sync-badge pending"');
+  it('edições e exclusões confirmadas ainda aguardam a resposta remota', () => {
+    for (const [bridge, body] of [
+      ['__motoboyAbastecimentos', refuelSave],
+      ['__motoboyManutencoes', maintenanceSave],
+      ['__motoboyEntradas', entrySave],
+    ] as const) {
+      expect(body).toContain(`window.${bridge}.update(record.fsId, record)`);
+      expect(body).toContain('A alteração não foi aplicada.');
+    }
+    expect(panelSource).toContain('window.__motoboyAbastecimentos.remove(item.fsId)');
+    expect(panelSource).toContain('window.__motoboyManutencoes.remove(item.fsId)');
+    expect(panelSource).toContain('window.__motoboyEntradas.remove(item.fsId)');
   });
 });
 
-describe('bridges não engolem mais falhas de update/remove', () => {
-  const read = (p: string) => readFileSync(resolve(__dirname, p), 'utf-8');
-  const refuelBridge = read('../features/abastecimentos/presentation/panel-bridge.ts');
-  const maintBridge = read('../features/manutencoes/presentation/panel-bridge.ts');
-  const entryBridge = read('../features/faturamento/presentation/panel-bridge.ts');
+describe('bridges expõem apenas criação idempotente no caminho ativo', () => {
+  const read = (path: string) => readFileSync(resolve(__dirname, path), 'utf-8');
+  const bridges = [
+    ['abastecimentos', read('../features/abastecimentos/presentation/panel-bridge.ts')],
+    ['manutencoes', read('../features/manutencoes/presentation/panel-bridge.ts')],
+    ['entradas', read('../features/faturamento/presentation/panel-bridge.ts')],
+  ] as const;
 
-  for (const [name, src] of [
-    ['abastecimentos', refuelBridge],
-    ['manutenções', maintBridge],
-    ['entradas', entryBridge],
-  ]) {
-    it(`${name}: update e remove propagam erro em vez de manter cache local`, () => {
-      expect(src).not.toContain('mantém o cache local');
-      expect(src).toMatch(/async update\(fsId, vm\) \{[\s\S]*?await .*Service\.update\(fsId, vmToEdit\(vm\)\)/);
-    });
-  }
-
-  it('add ainda devolve id ou null (contrato usado pelo settleLocalAdd)', () => {
-    expect(refuelBridge).toContain('return created.id;');
-    expect(maintBridge).toContain('return created.id;');
-    expect(entryBridge).toContain('return created.id;');
+  it.each(bridges)('%s: prepara, lista e reenvia a mesma tentativa', (kind, source) => {
+    expect(source).toContain(`durableCreateManager.prepare('${kind}'`);
+    expect(source).toContain(`durableCreateManager.pending('${kind}')`);
+    expect(source).toContain(`durableCreateManager.retry('${kind}', id)`);
+    expect(source).not.toMatch(/async add\(vm\)/);
   });
 });

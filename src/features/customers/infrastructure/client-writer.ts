@@ -10,7 +10,8 @@
  * - Escrita em customers/{id} + clients/data no mesmo commit
  * - Em falha, nenhuma fonte é alterada
  *
- * IDs são gerados pelo crypto.randomUUID() — único gerador.
+ * IDs são gerados por generateUuid() — randomUUID quando disponível e
+ * getRandomValues e, quando Web Crypto não existe, tempo + entropia local.
  * O mesmo ID aparece em customers/{id} e em clients/data.
  *
  * IDs são pré-gerados ANTES de entrar no callback da transação.
@@ -34,6 +35,7 @@ import {
   collection,
   runTransaction,
 } from 'firebase/firestore';
+import { generateUuid } from '../../../shared/infrastructure/random-id';
 import { db } from '../../../config/firebase.js';
 import { currentUid } from '../../auth/application/auth-service';
 import type { LegacyCliente } from '../application/merge-legacy-customers';
@@ -83,7 +85,7 @@ export interface ApplyReceiptInput {
   readonly dateLabel: string;
   /**
    * Identificador idempotente da submissão de recebimento.
-   * Gerado uma vez por submissão (ex: `receipt-${crypto.randomUUID()}`).
+   * Gerado uma vez por submissão (ex: `receipt-${generateUuid()}`).
    * Reexecuções do callback transacional reutilizam o mesmo ID.
    * Dois dispositivos ou reloads que enviem o same receiptOperationId
    * com o mesmo payload são idempotentes (no-op).
@@ -129,7 +131,7 @@ function entradasDoc(uid: string, receiptOperationId: string) {
 }
 
 function generateId(_uid: string): string {
-  return crypto.randomUUID().replace(/-/g, '').slice(0, 20);
+  return generateUuid().replace(/-/g, '').slice(0, 20);
 }
 
 function createConta(

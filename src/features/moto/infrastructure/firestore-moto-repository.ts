@@ -4,9 +4,10 @@
  * Armazena em users/{uid}/moto/data (documento único por usuário).
  */
 
-import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { doc, getDoc } from 'firebase/firestore';
 import { db } from '../../../config/firebase.js';
 import type { MotoData, MotoRepository } from '../domain/moto-data';
+import { persistMotoSnapshot } from './moto-transaction-writer';
 
 const DEFAULT_MOTO_DATA: MotoData = {
   currentKm: 0,
@@ -35,10 +36,6 @@ export class FirestoreMotoRepository implements MotoRepository {
   }
 
   async save(data: MotoData): Promise<void> {
-    await setDoc(this.docRef(), {
-      currentKm: data.currentKm,
-      consumption: data.consumption,
-      consumptionIsManual: data.consumptionIsManual,
-    }, { merge: true });
+    await persistMotoSnapshot(this.docRef(), data);
   }
 }

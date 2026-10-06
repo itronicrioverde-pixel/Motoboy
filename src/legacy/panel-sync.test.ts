@@ -113,6 +113,19 @@ describe('panel.js — propriedades estáticas', () => {
   });
 
   describe('sync bloqueado antes da hidratação via SyncGate', () => {
+    it('moto usa a persistência transacional que preserva o maior hodômetro', () => {
+      expect(panelSource).toContain("import { persistMotoSnapshot } from");
+      expect(panelSource).toContain('persist: async (ref, snapshot) =>');
+      expect(panelSource).toContain('await persistMotoSnapshot(ref, snapshot)');
+      expect(panelSource).not.toContain("from 'firebase/firestore'");
+    });
+
+    it('falha de sincronização da moto preserva retry no retorno da conexão', () => {
+      expect(panelSource).toContain('scheduleMotoRetry()');
+      expect(panelSource).toContain("window.addEventListener('online', () => {");
+      expect(panelSource).toContain('motoWriter.retry()');
+    });
+
     it('syncMotoToFirestore tem guarda if(!motoHydrated.isOpen) return', () => {
       const block = extractFunction(panelSource, 'syncMotoToFirestore');
       expect(block).toMatch(/if\s*\(\s*!motoHydrated\.isOpen\s*\)\s*return/);
@@ -171,7 +184,7 @@ describe('panel.js — propriedades estáticas', () => {
       const compositionStart = panelSource.indexOf('const receiptSubmissionManager = createReceiptSubmissionManager');
       const compositionEnd = panelSource.indexOf('let receiptPendingMode', compositionStart);
       const composition = panelSource.slice(compositionStart, compositionEnd);
-      expect(composition).toContain('generateReceiptOperationId: () => `receipt-${crypto.randomUUID()}`');
+      expect(composition).toContain('generateReceiptOperationId: () => `receipt-${generateUuid()}`');
     });
 
     it('tentativa pendente oferece retomada por banner e modal em modo pendente', () => {
@@ -228,12 +241,12 @@ describe('panel.js — propriedades estáticas', () => {
     });
 
     it('newService gera serviceId permanente com UUID', () => {
-      expect(panelSource).toMatch(/function\s+newService\s*\(\)\s*\{.*svc-.*crypto\.randomUUID\(\)/);
-      expect(panelSource).toContain('generateServiceId: () => `svc-${crypto.randomUUID()}`');
+      expect(panelSource).toMatch(/function\s+newService\s*\(\)\s*\{.*svc-.*generateUuid\(\)/);
+      expect(panelSource).toContain('generateServiceId: () => `svc-${generateUuid()}`');
     });
 
     it('routeId usa UUID e não Date.now', () => {
-      expect(panelSource).toContain('generateRouteId: () => `rota-${crypto.randomUUID()}`');
+      expect(panelSource).toContain('generateRouteId: () => `rota-${generateUuid()}`');
       expect(panelSource).not.toContain('rota-${Date.now()}');
     });
 

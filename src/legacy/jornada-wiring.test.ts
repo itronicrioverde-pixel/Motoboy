@@ -18,13 +18,14 @@ const indexSource = readFileSync(resolve(__dirname, '../../index.html'), 'utf-8'
 const mainSource = readFileSync(resolve(__dirname, '../main.ts'), 'utf-8');
 
 describe('painel recebe jornadas do Firestore e mescla pendências', () => {
-  it('expõe __applyRemoteJornada com merge de pendências locais', () => {
+  it('expõe __applyRemoteJornada com mescla de pendências e reconciliação de conflitos', () => {
     expect(panelSource).toContain('window.__applyRemoteJornada = function(entities)');
-    expect(panelSource).toContain('mergeRemoteWithPending(remoteVMs, jornadas)');
+    expect(panelSource).toContain('mergeJornadaWithRemote(remoteVMs, jornadas)');
   });
 
   it('jornadas entra no estado local para a recarga não apagar o pendente', () => {
-    expect(panelSource).toContain('let jornadas = Array.isArray(localState.jornadas) ? localState.jornadas : [];');
+    expect(panelSource).toContain('let jornadas = restoreJornadaAttempts(Array.isArray(localState.jornadas) ? localState.jornadas : []);');
+    expect(panelSource).toContain('jornadaAttemptStore.put(record);');
     expect(panelSource).toContain('jornadas,');
   });
 
@@ -34,7 +35,7 @@ describe('painel recebe jornadas do Firestore e mescla pendências', () => {
   });
 
   it('o custo estimado é derivado e nunca é gravado como despesa/entrada', () => {
-    expect(panelSource).toContain("record.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null");
+    expect(panelSource).toContain("current.custoEstimado = saved.custoEstimado !== undefined ? saved.custoEstimado : null");
     // A jornada não salva em entradas: o bloco de jornada não chama __motoboyEntradas.
     const jornadaBlock = panelSource.indexOf('function startJornadaFromCard');
     const jornadaSlice = panelSource.slice(jornadaBlock, panelSource.indexOf('function renderDashboard(){', jornadaBlock));
@@ -61,12 +62,32 @@ describe('painel recebe jornadas do Firestore e mescla pendências', () => {
     expect(panelSource).toContain('syncMotoToFirestore();');
   });
 
+  it('conflito remoto remove só o início rejeitado e reidrata o histórico do mesmo UID', () => {
+    expect(panelSource).toContain("cause.name === 'JornadaAlreadyOpenError'");
+    expect(panelSource).toContain('jornadas = jornadas.filter(function(item){ return item !== r; });');
+    expect(panelSource).toContain('window.__motoboyJornada.refresh().then(function(items)');
+    expect(panelSource).toContain('if(uidAtWrite === currentUid()) window.__applyRemoteJornada(items);');
+  });
+
   it('o km da moto considera também as leituras das jornadas', () => {
     expect(panelSource).toContain('...jornadas.map(item => Number(item.kmFinal ?? item.kmInicial) || 0)');
   });
 
   it('os campos de combustível são ocultados por regra própria', () => {
     expect(indexSource).toContain('.jornada-fuel-fields.hidden{ display:none; }');
+  });
+
+  it('o formulário tem envio conectado e as referências existem antes de fechar', () => {
+    expect(indexSource).toContain('id="jornadaForm"');
+    expect(indexSource).toContain('type="submit" class="btn-primary" id="jornadaModalSave"');
+    expect(panelSource).toContain("getElementById('jornadaForm').addEventListener('submit'");
+    expect(panelSource).toContain('function jornadaFuelDefaults(){');
+  });
+
+  it('o histórico começa visível com datas de início e fim', () => {
+    expect(indexSource).toContain('id="jornadaHistory" open');
+    expect(panelSource).toContain('Início: ');
+    expect(panelSource).toContain('Fim: ');
   });
 });
 

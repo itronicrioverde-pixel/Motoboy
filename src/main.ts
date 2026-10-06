@@ -38,45 +38,27 @@ import {
 import { bootstrapPanel } from './legacy/panel.js';
 import type { AuthUser } from './features/auth/domain/auth-user';
 import { createPanelHydration } from './shared/application/panel-hydration';
+import { currentPeriodLabel } from './shared/presentation/current-period';
+import { panelUidChanged } from './features/auth/application/panel-uid-guard';
+import { isolateLocalCache } from './features/auth/application/local-cache-isolation';
+
+function renderCurrentPeriod(): void {
+  const label = currentPeriodLabel(new Date());
+  const month = document.getElementById('currentMonthYear');
+  const week = document.getElementById('currentWeek');
+  if (month) month.textContent = label.monthYear;
+  if (week) week.textContent = label.week;
+}
+
+renderCurrentPeriod();
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) renderCurrentPeriod();
+});
 
 // Chaves de estado local do painel (hoje ele guarda os dados em localStorage).
 const PANEL_STATE_KEYS = ['motoboy-front-etapa1-v2-clean'];
 // Marca de quem é o dono dos dados locais atualmente no aparelho.
 const OWNER_UID_KEY = 'motoboy-owner-uid';
-
-/**
- * RD-05: um usuário nunca pode ver os dados do usuário anterior.
- * Como o painel ainda guarda estado em localStorage (global), garantimos o
- * isolamento por uid:
- *  - dono anterior é o mesmo uid  → mantém os dados;
- *  - primeiro dono (marca vazia)  → adota os dados existentes como dele;
- *  - dono diferente               → limpa os dados locais e recarrega limpo.
- * Retorna true quando fez uma limpeza que exige recarregar a página.
- */
-function ensureLocalIsolation(uid: string): boolean {
-  let previousOwner: string | null = null;
-  try {
-    previousOwner = localStorage.getItem(OWNER_UID_KEY);
-  } catch {
-    return false;
-  }
-
-  if (previousOwner === uid) return false;
-
-  try {
-    if (previousOwner !== null) {
-      // Troca de usuário: apaga os dados locais do dono anterior.
-      PANEL_STATE_KEYS.forEach((key) => localStorage.removeItem(key));
-      localStorage.setItem(OWNER_UID_KEY, uid);
-      return true; // recarrega para o painel reiniciar sem dados do anterior
-    }
-    // Primeiro login neste aparelho: adota o estado atual como deste usuário.
-    localStorage.setItem(OWNER_UID_KEY, uid);
-  } catch {
-    /* se o storage falhar, seguimos sem isolamento local */
-  }
-  return false;
-}
 
 // Estado de boot (definido inline no index.html): cobre a tela enquanto a
 // sessão é verificada. Removido no primeiro callback do observeAuth.
@@ -109,6 +91,7 @@ installJornadaBridge();
 // O login NÃO é montado antes do primeiro estado da autenticação — assim quem
 // já tem sessão válida não vê o login piscar. Até lá, o #appBoot cobre a tela.
 let panelStarted = false;
+let activePanelUid: string | null = null;
 
 // ---------- Hidratação por feature ----------
 const { hydration, featureLoaders, retryFeatureLoad } = createPanelHydration(
@@ -154,9 +137,20 @@ type MotoData = { currentKm: number; consumption: number; consumptionIsManual: b
  * usuário autenticado e verificado. As pontes já foram instaladas acima.
  */
 function enterAuthenticatedApp(user: AuthUser): void {
+  // Mesmo sem localStorage, nunca reutiliza a memória do painel para outro UID.
+  if (panelUidChanged(activePanelUid, user.uid)) {
+    window.location.reload();
+    return;
+  }
   // Troca de usuário: sempre checa o UID atual ANTES da guarda, para que
   // panelStarted nunca impeça a detecção de troca de usuário.
-  if (ensureLocalIsolation(user.uid)) {
+  let isolation = { reload: false, ignoreLocalCache: true };
+  try {
+    isolation = isolateLocalCache(user.uid, localStorage, OWNER_UID_KEY, PANEL_STATE_KEYS);
+  } catch {
+    // Até o acesso à propriedade window.localStorage pode ser bloqueado.
+  }
+  if (isolation.reload) {
     window.location.reload();
     return;
   }
@@ -166,8 +160,9 @@ function enterAuthenticatedApp(user: AuthUser): void {
   }
   // Só agora revelamos o painel e inicializamos.
   revealPanel();
-  bootstrapPanel();
+  bootstrapPanel({ ignoreLocalCache: isolation.ignoreLocalCache });
   panelStarted = true;
+  activePanelUid = user.uid;
 
   // Carregamento: cada loader é executado exatamente uma vez.
   // Loaders de abastecimentos, manutenções, faturamento e rotas aplicam dados

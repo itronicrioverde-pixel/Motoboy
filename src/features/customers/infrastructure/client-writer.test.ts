@@ -73,7 +73,7 @@ function makeTx(overrides: Record<string, unknown> = {}) {
  * - `.../clients/data` → dados fornecidos por getClientData().
  * - `.../entradas/{receiptOperationId}` → store próprio (persistido no commit).
  */
-interface TxEntry { ref: unknown; data: unknown; options?: unknown; }
+interface TxEntry { ref: unknown; data: unknown; options?: unknown; delete?: boolean; }
 interface BufferedTx {
   tx: { get: ReturnType<typeof vi.fn>; set: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn>; delete: ReturnType<typeof vi.fn> };
   commitBuffer: () => TxEntry[];
@@ -194,7 +194,9 @@ function createVersionedStore(seed: Record<string, unknown> = {}) {
         buffer.push({ ref, data, options });
       }),
       update: vi.fn(),
-      delete: vi.fn(),
+      delete: vi.fn((ref: unknown) => {
+        buffer.push({ ref, data: undefined, delete: true });
+      }),
     };
     function commit(): boolean {
       for (const entry of buffer) {
@@ -205,10 +207,14 @@ function createVersionedStore(seed: Record<string, unknown> = {}) {
       }
       for (const entry of buffer) {
         const path = refPath(entry.ref);
-        docs.set(path, {
-          data: entry.data,
-          version: (docs.get(path)?.version ?? 0) + 1,
-        });
+        if (entry.delete) {
+          docs.delete(path);
+        } else {
+          docs.set(path, {
+            data: entry.data,
+            version: (docs.get(path)?.version ?? 0) + 1,
+          });
+        }
       }
       return true;
     }
@@ -1641,6 +1647,71 @@ describe('ClientWriter — CRUD atômico em duas fontes', () => {
 
       await expect(cancelRouteDual('r1')).rejects.toThrow('já recebeu pagamento');
       expect(cancelTx.delete).not.toHaveBeenCalled();
+    });
+
+    it('cancelamento que vence recebimento obsoleto não ressuscita a conta', async () => {
+      const clientsPath = 'users/uid-1/clients/data';
+      const routePath = 'users/uid-1/rotas/r1';
+      const receiptPath = 'users/uid-1/entradas/receipt-after-cancel';
+      const versioned = createVersionedStore({
+        [clientsPath]: {
+          clientes: [{
+            id: 'c1', nome: 'Ana', pendente: 50,
+            contas: [{ routeId: 'r1', saldo: 50, recebido: 0, operationId: 'r1:svc-aaa' }],
+            recebimentos: [],
+          }],
+        },
+        [routePath]: { id: 'r1', status: 'confirmed' },
+      });
+
+      let signalReceiptStaged!: () => void;
+      const receiptStaged = new Promise<void>((resolve) => { signalReceiptStaged = resolve; });
+      let releaseReceipt!: () => void;
+      const cancelFinished = new Promise<void>((resolve) => { releaseReceipt = resolve; });
+      let starts = 0;
+      let receiptCallbackRuns = 0;
+
+      mocks.runTransaction.mockImplementation(async (_db: unknown, fn: (tx: unknown) => Promise<void>) => {
+        starts += 1;
+        if (starts === 1) {
+          const staleReceipt = versioned.createTransaction();
+          receiptCallbackRuns += 1;
+          await fn(staleReceipt.tx);
+          signalReceiptStaged();
+          await cancelFinished;
+
+          // O cancelamento modificou clients/data: o commit obsoleto perde.
+          expect(staleReceipt.commit()).toBe(false);
+          const retry = versioned.createTransaction();
+          receiptCallbackRuns += 1;
+          await fn(retry.tx);
+          retry.commit();
+          return;
+        }
+
+        const cancel = versioned.createTransaction();
+        await fn(cancel.tx);
+        expect(cancel.commit()).toBe(true);
+      });
+
+      const receipt = applyReceiptDual(receiptInput({
+        clientId: 'c1', valor: 20, receiptOperationId: 'receipt-after-cancel',
+      }));
+      await receiptStaged;
+      const cancelledClients = await cancelRouteDual('r1');
+      releaseReceipt();
+
+      await expect(receipt).rejects.toThrow('excede o saldo pendente');
+      expect(receiptCallbackRuns).toBe(2);
+      expect(cancelledClients[0].contas).toHaveLength(0);
+      expect(versioned.docs.has(routePath)).toBe(false);
+      expect(versioned.docs.has(receiptPath)).toBe(false);
+      const finalClients = (versioned.docs.get(clientsPath)!.data as {
+        clientes: Array<{ pendente: number; contas: unknown[]; recebimentos: unknown[] }>;
+      }).clientes;
+      expect(finalClients[0].pendente).toBe(0);
+      expect(finalClients[0].contas).toHaveLength(0);
+      expect(finalClients[0].recebimentos).toHaveLength(0);
     });
 
     it('isola estados financeiros por UID usando caminhos completos do Firestore', async () => {

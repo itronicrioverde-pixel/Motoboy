@@ -434,6 +434,7 @@
   .drawer-hidden{ display:none !important; }
   .view-hidden{ display:none !important; }
   .jornada-title{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  #jornadaCard{ padding:16px; }
   .jornada-title .label{ font-size:11px; letter-spacing:.05em; font-weight:700; color:var(--muted); text-transform:uppercase; }
   .jornada-rows{ display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:10px; margin-top:12px; }
   .jornada-row{ display:flex; flex-direction:column; gap:2px; }
@@ -442,12 +443,16 @@
   .jornada-cost{ font-size:12px; color:var(--muted); margin-top:12px; }
   .jornada-preview{ font-size:13px; color:var(--muted); margin-top:10px; }
   .jornada-fuel-fields.hidden{ display:none; }
-  .jornada-history{ margin-top:14px; border-top:1px solid var(--line); padding-top:4px; }
-  .jornada-history summary{ cursor:pointer; font-size:12px; font-weight:600; color:var(--muted); }
-  .jornada-history-list{ display:flex; flex-direction:column; gap:8px; margin-top:10px; max-height:220px; overflow-y:auto; }
-  .jornada-history-item{ display:flex; align-items:center; gap:6px; font-size:12px; color:var(--muted); padding:8px 10px; background:var(--surface-2); border-radius:8px; }
-  .jornada-history-item b{ color:var(--text); font-weight:600; }
-  .jornada-actions{ display:flex; gap:8px; margin-top:14px; }
+  .jornada-fuel-fields{ display:grid; gap:8px; }
+  .jornada-fuel-fields .field-label:not(:first-child){ margin-top:6px; }
+  .jornada-history{ margin-top:14px; border:1px solid var(--line); border-radius:var(--radius-md); padding:14px 16px; background:var(--surface); }
+  .jornada-history summary{ cursor:pointer; font-size:13px; font-weight:700; color:var(--text); }
+  .jornada-history-list{ display:flex; flex-direction:column; gap:10px; margin-top:14px; max-height:360px; overflow-y:auto; }
+  .jornada-history-item{ display:flex; flex-direction:column; gap:8px; font-size:12px; color:var(--muted); padding:12px; background:var(--surface-2); border-radius:var(--radius-sm); }
+  .jornada-history-item strong{ color:var(--text); font-size:13px; }
+  .jornada-history-item .jornada-history-dates{ display:grid; gap:4px; }
+  .jornada-history-item .jornada-history-values{ line-height:1.55; }
+  .jornada-actions{ display:flex; gap:8px; margin-top:18px; }
   .jornada-actions .btn-primary, .jornada-actions .btn-secondary{ margin-top:0; flex:1; text-align:center; }
   .edit-reason-field{ border-top:1px dashed var(--line); padding-top:12px; }
   .record-actions{ display:flex; align-items:center; justify-content:flex-end; gap:5px; }
@@ -457,6 +462,7 @@
     color:var(--muted); cursor:pointer; flex-shrink:0;
   }
   .record-action-btn svg.icon{ width:17px; height:17px; }
+  .record-action-btn.retry{ width:auto; min-width:44px; padding:0 10px; color:var(--orange); font-size:12px; font-weight:700; white-space:nowrap; }
   .record-action-btn.edit:active{ color:var(--orange); border-color:rgba(255,122,26,.45); }
   .record-action-btn.delete:active{ color:var(--red); border-color:rgba(255,107,118,.45); }
   .form-action-row{ display:grid; grid-template-columns:minmax(0,1fr) auto; gap:9px; align-items:stretch; }
@@ -1337,7 +1343,7 @@
       <h1 class="display" id="viewTitle">Painel</h1>
       <div class="sub" id="viewSub">visão geral do mês</div>
     </div>
-    <div class="date mono">AGO 2026<br>semana 3</div>
+    <div class="date mono"><span id="currentMonthYear">—</span><br><span id="currentWeek">—</span></div>
   </div>
 
   <!-- ============ DRAWER ============ -->
@@ -1444,8 +1450,8 @@
     <section>
       <div class="section-head"><h2>JORNADA</h2></div>
       <div class="list-card" id="jornadaCard"></div>
-      <details class="jornada-history" id="jornadaHistory">
-        <summary>Histórico de jornadas</summary>
+      <details class="jornada-history" id="jornadaHistory" open>
+        <summary id="jornadaHistoryTitle">Histórico de jornadas</summary>
         <div class="jornada-history-list" id="jornadaHistoryList"></div>
       </details>
     </section>
@@ -1510,7 +1516,7 @@
       <div class="billing-period-copy">
         <div class="billing-period-label">PERÍODO DO FATURAMENTO</div>
         <div class="billing-period-value" id="billingPeriodLabel">Mês atual</div>
-        <div class="billing-period-note" id="billingStorageStatus">O novo mês começa em zero e o histórico fica salvo neste dispositivo.</div>
+        <div class="billing-period-note" id="billingStorageStatus">O novo mês começa em zero. Registros confirmados permanecem na sua conta.</div>
       </div>
       <label class="sr-only" for="billingMonth">Selecionar mês do faturamento</label>
       <select class="period-select" id="billingMonth" aria-label="Selecionar mês do faturamento"></select>
@@ -1901,8 +1907,8 @@
       <div>
         <div class="title">Valores vinculados aos clientes</div>
         <div class="desc">
-          Quando um serviço for marcado como "Fica pra depois", o valor entra na conta do cliente pagador.
-          Depois, registre o recebimento total ou parcial para lançar somente o dinheiro que realmente entrou.
+          Acompanhe as contas em aberto dos clientes. Ao registrar um recebimento total ou parcial,
+          o faturamento inclui somente o dinheiro que realmente entrou.
         </div>
       </div>
     </div>
@@ -2147,22 +2153,25 @@
         <svg class="icon" viewBox="0 0 24 24"><path d="M6 6 18 18"/><path d="M18 6 6 18"/></svg>
       </button>
     </div>
+    <form id="jornadaForm" novalidate>
     <div class="modal-body">
-      <label class="field-label" for="jornadaKmInput">Quilometragem atual (km)</label>
-      <input type="text" inputmode="numeric" class="field-input" id="jornadaKmInput" placeholder="Ex.: 42750" autocomplete="off" />
+      <label class="field-label" for="jornadaKmInput" id="jornadaKmLabel">Hodômetro inicial (km)</label>
+      <input type="text" inputmode="decimal" class="field-input" id="jornadaKmInput" placeholder="Ex.: 42750" autocomplete="off" />
       <div class="jornada-fuel-fields" id="jornadaFuelFields">
         <label class="field-label" for="jornadaConsumptionInput">Consumo de referência (km/L)</label>
         <input type="text" inputmode="decimal" class="field-input" id="jornadaConsumptionInput" placeholder="Ex.: 25" autocomplete="off" />
         <label class="field-label" for="jornadaPriceInput">Preço do combustível (R$/L)</label>
         <input type="text" inputmode="decimal" class="field-input" id="jornadaPriceInput" placeholder="Ex.: 6,05" autocomplete="off" />
+        <div class="config-note">O consumo é necessário para estimar os litros. O preço é opcional para calcular o custo.</div>
       </div>
-      <div class="jornada-preview" id="jornadaPreview"></div>
-      <div class="date-error" id="jornadaFormMessage" role="alert"></div>
+      <div class="jornada-preview" id="jornadaPreview" aria-live="polite"></div>
+      <div class="date-error" id="jornadaFormMessage" role="alert" aria-live="assertive"></div>
     </div>
     <div class="modal-foot">
       <button type="button" class="btn-secondary" id="jornadaModalCancel">Cancelar</button>
-      <button type="button" class="btn-primary" id="jornadaModalSave" style="margin-top:0">Salvar</button>
+      <button type="submit" class="btn-primary" id="jornadaModalSave" style="margin-top:0">Salvar</button>
     </div>
+    </form>
   </div>
 
   <!-- ============ MODAL: CONFIRMAR EXCLUSÃO ============ -->
