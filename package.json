@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:emulator": "vitest run --config vitest.emulator.config.ts",
     "test:watch": "vitest",
     "check": "npm run typecheck && npm run test && npm run build"
   },
@@ -18,6 +19,7 @@
     "leaflet": "^1.9.4"
   },
   "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.2",
     "@types/leaflet": "^1.9.22",
     "typescript": "5.9.3",
     "vite": "8.2.2",

@@ -5,6 +5,6 @@ import { defineConfig, configDefaults } from 'vitest/config';
 // mantém a baseline do web estável e evita execução duplicada dos testes server.
 export default defineConfig({
   test: {
-    exclude: [...configDefaults.exclude, 'functions/**'],
+    exclude: [...configDefaults.exclude, 'functions/**', 'src/**/*.emulator.test.ts'],
   },
 });

@@ -86,3 +86,29 @@ jobs:
       - name: Suíte de integração no emulador
         working-directory: .
         run: npx --yes firebase-tools@latest emulators:exec --only firestore --project demo-motoboy "npm --prefix functions run test:emulator"
+
+  emulator-web:
+    name: Web no Firestore Emulator (Rules + transações)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 21 (pré-requisito dos emuladores do Firebase)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Suíte web de integração no emulador
+        run: npx --yes firebase-tools@latest emulators:exec --only firestore --project demo-motoboy "npm run test:emulator"
