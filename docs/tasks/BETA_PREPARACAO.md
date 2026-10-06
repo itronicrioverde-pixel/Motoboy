@@ -453,3 +453,23 @@ resposta perdida após commit continua coberta somente pelos testes do
 Emulator. Os Emulators foram reiniciados sem importação de dados e o ensaio
 não substitui Android físico nem usa o projeto beta real. Nenhum deploy ou
 regra foi alterado.
+
+### Ensaio de viewport estreito — 06/10/2026
+
+Com Vite e Auth + Firestore Emulators no projeto isolado
+`demo-motoboy-mobile-1006`, uma conta sintética verificada foi usada para
+inspecionar a interface em **360 × 800 px** e **320 × 640 px** no navegador.
+O login, o painel, o menu, Abastecimentos, Minha Moto, Faturamento e Clientes
+foram navegados. O formulário de abertura da jornada e os modais de
+manutenção, entrada manual e cliente foram abertos e inspecionados; seus
+campos e botões ficaram acessíveis. Em 320 px, o modal de manutenção usou
+rolagem interna até **Salvar gasto**, e o login usou rolagem vertical até
+**Entrar**. O gráfico anual rolou dentro do próprio card.
+
+A medição do DOM não encontrou overflow horizontal do documento nos estados
+verificados: em 320 px, `scrollWidth` foi igual a `clientWidth` (305 px nas
+telas com barra vertical e 320 px em Clientes/login). O modal de jornada
+ficou entre x=5 e x=300 px; manutenção e entrada também ficaram nessa faixa.
+Esta é **simulação de viewport**, não prova de toque, teclado virtual,
+safe-area ou desempenho em Android físico. Nenhum registro financeiro foi
+criado e nenhum deploy ou regra foi alterado.
