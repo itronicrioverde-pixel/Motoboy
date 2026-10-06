@@ -6,8 +6,18 @@ autenticação real, Firestore real e comportamento multi-dispositivo.
 
 > NUNCA executar `firebase deploy` sem autorização. Estes passos usam o
 > preview local (`npm run dev`) com o projeto real do `index.html`.
-> A suíte automatizada, por sua vez, isola cada camada: o web suite mocka
-> Firebase e DOM; o `functions/test:emulator` roda no Firestore Emulator.
+> A suíte rápida web ainda mocka Firebase e DOM. As suítes
+> `npm run test:emulator` e `functions/test:emulator` usam o Firestore Emulator.
+
+Para ensaio de interface sem tocar em contas reais, iniciar Auth e Firestore
+Emulators com `firebase emulators:start --only auth,firestore --project demo-motoboy`
+e executar o Vite com `VITE_USE_LOCAL_EMULATORS=true`,
+`VITE_FIREBASE_PROJECT_ID=demo-motoboy` e as demais variáveis
+`VITE_FIREBASE_*` apontando para valores fictícios desse projeto demo.
+O proxy do Vite e a conexão dos SDKs só são habilitados em desenvolvimento
+com `projectId` iniciado por `demo-`; não são usados no build de produção.
+As contas criadas nesse ambiente são descartáveis e não substituem o teste
+em dois dispositivos/contas do projeto de beta.
 
 ---
 
@@ -26,11 +36,15 @@ autenticação real, Firestore real e comportamento multi-dispositivo.
 | Passo | Ação | Esperado |
 | --- | --- | --- |
 | 2.1 | Abastecimentos → salvar um novo | Soma só é anunciada como "salvo" DEPOIS da confirmação; sem badge permanece |
-| 2.2 | Offline: salvar um abastecimento | Badge **Sincronizando**; em falha, badge **Não salvo** e o formulário continua carregado |
-| 2.3 | Voltar a rede e tentar de novo o registro "Não salvo" | Vira **salvo** com fsId; sem duplicar a linha |
+| 2.2 | Offline: salvar um abastecimento | ID, UID e payload ficam guardados antes do envio; badge **Sincronizando** → **Aguardando conexão** enquanto espera ou **Não confirmado** se a tentativa falhar. Não entra nos totais nem aparece toast de sucesso |
+| 2.3 | Recarregar, voltar a rede e tocar **Tentar novamente** na lista (ou no formulário ainda aberto) | A mesma tentativa/ID/payload é reenviada; vira salva somente após confirmação, sem duplicar linha ou valor |
 | 2.4 | Editar um abastecimento salvo | Janela de motivos abre; "Atualizado" só após confirmação remota |
 | 2.5 | Excluir um abastecimento salvo | Some da lista só depois de o Firestore confirmar |
 | 2.6 | Repetir 2.1–2.5 para Manutenção e para Entrada manual (Faturamento) | Mesmo comportamento; badge nas 3 listas |
+| 2.7 | Perder somente a resposta após o commit e recarregar | A tentativa continua visível como não confirmada; retry encontra o marcador remoto e reconcilia sem novo documento |
+| 2.8 | Tocar duas vezes em **Tentar novamente** | Uma única tentativa fica em voo; não há segundo lançamento nem dois toasts de sucesso |
+| 2.9 | Trocar de usuário enquanto uma tentativa ainda aguarda | A conta B não vê nem confirma a tentativa da A; ao voltar à A, a tentativa e o payload permanecem disponíveis |
+| 2.10 | Repetir 2.2–2.3 após reconexão do Emulator | A tentativa é confirmada uma vez; marcador e documento têm o mesmo ID/payload persistido antes da primeira tentativa |
 
 ## 3. Etapa 2 — Jornada pelo hodômetro
 
@@ -45,7 +59,8 @@ autenticação real, Firestore real e comportamento multi-dispositivo.
 | 3.7 | Conferir Faturamento | NENHUMA despesa/entrada criada com o custo estimado |
 | 3.8 | Offline: iniciar jornada | Badge **Sincronizando**/**Não salvo**; "Tentar salvar novamente" reenvia a MESMA jornada sem abrir formulário; encerrar exige sincronia (aviso) |
 | 3.9 | Última jornada fechada | Card mostra PERCURSO + GASOLINA ESTIMADA + CUSTO ESTIMADO + referências (km/L · R$/L) |
-| 3.10 | Card fechado → "Histórico de jornadas" | Lista mostra as jornadas encerradas (data · percurso · litros); a mais recente marcada como "última" |
+| 3.10 | Dashboard → "Histórico de jornadas" | Lista já vem aberta e mostra todas as jornadas, inclusive a atual; início e fim têm data e hora completas, além de hodômetros, percurso, litros e custo |
+| 3.11 | Com uma jornada salva em andamento, informar km final, consumo e tocar "Salvar e encerrar" | Registro é encerrado no servidor, a tela muda para encerrada e o histórico ganha data/hora de fim; recarregar mantém os mesmos dados |
 
 ## 4. Regressão rápida do que continua vivo
 
@@ -65,14 +80,257 @@ roteiro manual acima e NÃO podem ser validadas por `vitest run`:
 | Aspecto | Cobertura real hoje |
 | --- | --- |
 | Autenticação Firebase (login/sessão/logout) | Manual (1.1–1.5); suíte web mocka `firebase/auth` |
-| Regras do Firestore no servidor (isolamento por UID) | Manual; testes de repositório mockam `firebase/firestore` |
-| Ciclo salvo/pendente/falhou (módulo puro) | Automática — `pending-local-write.test.ts` (17) |
-| Wiring das pontes no monólito | Automática estática — `pending-sync-wiring.test.ts` (15) |
-| Regras de jornada (1 aberta, km final, idempotência de abertura e fechamento, custo e litros) | Automática — `jornada/**` (37 testes) |
-| Jornada no Firestore (persistência real, reload, 2 aparelhos, histórico) | Manual (3.4–3.10); repositório mocka Firestore |
+| Regras do Firestore no servidor (isolamento por UID) | Automática — `firestore-rules.emulator.test.ts`: proprietário, outro UID e anônimo em 9 caminhos do beta, incluindo marcadores de criação e controle da jornada, mais negação fora de `users/{uid}`; troca real de sessão ainda é manual |
+| Criações duráveis de abastecimentos, gastos e entradas | Automática — `durable-create-manager.test.ts`, `local-storage-durable-create-store.test.ts` e `firestore-durable-create-gateway.emulator.test.ts`: pré-persistência, resposta perdida, recarga, UID, retries simultâneos, interleaving de duas abas, compatibilidade V1, colisão e reconexão injetada; a UI ainda exige teste manual |
+| Ciclo legado de Jornada e mescla remota | Automática — `pending-local-write.test.ts`; criações financeiras novas não usam `settleLocalAdd` |
+| Wiring das pontes no monólito | Automática estática — `pending-sync-wiring.test.ts`, complementada pelo ensaio no navegador |
+| Regras de jornada (1 aberta, km final, idempotência de abertura e fechamento, custo e litros) | Automática — `jornada/**` (43 testes) |
+| Jornada no Firestore (persistência, histórico e concorrência) | Automática — `firestore-jornada-repository.emulator.test.ts` (5 passaram): abertura, leitura por nova instância, fechamento, histórico, ausência de entrada financeira, duas aberturas divergentes, dois fechamentos, legado sem controle e duplo início idêntico. O ensaio em aparelhos físicos continua pendente |
+| Recebimento × cancelamento no Firestore | Automática — `client-writer.emulator.test.ts` (1) executa as duas transações reais em concorrência e verifica os dois resultados admissíveis; teste determinístico do interleaving cancelamento-primeiro permanece em `client-writer.test.ts` |
+| Repositórios de Abastecimento, Manutenção, Entrada manual e Moto | Automática — `beta-repositories.emulator.test.ts` grava, edita/reconsulta e verifica documentos reais no Emulator, incluindo snapshot de outro aparelho que não pode reduzir o hodômetro; a criação ativa usa a suíte durável acima |
 | Functions no Firestore Emulator | Automática — `functions test:emulator` (gate `FIRESTORE_EMULATOR_HOST`) |
 | Desempenho/UX tátil no celular | Manual — revisar em aparelho real antes do beta |
 
 **Critério de liberação do beta:** roteiro manual 1–4 concluído em aparelho
 real + `npm run check` verde na branch `review/beta-preparacao` + `git diff
 --check` limpo.
+
+## Resultados registrados — 28–29/09/2026
+
+| Verificação | Resultado | Limite da evidência |
+| --- | --- | --- |
+| `npm run check` no checkout `review/beta-preparacao` | Passou: typecheck, 58 arquivos/979 testes, build Vite | A suíte rápida usa mocks; aviso de bundle acima de 500 kB não impede build |
+| `firebase emulators:exec --only firestore --project demo-motoboy "npm run test:emulator"` | Passou: 4 arquivos/15 testes; 2 testes de concorrência da jornada pulados e não contados como sucesso | Regras de UID, corrida receipt/cancel, persistência de jornada e repositórios beta; snapshot tardio da moto não reduz hodômetro; não simula toda a UI nem aparelhos físicos |
+| `firebase emulators:exec --only firestore --project demo-motoboy "npm --prefix functions run test:emulator"` | Passou: 1 arquivo/7 testes | Cobre Functions existentes, não todos os fluxos web |
+| `npm run check` em `functions/` | Passou: typecheck, 2 arquivos/22 testes e bundle | Independente do check web |
+| Preview local com sessão já aberta | Navegação Painel → Faturamento → Abastecimentos → Minha Moto → Clientes funcionou; menu não mostra Rotas; sem erros de console capturados; recarga após correção da moto manteve dashboard, histórico de 2 jornadas e valores visíveis | Não comprova login/logout, segunda conta nem gravação no servidor |
+| Viewport de 390 × 844 px no navegador | Clientes e card/histórico de jornada renderizaram sem overflow horizontal observado; viewport restaurado | Simulação de largura, não teste tátil em aparelho real |
+| Cabeçalho de período | Corrigido texto estático `AGO 2026 · semana 3`; preview de 28/09/2026 mostra `SET 2026 · semana 5`, com teste de virada de mês/ano | Não cobre app aberto continuamente durante a virada sem ocultar/reabrir a aba |
+| Resumo mensal de abastecimentos | Corrigido: em setembro, registros históricos somente de agosto/julho agora mostram `TOTAL NO MÊS R$ 0,00` no preview; 2 testes para filtragem mensal | Não equivale a salvar um abastecimento novo no servidor |
+| Cache do painel na troca de UID | Guarda em memória força recarga mesmo se localStorage falhar; erro de leitura/limpeza do cache faz o painel ignorá-lo sem sobrescrevê-lo; 9 testes de unidade/wiring novos | Troca de contas reais e storage bloqueado no navegador ainda não executados |
+| Escrita concorrente da moto | Writer do painel serializa snapshots em voo, usa transação que mantém o maior hodômetro e retenta após falha/retorno da conexão; teste real no Emulator reproduziu a redução antes da correção e passou depois | Sem validação UI offline com dois dispositivos; consumo manual ainda segue o último snapshot |
+| Falha síncrona da persistência da moto | Teste reproduziu exceção fora do fluxo de retry; writer agora restaura o snapshot e aceita retry mesmo se `persist` lançar antes de devolver Promise | Teste unitário com persistência injetada; falha de rede na UI real ainda pendente |
+| Jornada em dois aparelhos | O Emulator reproduziu duas jornadas abertas simultâneas (esperado: uma) e fechamentos simultâneos com dois resultados divergentes. Abertura usa `findOpen()` + `addDoc()` separados; fechamento usa `updateDoc()` sem comparar status no commit. Os dois testes de reprodução estão explicitamente pulados, aguardando aprovação de correção estrutural da DEC-027 | Bloqueio conhecido para beta multi-dispositivo; não declarar regra global de uma aberta nem fechamento idempotente como comprovados |
+| Texto de Moto e Clientes | Preview mostra referências a estimativas de jornada e contas em aberto, sem instruir o uso da aba oculta de Rotas | Revisão de microtexto; não altera cálculos nem dados |
+| CI do patch atual | Pendente: novo job `emulator-web` foi adicionado, mas o patch não foi enviado; a última execução publicada (`ef325fe`, 25/09/2026) passou | A CI verde anterior não cobre as alterações locais |
+| Navegador com Auth + Firestore Emulators (projeto `demo-motoboy`) | Login da conta A; jornada iniciada, recarregada e encerrada; custo estimado não gerou entrada; logout/login da conta B isolou o histórico; retorno à conta A restaurou dados. Abastecimento, manutenção e entrada manual foram criados, editados e mantidos após recarga. | Teste local em navegador, não comprova uso em aparelho físico nem concorrência real entre dispositivos |
+| Motivo de correção financeira | Reprodução: editar abastecimento gravava `editReason: null` no Firestore. Corrigido o envio do motivo antes da escrita nos três formulários; teste estático (3 casos) e leitura dos documentos no Emulator confirmaram os motivos de abastecimento, manutenção e entrada. | Não cobre offline/retry dessas edições; o rastro detalhado `editLog` ainda é local |
+| Queda do Firestore durante novo abastecimento (demo) | O card apareceu imediatamente como **Sincronizando**, sem mensagem de sucesso; ficou nesse estado durante a queda. Após restaurar o emulador, concluiu automaticamente uma vez (`1` documento da tentativa no Firestore). | Não apareceu **Não salvo** nem retry enquanto a promessa do SDK aguardava a rede. A recarga durante a queda e o retry idempotente seguem sem comprovação; correção estrutural proposta, aguardando aprovação. O reinício do emulador descartou dados anteriores desse projeto demo, não dados reais. |
+| Cliente/recebimento no navegador após reiniciar os Emulators | Inconclusivo: o cadastro de cliente não confirmou na UI nem criou documento; o SDK registrou erro de parsing do canal WebChannel no proxy local. A suíte transacional direta no Emulator continua verde. | Não usar esse ensaio de navegador como evidência de fluxo de clientes/recebimentos; requer nova sessão de teste estável. |
+
+## Resultados adicionais — 30/09/2026 (DEC-028)
+
+| Verificação | Resultado | Limite da evidência |
+| --- | --- | --- |
+| `npm run check` após ligar os três formulários às tentativas duráveis | Passou: typecheck global, 60 arquivos/986 testes e build Vite | Executado antes dos últimos ajustes de preservação do cache e do proxy; repetir no fechamento da etapa |
+| `firebase emulators:exec --only firestore --project demo-motoboy 'npm run test:emulator -- src/shared/infrastructure/firestore-durable-create-gateway.emulator.test.ts'` | Passou: 8 testes, incluindo três tipos, resposta perdida seguida de recarga, retries simultâneos, UID divergente, colisão, remoção após commit e falha/reconexão injetada | A falha de rede do último caso foi injetada no gateway; não simula queda física de conexão do navegador |
+| Browser isolado `127.0.0.1:5174` com Auth + Firestore Emulators `demo-motoboy` | Um abastecimento ficou **Aguardando conexão** após falha do proxy, sobreviveu à recarga com ação de retry e confirmou usando o mesmo ID; só depois entrou nos totais. Manutenção e entrada manual salvaram e foram recuperadas após recarga. Conta B abriu sem os dados da A; retorno à A restaurou os três registros e o resultado R$ 35,00. | Dados exclusivamente sintéticos em origem e projeto demo. A falha do proxy antecedeu o commit; a resposta perdida **após** commit é coberta no teste do Emulator, não observada via UI. Não equivale a teste em aparelho físico ou serviço real. |
+| Proxy local do Firestore | Corrigido encaminhamento de `/v1/projects/`, usado pelo SDK nas transações; antes o navegador registrava `Unexpected end of JSON input` e a criação não concluía. Após o ajuste, retry da tentativa pendente confirmou e a leitura remota ficou estável. | Somente configuração de desenvolvimento; nenhuma regra/deploy alterado. |
+| Viewport 390 × 844 px no navegador embutido | Painel e menus acessíveis; medição DOM: `scrollWidth` 375 = `clientWidth` 375, sem overflow horizontal nesse estado. | Simulação de viewport, não ensaio tátil em aparelho real nem inspeção visual completa de todos os modais. |
+| Cliente e recebimento no browser após correção do proxy | Cliente sintético criado e recuperado após recarga. Uma conta de teste de R$ 100 foi preparada diretamente no Emulator; recebimento parcial de R$ 40 deixou R$ 60 a receber e criou uma única entrada de R$ 40, conferida no faturamento após recarga. | A conta de R$ 100 foi fixture de teste, não gerada pela UI de Rotas (fora do beta). Não exercita cancelamento concorrente por dois aparelhos. |
+| Tentativas simultâneas em duas abas | Teste comportamental reproduziu perda de uma tentativa no array local V1. Corrigido com chave V2 individual por tentativa, leitura preservada de V1 e marcador V2 após confirmação. Testes verificam ambas as tentativas, recarga de V1, isolamento de UID e falha de storage. | O interleaving exato é simulado no teste unitário; o ensaio de duas abas reais está na linha seguinte. |
+| Duas abas reais no browser com Auth + Firestore Emulators (`demo-motoboy-browser2`) | Mesma conta sintética em duas abas: abastecimento de R$ 50 e manutenção de R$ 25 foram preparados com o Firestore parado. Ambas mostraram **Aguardando conexão** após recarga. Retomadas separadamente, confirmaram e o Firestore continha exatamente 1 documento e 1 marcador por tentativa, com IDs coincidentes. | O reinício do Emulator apagou a conta sintética; ela foi recriada com o mesmo UID e foi necessário entrar novamente antes de retomar. Não prova sessão contínua durante falha de Auth nem simultaneidade de commits em aparelhos físicos. |
+| Verificação final após a correção de duas abas | `npm run check`: typecheck global, 60 arquivos/992 testes e build passaram. Firestore Emulator isolado `demo-motoboy-verify`: 5 arquivos/24 testes passaram; `git diff --check` sem erros. | Os 2 testes antigos de concorrência da jornada continuam pulados; CI publicada e aparelho real ainda não validam este patch. |
+
+Nota operacional: a suíte completa de Rules chama `clearFirestore()` no projeto
+`GCLOUD_PROJECT` informado. A execução local posterior ao ensaio visual
+descartou os registros **sintéticos** criados naquele Emulator; não apontou
+para o projeto real nem removeu registros do usuário. Próximas execuções devem
+usar um `demo-*` exclusivo para a suíte, separado do projeto demo do browser.
+Após essa execução, a suíte foi repetida em `demo-motoboy-verify` para não
+voltar a limpar os dados usados no browser: 5 arquivos, 24 testes passaram e
+2 cenários antigos de concorrência da jornada ficaram pulados **naquela
+execução anterior**; ambos foram reativados e passaram na DEC-029. O `npm run
+check` final da etapa passou com 60 arquivos/992 testes, typecheck global e
+build. A CI publicada permanece pendente porque não houve push.
+
+**Roteiro manual ainda aberto em 30/09:** 1.2–1.5 no projeto real (login, troca de UID,
+sessão e falha de rede); 2.2–2.10 no projeto real (offline, retry, resposta
+perdida e exclusão remota); 2.7 e 2.10 foram simulados no Emulator, mas não
+em aparelho físico; 3.5 e 3.8 (idempotência/offline de jornada), confirmação de 3.10 com jornada
+aberta e teste tátil em celular físico. Os fluxos felizes de 1.2–1.4, 2.1,
+2.4, 3.2–3.4, 3.6–3.7, 3.9, 3.11 e 4.2–4.3 passaram apenas no projeto demo;
+não são evidência no projeto real. A sessão encontrada no preview pode conter
+dados reais; nenhuma mutação financeira ou exclusão foi feita nela durante
+esta verificação. Para executar o restante com segurança, são necessárias
+duas contas de teste e confirmação de que seus dados são descartáveis.
+
+## Resultado adicional — 30/09/2026 (DEC-029)
+
+Os dois testes de concorrência da jornada que estavam pulados foram
+reativados e executados separadamente no Firestore Emulator, antes da
+correção: duas aberturas produziram **2 jornadas abertas** (esperado: 1) e
+dois fechamentos devolveram **km final/custo divergentes**. Após a mudança
+transacional, a suíte focada passou com 5 testes; a suíte completa do
+Firestore Emulator passou com **5 arquivos/29 testes, nenhum pulado**,
+incluindo regras de UID para `jornadaState/current`. Um teste adicional
+preservou uma jornada legada sem controle e outro confirmou que dois inícios
+idênticos geram um único documento. Nenhuma regra foi alterada ou publicada.
+
+Permanecem abertos: ensaio do fluxo de jornada em dois aparelhos físicos,
+CI publicada (o patch não foi enviado), autenticação e falha de rede no
+projeto real e revisão tátil em celular. A transação só protege clientes que
+executam esta versão; instâncias antigas com `addDoc()` precisam ser
+atualizadas antes do beta multi-dispositivo.
+
+### Ensaio de interface — 01/10/2026
+
+No navegador local com Auth + Firestore Emulators (`demo-motoboy-journey-ui`),
+duas abas da mesma conta sintética enviaram leituras iniciais diferentes.
+Uma jornada foi criada; a outra aba apresentou o conflito e recarregou a
+jornada vencedora sem manter uma linha fantasma **Não salvo**. Após recarga,
+o histórico mostrou exatamente uma jornada fechada anterior e uma aberta.
+O Firestore confirmou esses dois documentos, `activeJornadaId` apontando
+para a aberta e **zero entradas financeiras**. O fechamento anterior foi
+feito pela UI (1.001 → 1.100 km, 35 km/L, R$ 5/L), com custo estimado de
+R$ 14,14, preservado após recarga. Isto usa duas abas de um navegador, não
+dois aparelhos físicos nem o projeto real.
+
+Após a reconciliação da interface, `npm run check` passou com **62 arquivos,
+999 testes, typecheck global e build**. A suíte integral do Firestore Emulator
+foi repetida em `demo-motoboy-journey-final`: **5 arquivos/29 testes passaram,
+nenhum pulado**. O bundle principal continua acima do aviso de 500 kB do
+Vite; isso não impediu o build, mas merece revisão de desempenho no celular.
+
+Um novo teste no Emulator reproduziu um caso ainda aberto: abertura
+confirmada, resposta perdida, fechamento por outro aparelho e retry do
+início original criaram uma **segunda jornada aberta**. O teste está
+explicitamente pulado enquanto se aguarda aprovação para fixar a identidade
+da abertura depois do fechamento; não contar este caso como coberto pela
+DEC-029. O beta multi-dispositivo permanece bloqueado por esse defeito.
+No estado atual, `npm run check` passou com 62 arquivos/999 testes, tipagem
+global e build; a suíte integral do Firestore Emulator passou com 29 testes
+e **1 pulado** (este caso), sem confundir verde parcial com liberação do beta.
+
+### Ensaio adicional em cópia isolada — 01/10/2026
+
+Uma cópia separada do checkout `review/beta-preparacao` (HEAD `ef325fe`),
+com o mesmo estado Git e sem copiar `.env`/`.env.local`, foi validada sem
+alterar os dois checkouts anteriores. `npm run check` passou com typecheck
+global, **62 arquivos/999 testes** e build. `npm --prefix functions run check`
+passou com typecheck, **2 arquivos/22 testes** e auditoria do bundle; o build
+das Functions precisou de leitura fora do sandbox para resolver imports, sem
+deploy. A suíte integral do Firestore Emulator (`demo-motoboy-clone-verify`)
+passou com **29 testes e 1 pulado**: o retry após fechamento por outro
+aparelho continua sem correção e não conta como sucesso.
+
+No navegador local com Auth + Firestore Emulators
+(`demo-motoboy-clone-browser`), duas contas sintéticas foram criadas apenas
+no Emulator. A conta A iniciou uma jornada de 1.000 km, recarregou e a
+encerrou em 1.100 km com 35 km/L e R$ 5/L: a UI exibiu 100 km, 2,86 L e
+R$ 14,29 somente como estimativa. A conta B abriu com histórico vazio e
+continuou vazia após recarga. Com os Emulators indisponíveis, B iniciou uma
+jornada de 2.000 km; a UI mostrou **Não salvo** e **Tentar salvar novamente**,
+preservou a tentativa após recarga e recusou o encerramento antes da
+sincronização. Após restaurar o export do Emulator, foi necessário entrar
+novamente; a tentativa da B permaneceu disponível e o retry a confirmou.
+Leitura direta no Firestore confirmou **1 jornada encerrada para A, 1 aberta
+para B e 0 entradas financeiras em ambas**. O export reportou falha do
+processo após indicar conclusão; seus arquivos foram importados e a leitura
+posterior confirmou a preservação dos dados sintéticos. Este ensaio não
+simula resposta perdida depois do commit, dois aparelhos físicos nem o
+projeto real. A revisão tátil em celular e a CI publicada seguem pendentes.
+Um export final foi importado novamente e confirmou os mesmos totais
+(A: 1 encerrada; B: 1 aberta; ambas sem entradas); os exports sintéticos
+ficaram fora do repositório em `Site Motoboy/emulator-artifacts/`.
+
+### Bloqueio reproduzido: troca de UID com jornada não salva — 01/10/2026
+
+Em outra origem local (`127.0.0.1:5175`) do mesmo projeto demo, a conta C
+iniciou uma jornada de 3.000 km com os Emulators indisponíveis. O painel
+mostrou **Não salvo** e **Tentar salvar novamente**. Após restaurar o estado
+exportado, entrar primeiro na conta A e voltar à C deixou o histórico da C
+vazio, sem ação de retry. Consulta direta confirmou **0 jornadas remotas**
+para C: a tentativa não havia sido confirmada e também não pôde ser
+recuperada. A conta A mostrou somente sua jornada encerrada, portanto não
+houve vazamento entre UIDs. A causa é `isolateLocalCache()` remover a chave
+única `motoboy-front-etapa1-v2-clean` na troca de dono; as jornadas locais
+sem `fsId` ainda vivem nessa chave. É perda de uma tentativa não confirmada,
+não corrigida por este ensaio. Requer persistência de pendências de jornada
+por UID, sem reexpor o cache legado de uma conta à outra. Nenhuma regra ou
+dado real foi alterado.
+
+### Gate local adicional de CI — 01/10/2026
+
+O comando do job `emulator-functions` foi executado na cópia isolada com
+Firestore Emulator e projeto `demo-motoboy-functions-clone-ci`:
+`npm --prefix functions run test:emulator` passou com **1 arquivo/7 testes**.
+O workflow contém jobs separados para web, Functions e integração nos
+Emulators. Esta execução local não substitui a CI publicada: o patch segue
+sem push, por instrução do proprietário, e nenhum novo job foi executado no
+GitHub para o HEAD com alterações locais. A CLI do workflow é obtida como
+`firebase-tools@latest`, de modo que a versão instalada pela CI pode diferir
+da versão local usada neste ensaio.
+
+### Correção da jornada: retry após fecho e troca de UID — 01/10/2026
+
+A DEC-030 foi aprovada e implementada na cópia isolada
+`Site Motoboy/Motoboy-beta-current`. Aberturas novas têm ID estável derivado
+do hodômetro/data/hora; a transação lê a mesma identidade antes de criar,
+inclusive se outro aparelho já encerrou a jornada. Documentos legados com
+ID aleatório e o mesmo início são reconhecidos na consulta de compatibilidade.
+O painel só anuncia nova abertura quando o retorno continua aberto. Cada
+tentativa não confirmada é guardada por UID e por tentativa antes do envio,
+sem depender do cache agregado que é limpo na troca de usuário.
+
+`npm run check` passou com tipagem global, **64 arquivos/1.006 testes** e
+build (aviso de bundle acima de 500 kB). A suíte integral do Firestore
+Emulator passou com **5 arquivos/31 testes, nenhum pulado**, incluindo o
+caso antes vermelho de retry após fechamento remoto e uma jornada legada
+encerrada. Testes locais cobrem chaves independentes por tentativa, recarga
+e isolamento de UID. No navegador com Auth Emulator ativo e Firestore
+indisponível, a conta sintética A iniciou 3.000 km; após recarga viu
+**Não confirmado** e **Tentar salvar novamente**. A conta B entrou com
+histórico vazio; ao retornar à A, a mesma tentativa reapareceu. Depois de
+reiniciar Auth + Firestore Emulators e reentrar na mesma conta sintética, o
+retry confirmou a jornada. Outra recarga manteve apenas uma jornada aberta;
+leitura direta no Firestore encontrou **1 jornada de 3.000 km em A, 0 em B e
+0 entradas financeiras nas duas contas**. `npm --prefix functions run check`
+passou com tipagem, 2 arquivos/22 testes e build. A CI publicada e o ensaio
+em aparelho físico ainda não cobrem o patch local. Nenhuma regra foi alterada
+ou implantada; os registros anteriores permanecem preservados.
+
+Na revisão para acesso móvel por HTTP na rede local, a geração de IDs de
+jornada, recebimento e criações duráveis deixou de depender exclusivamente de
+`crypto.randomUUID()`, indisponível em alguns contextos não seguros. O helper
+compartilhado usa `randomUUID` quando presente, UUID v4 sobre
+`crypto.getRandomValues()` como primeira alternativa e, em WebViews que
+removem Web Crypto por completo, combina tempo e entropia local. Esses IDs
+servem para unicidade/idempotência e nunca são credenciais ou segredos.
+
+### Validação local final desta etapa — 05/10/2026
+
+| Verificação | Resultado | Limite da evidência |
+| --- | --- | --- |
+| `npm run check` | Passou: tipagem global, **65 arquivos/1.009 testes** e build Vite | O bundle principal mantém o aviso acima de 500 kB; não é erro de build |
+| Firestore Emulator web (`demo-motoboy-final2-20261005`) | Passou: **5 arquivos/31 testes, nenhum pulado** | Projeto exclusivamente `demo-*`; nenhum dado ou regra de produção foi alterado |
+| `npm --prefix functions run check` | Passou: tipagem, **2 arquivos/22 testes** e auditoria do bundle | Check local; não substitui o job publicado |
+| Firestore Emulator Functions (`demo-motoboy-functions-final2-20261005`) | Passou: **1 arquivo/7 testes** | Projeto exclusivamente `demo-*`; sem deploy |
+| Viewport móvel 390 × 844 px | Dashboard, card e histórico de jornada e formulário de abertura renderizaram sem overflow horizontal. Medição DOM confirmou `scrollWidth <= innerWidth`; menu, fechar, cancelar e salvar têm alvo mínimo de **44 px**. O formulário permaneceu totalmente dentro do viewport. | Simulação responsiva no navegador embutido; não substitui toque, teclado virtual e safe-area em aparelho físico |
+| HTTP LAN real (`http://192.168.0.167:5176`) sem Web Crypto | A reprodução confirmou `window.crypto === undefined` e inicialmente encontrou crash no bootstrap do código oculto de Rotas. Após centralizar também esses geradores em `generateUuid()`, o painel abriu. A UI criou **1 cliente**, salvou **1 abastecimento de R$ 30,50** com documento + marcador no mesmo ID, e registrou **1 recebimento de R$ 20,00**, reduzindo o saldo sintético de R$ 50,00 para R$ 30,00 e criando uma única entrada com o mesmo `receiptOperationId`. Após recarga, o dashboard mostrou R$ 20,00 recebido, R$ 30,50 em despesas e resultado de -R$ 10,50. | Navegador no mesmo computador acessando pelo IP da LAN; comprova o contexto inseguro e o fallback, mas não substitui aparelho físico |
+| Ensaio de UI demo antes da autorização específica (`demo-motoboy-browser-final2-20261005`) | Auth e Firestore Emulators e Vite iniciaram; conta sintética criada e marcada como verificada apenas no Emulator. A revisão automática bloqueou o login antes do envio das credenciais; os serviços e a aba foram encerrados. | Registro histórico do bloqueio; o proprietário autorizou o login em seguida, e o novo ensaio está na linha abaixo |
+| Ensaio de UI autorizado (`demo-motoboy-browser-approved-20261005`) | Login da conta sintética, abastecimento de R$ 30,00 editado para R$ 36,00 com motivo e excluído; manutenção de R$ 25,00 editada para R$ 27,00 com motivo e excluída; entrada manual de R$ 40,00 editada para R$ 45,00 com motivo e excluída. Listas e totais voltaram a zero; após recarga a sessão permaneceu autenticada e os totais continuaram zerados. Leitura direta no Firestore Emulator encontrou **0 documentos** nas três coleções e hodômetro da moto em **1.510 km**. Após sair e desligar o Auth Emulator, o login exibiu **“Serviço temporariamente indisponível. Tente mais tarde.”**, sem informar se o e-mail existe. | Conta e dados exclusivamente sintéticos em projeto `demo-*`. Não cobre resposta perdida após commit pela UI, toque físico, teclado virtual nem projeto beta real |
+| Diff | `git diff --check` sem erro; somente avisos esperados de LF → CRLF no Windows | Worktree continua intencionalmente sem commit/push |
+
+A última CI publicada consultada foi a execução
+[`36186231275`](https://github.com/itronicrioverde-pixel/Motoboy/actions/runs/36186231275),
+verde no commit `ef325fe6c39b0fd8de3463db3570561d37875fa7` com os três jobs então
+publicados. Ela não contém este patch sem commit nem o quarto job web no
+Emulator presente no workflow local, portanto não é evidência de CI verde para
+as alterações atuais. Uma nova consulta à branch em 05/10 confirmou que essa
+continua sendo a execução mais recente.
+
+### Estado do roteiro de liberação em 05/10
+
+| Bloco | Comprovado nesta revisão | Ainda necessário para liberação |
+| --- | --- | --- |
+| 1 — Login e UID | Login, logout, troca de conta, recarga e isolamento em contas sintéticas no Auth + Firestore Emulators; tentativa de jornada da conta A não apareceu na B e reapareceu ao retornar à A. Login sem Auth Emulator mostrou erro genérico | Repetir com duas contas de teste do projeto beta e confirmar a experiência sem conexão no aparelho |
+| 2 — Gravações e retry | Criação, recarga, falha, reconexão e retry exercitados na UI demo; resposta perdida após commit coberta somente no Emulator. Edição e exclusão de abastecimento, manutenção e entrada manual passaram na UI demo aprovada; cliente, recebimento e abastecimento também foram exercitados via HTTP LAN sem Web Crypto | Executar 2.1–2.10 no aparelho/projeto beta, especialmente resposta perdida após commit e toque duplo no retry pela interface |
+| 3 — Jornada | Abertura, recarga, fechamento, custo só estimado, histórico, conflito entre aparelhos, tentativa offline, troca de UID e retry demonstrados em navegador demo e Emulator | Executar 3.1–3.11 no aparelho/projeto beta, incluindo hodômetro real, teclado virtual e histórico com jornada aberta e encerrada |
+| 4 — Regressão | Navegação, totais e recarga exercitados no navegador demo; viewport 390 × 844 sem overflow horizontal | Conferir navegação, valores e interação tátil em aparelho físico com as contas de teste |
+| CI | Checks locais do patch atual aprovados | Publicar o patch autorizado e aguardar os quatro jobs da CI no commit correspondente |
+
+O proprietário autorizou commit/push da branch e o login sintético em 05/10;
+o ensaio acima cobriu o login. O patch ainda não pode ser declarado liberado
+para beta até que os quatro jobs da CI cubram o commit publicado e o roteiro
+seja executado em aparelho físico. O proprietário fará a etapa no celular.

@@ -935,7 +935,7 @@ Hierarquia de dados (DEC-006, DEC-012):
 - `clienteSave` (criar/editar) escreve em `customers/{id}` via `window.__motoboyCustomers` (bridge) **antes** de atualizar o array local.
 - `deleteClient` remove de `customers/{id}` via bridge **antes** de remover do array local.
 - Em falha remota, a operação é abortada, o estado anterior é preservado e uma mensagem de erro é exibida ao usuário.
-- IDs de novos clientes são gerados via `crypto.randomUUID()` dentro de `createClientDual`/`applyRoutePendingsDual` — pré-gerados antes da transação para estabilidade.
+- IDs de novos clientes são gerados via `generateUuid()` dentro de `createClientDual`/`applyRoutePendingsDual` — `randomUUID` quando disponível, `getRandomValues` como primeira alternativa e tempo + entropia local quando Web Crypto inexiste no HTTP local; são pré-gerados antes da transação para estabilidade e não funcionam como segredo.
 - Bridge (`panel-bridge.ts`) propaga erros — o chamador é responsável por tratar falhas.
 - Pendências financeiras de rota são aplicadas atomicamente via `applyRoutePendingsDual` (uma transação para todos os serviços).
 
@@ -1007,7 +1007,7 @@ Retry (feature em estado failed):
 - Nome normalizado permanece como fallback de migração, não como chave de identidade.
 - Escrita debounced não financeira captura UID no agendamento e confirma antes de executar — impede escrita com UID errado após logout/troca de usuário.
 - CRUD de clientes propaga erros e preserva estado anterior em falha — sem dados corrompidos.
-- IDs de clientes são gerados por `crypto.randomUUID()` — estáveis e únicos para migração de registros legados.
+- IDs de clientes são gerados por `generateUuid()` — estáveis e únicos para migração de registros legados, inclusive no HTTP da rede local.
 - `clients/data` continua sendo um agregado temporário, mas não possui caminho de escrita financeira fora das transações de `client-writer.ts`.
 
 ### Testes adicionados
@@ -1138,7 +1138,7 @@ Fase 3: Atualizar rota para status:'confirmed'
 - **Rota pending visível no histórico**: Card recebe classe `pending` (opaco, borda tracejada) e badge `Pendente`. `routeHistoryYears()` inclui rotas pending (visíveis no histórico).
 - **Rota pending excluída do dashboard**: Filtro `item.status !== 'pending'` na contagem de entregas do dia.
 - **Transição confirmed→pending rejeitada transacionalmente**: `firestore-rota-repository.ts` usa `runTransaction` para ler status existente e rejeitar downgrade atomicamente. Sem condição de corrida.
-- **routeId com UUID**: `rota-${crypto.randomUUID()}` — ID globalmente único, não depende de timing.
+- **routeId com UUID**: `rota-${generateUuid()}` — ID globalmente único, não depende de timing e funciona no HTTP da rede local.
 - **Legado**: Rotas antigas sem `status` são tratadas como `confirmed` (default no `toEntity`).
 
 #### Atomicidade do CRUD de clientes (`client-writer.ts`)
@@ -1148,7 +1148,7 @@ Fase 3: Atualizar rota para status:'confirmed'
 - **Reversibilidade**: Em falha, nenhuma das duas fontes (`customers/{id}`, `clients/data`) é alterada.
 - **Idempotência**: IDs são pré-gerados antes da transação. O callback pode ser repetido pelo Firestore sem gerar IDs diferentes.
 - **Migração de legado (editar sem ID)**:
-  - `updateClientDual('', { name })` gera um ID estável via `crypto.randomUUID()`.
+  - `updateClientDual('', { name })` gera um ID estável via `generateUuid()`.
   - Cria `customers/{id}` e atualiza `clients/data` com o novo ID — atomicamente.
   - Retorna o ID resolvido para o painel atualizar o array local.
 - **Exclusão de legado (sem ID)**:
@@ -1255,7 +1255,7 @@ O único caminho público de cancelamento é `cancelAtomic()` → `cancelRouteDu
 
 `ApplyReceiptInput` recebe campo obrigatório `receiptOperationId` (string). Regras:
 
-- **Gerado uma vez por submissão**: `receipt-${crypto.randomUUID()}` gerado antes do `try` em `panel.js`.
+- **Gerado uma vez por submissão**: `receipt-${generateUuid()}` gerado antes do `try` em `panel.js`; usa `getRandomValues` e, se Web Crypto inexiste no HTTP da rede local, tempo + entropia local. O identificador não é credencial nem segredo.
 - **Pré-gerado antes de `runTransaction`**: sobrevive a reexecuções do callback pelo Firestore.
 - **Persistido em `recebimentos[]`** do cliente.
 - **Idempotência**: Mesmo `receiptOperationId` + mesmo payload → no-op (retorna estado atual sem escrever).
@@ -1436,7 +1436,7 @@ Medir percurso e custo diário estimado sem acoplar ao financeiro, evitando lan�
 
 - Nova coleção isolada por dono; o roteiro manual e a CI (Etapa 3) cobrem o fluxo de abertura/fechamento.
 - No mesmo aparelho, uma jornada aberta rejeita um novo início (evita dupla).
-- Multi-dispositivo: a checagem de "1 em aberto" é feita no serviço; dois aparelhos abrindo quase simultaneamente podem gerar jornada dupla — mitigação futura por transação Firestore, não implementada nesta etapa.
+- Multi-dispositivo: a checagem de "1 em aberto" era feita somente no serviço; dois aparelhos podiam abrir jornadas simultâneas. **Esta limitação foi substituída pela DEC-029.**
 - Sem deploy do servidor; nenhuma nova Cloud Function.
 
 ### Testes
@@ -1444,15 +1444,198 @@ Medir percurso e custo diário estimado sem acoplar ao financeiro, evitando lan�
 - `src/features/jornada/domain/jornada.test.ts` (10 testes): distância e custo estimado (valores inválidos, sem referências, km final menor que o inicial) e litros estimados pelo hodômetro.
 - `src/features/jornada/application/jornada-service.test.ts` (11 testes): abertura com 1 em aberto, reenvio idempotente da abertura, km inicial inválido, km final menor que o inicial, fim antes do início (data e hora), custo estimado, idempotência de fechamento, jornada inexistente.
 - `src/features/jornada/infrastructure/firestore-jornada-repository.test.ts` (4 testes): conversão do snapshot (aberta, fechada com referências, status desconhecido, defaults).
-- `src/legacy/jornada-wiring.test.ts` (13 testes): ponte no painel, mescla de pendências, conexão em `main.ts`, ocultação de Rotas, retry da abertura, consumo obrigatório, km da moto com leituras de jornada e regra CSS dos campos de combustível.
-- Total do projeto: 896 → **945** (46 → 49 arquivos) ao final da Etapa 2 e dos ajustes verificados na revisão do hodômetro.
+- `src/features/jornada/application/jornada-close-form.test.ts` (9 testes): consumo e preço obrigatórios/opcionais, texto inválido que não vira fallback silencioso e km final inválido.
+- `src/features/jornada/presentation/jornada-form-values.test.ts` (2 testes) e `jornada-history.test.ts` (2 testes): leitura de milhar/decimal em pt-BR e histórico com datas completas mantendo jornadas abertas.
+- `src/legacy/jornada-wiring.test.ts` (15 testes): ponte no painel, mescla de pendências, conexão em `main.ts`, ocultação de Rotas, retry da abertura, consumo obrigatório, km da moto com leituras de jornada, regra CSS e formulário com `<form>` enviando por submit.
+- Total do projeto: 896 → **953** (46 → 51 arquivos) ao final da Etapa 2 e dos ajustes verificados na revisão do hodômetro.
 
 ### Atualização — 25/09/2026: hodômetro informado e histórico
 
 - O hodômetro passa a ser **informado pelo motoboy em formulário modal** na abertura e no encerramento (km final, consumo e preço editáveis); a abertura deixa de usar automaticamente o `currentKm` da moto. A origem manual do consumo registra-se como `moto`.
 - O card de jornada em aberto mostra apenas o KM INICIAL; o card encerrado mostra também a **gasolina estimada** (litros) e o dashboard ganha o **histórico de jornadas encerradas** (`#jornadaHistory`).
 - **Retry idempotente**: "Tentar salvar novamente" reenvia a **mesma** jornada em aberto (sem `fsId`) via `settleLocalAdd` — nunca abre formulário nem duplica o registro. Política pura em `src/features/jornada/application/jornada-start-plan.ts` (5 testes, 1 deles executando o `settleLocalAdd`).
-- **Consumo obrigatório no encerramento**: só fecha com km/L válido (digitado > 0, origem `moto`) ou o consumo vigente da moto (origem `historico`/`moto`); preço permanece opcional. Validação pura em `src/features/jornada/application/jornada-close-form.ts` (7 testes).
+- **Consumo obrigatório no encerramento**: só fecha com km/L válido (digitado > 0, origem `moto`) ou o consumo vigente da moto (origem `historico`/`moto`); preço opcional (digitado inválido bloqueia, sem reaproveitar o anterior). Validação pura em `src/features/jornada/application/jornada-close-form.ts` (9 testes).
 - **Reenvio idempotente da abertura:** se já existir uma jornada em aberto com o mesmo `kmInicial`, `dataInicioISO` e `horaInicioISO`, o `start` devolve a existente em vez de duplicar (resposta perdida no `settleLocalAdd`).
 - `panel-bridge.close` passa a retornar a jornada fechada (`Jornada | null`); o painel usa os dados salvos do servidor como fonte da verdade e registra o km final no `currentKm` da moto (`registrarKm` + `syncMotoToFirestore`).
 - `computeEstimatedLiters` centraliza a estimativa de litros; o custo estimado continua sendo derivado e **nunca** vira despesa (regra inalterada).
+- A apresentação do histórico mostra todas as jornadas do usuário, inclusive a aberta, ordenadas pelo início; cada item exibe datas e horas de início e fim, hodômetros, percurso, litros e custo. O formulário de encerramento resolve as referências vigentes antes de enviar a gravação.
+
+---
+
+## DEC-028 — Criação durável e idempotente de abastecimentos, gastos e entradas manuais
+
+**Status:** Aprovada
+**Data:** 29/09/2026
+**Decisor:** proprietário do Motoboy
+
+### Contexto
+
+As três criações do painel usavam `addDoc()`: o SDK podia manter a Promise em
+andamento durante uma queda de rede. Após recarga, um novo envio geraria outro
+ID e poderia duplicar o registro; a interface não tinha uma tentativa
+confirmável com identidade estável. O teste no Emulator mostrou
+**Sincronizando** durante a queda, sem transição para **Não salvo**.
+
+### Decisão
+
+- Antes de qualquer envio, gerar ID remoto, UID e payload completo (inclusive
+  timestamps) e persistir a tentativa em chave local versionada por UID e por
+  tentativa. Falha
+  nessa persistência impede o envio, preservando o formulário.
+- Retry e recarga leem a tentativa persistida e reutilizam exatamente o ID,
+  UID e payload. Uma chamada em voo por tentativa é compartilhada por cliques
+  simultâneos. Troca de UID não aplica sucesso nem limpa a tentativa anterior.
+- A infraestrutura usa transação Firestore para criar o documento e um marcador
+  `users/{uid}/createAttempts/{kind}_{id}` atomicamente. Marcador já existente
+  com o mesmo payload significa operação aplicada; com payload diferente é
+  conflito. Documento preexistente sem marcador nunca é sobrescrito. Se o
+  documento foi removido após o commit, o marcador impede ressuscitá-lo.
+- A interface mantém **Aguardando conexão** ou **Não confirmado**, com ação
+  **Tentar novamente**, até confirmação do servidor. Somente então anuncia
+  **Salvo**. Registros ainda não confirmados não podem ser editados/excluídos,
+  para manter o payload da tentativa imutável.
+- A mudança vale apenas para novas criações desses três fluxos. Documentos
+  existentes e outras coleções não são migrados ou apagados. As regras atuais
+  já autorizam a subárvore do próprio UID; não haverá deploy de regras.
+
+### Alternativas consideradas
+
+- Continuar com `addDoc()` e retry por conteúdo: simples, mas sem identidade
+  estável; resposta perdida permite duplicação.
+- Usar `setDoc()` no mesmo ID sem marcador: evita duplicatas comuns, mas um
+  retry poderia sobrescrever uma edição ou ressuscitar um registro removido.
+
+### Consequências e validação
+
+- Cada criação grava um documento marcador adicional, permanente para evitar
+  reaplicação após remoção. A tentativa local permanece até confirmação ou
+  reconciliação autoritativa; o cache do painel não é a fonte da identidade.
+- Chaves locais V1 (array por UID) permanecem legíveis e intactas. As novas
+  tentativas usam chaves V2 individuais para que duas abas não sobrescrevam
+  tentativas distintas; após confirmação, um marcador local V2 oculta a
+  tentativa V1 correspondente sem reescrever o array legado.
+- Testar resposta perdida, recarga, retries simultâneos, troca de UID,
+  reconexão, gravações intercaladas entre abas, compatibilidade V1,
+  colisão com documento existente e remoção após commit no
+  Firestore Emulator, além da ação visível no painel.
+- Esta decisão complementa a DEC-022 (separação do cache), a DEC-025/026
+  (idempotência financeira) e não altera a DEC-027 (jornada).
+
+---
+
+## DEC-029 — Concorrência transacional da jornada entre aparelhos
+
+**Status:** Aprovada
+**Data:** 30/09/2026
+**Decisor:** proprietário do Motoboy
+
+### Contexto
+
+A DEC-027 mantinha `findOpen()` + `addDoc()` e leitura + `updateDoc()` como
+operações separadas. O Firestore Emulator reproduziu duas jornadas abertas
+para o mesmo UID e dois fechamentos simultâneos retornando resultados
+diferentes para o mesmo registro.
+
+### Decisão
+
+- Cada UID passa a ter `users/{uid}/jornadaState/current` com
+  `activeJornadaId`. Os documentos históricos continuam em
+  `users/{uid}/jornadas`; nenhum registro existente é migrado ou apagado.
+- A abertura consulta o servidor para reconhecer jornadas legadas em aberto.
+  Se não houver, uma `runTransaction` lê o documento de controle e cria a
+  jornada e a referência ativa no mesmo commit. Um concorrente com dados
+  idênticos recebe a jornada já salva; com dados diferentes, é rejeitado.
+  ID e timestamps da nova jornada são preparados antes do callback
+  transacional, que pode ser reexecutado pelo Firestore.
+- O fechamento usa `runTransaction` para ler a jornada e o controle. Se já
+  estiver fechada, devolve exatamente a projeção persistida, sem reescrever.
+  Caso contrário, grava o fechamento e libera o controle no mesmo commit
+  quando ele aponta para aquela jornada. O caso de uso devolve essa projeção
+  autoritativa ao painel, inclusive se outro aparelho venceu a corrida.
+- `findOpen()` exige leitura do servidor; cache offline não pode autorizar
+  uma nova abertura. As regras vigentes já isolam a subárvore pelo UID. Não
+  há alteração nem deploy de `firestore.rules`.
+- Conflito por jornada já aberta é distinto de falha de rede. O painel remove
+  somente a tentativa local rejeitada e busca a jornada autoritativa do
+  mesmo UID; uma carga posterior também reconcilia tentativas falhas com a
+  abertura remota ou com a mesma jornada já fechada. Falha de conexão sem
+  correspondente remoto continua disponível para retry, sem anunciar sucesso.
+
+### Relação com decisões anteriores e limites
+
+Esta decisão **substitui apenas a consequência de concorrência
+multi-dispositivo da DEC-027**; as regras de hodômetro, referências e custo
+estimado sem lançamento financeiro continuam válidas. Clientes antigos que
+continuem usando `addDoc()` não participam da trava até serem atualizados.
+Jornadas legadas já duplicadas não são mescladas automaticamente; a leitura
+de uma jornada aberta impede uma nova criação, preservando o histórico.
+Em 01/10/2026, um teste adicional mostrou que a identidade por data/hora/km
+da abertura não sobrevive a um fechamento remoto anterior ao retry: a
+implementação anterior podia reabrir uma jornada já encerrada. A DEC-030
+refina a identidade da abertura e a durabilidade das tentativas locais;
+as demais regras de concorrência desta decisão permanecem válidas.
+
+### Validação
+
+- Os dois testes de corrida antes pulados falharam no Emulator antes da
+  correção e passaram depois: apenas uma abertura de dados divergentes e
+  fechamento simultâneo com o mesmo resultado persistido.
+- Testes adicionais cobrem jornada legada aberta sem documento de controle,
+  início idêntico em dois clientes e permissão do controle apenas ao próprio
+  UID. A suíte integral do Firestore Emulator passou com 5 arquivos/29 testes.
+- O ensaio no navegador com duas abas sintéticas confirmou que a aba perdedora
+  carrega a jornada vencedora sem registro local fantasma; recarga manteve
+  uma jornada aberta e a anterior fechada, sem entrada financeira.
+
+---
+
+## DEC-030 — Identidade estável e tentativa local por UID da jornada
+
+**Status:** Aprovada
+**Data:** 01/10/2026
+**Decisor:** proprietário do Motoboy
+
+### Contexto
+
+Dois defeitos foram reproduzidos: uma resposta de abertura perdida seguida
+de fechamento em outro aparelho permitia ao retry criar uma jornada nova;
+uma tentativa offline mantida apenas no cache agregado desaparecia ao trocar
+de UID, pois o isolamento da conta limpa corretamente esse cache.
+
+### Decisão
+
+- Novas aberturas usam ID `j1_` seguido da codificação hexadecimal UTF-8 dos
+  dados imutáveis `[kmInicial, dataInicioISO, horaInicioISO]`, dentro da
+  subárvore do UID. A codificação não depende de WebCrypto, indisponível em
+  alguns navegadores acessando o desenvolvimento por HTTP na rede local.
+  O ID é preparado antes da transação, e a transação lê esse documento antes
+  de criar: retry de uma abertura já fechada recebe o histórico existente e
+  jamais reabre a jornada. O serviço/painel não anunciam nova abertura nesse
+  caso. A consulta por dia reconhece também documentos antigos de ID aleatório
+  cujo mesmo início já foi encerrado.
+- Cada tentativa não confirmada é gravada antes do envio em uma chave local
+  independente por UID e por tentativa. Recarga e troca de usuário restauram
+  somente as tentativas do UID atual, com ação visível de retry. A tentativa
+  sai desse armazenamento apenas após confirmação remota ou reconciliação
+  autoritativa com uma jornada aberta/fechada; falha de persistência local
+  impede o envio. O cache agregado continua isolado/limpo na troca de UID.
+- Nenhum documento histórico é apagado, migrado ou reescrito. Não há mudança
+  nem deploy de `firestore.rules`.
+
+### Limites e relação com decisões anteriores
+
+Esta decisão **refina a identidade e a recuperação da abertura da DEC-029**
+e a política de retry da DEC-027; não substitui o fechamento transacional,
+as validações de hodômetro ou a regra de custo apenas estimado. Clientes
+antigos ainda usando IDs aleatórios não participam da nova identidade; a
+consulta de compatibilidade reconhece registros já persistidos, mas uma
+escrita concorrente de um cliente antigo não é atomicamente protegida pelo
+novo ID. Uma nova jornada com exatamente os mesmos km, data e hora de início
+de outra já encerrada é interpretada como retry da anterior.
+
+### Validação requerida
+
+Teste no Firestore Emulator do retry após fecho remoto, do documento legado
+fechado e de aberturas simultâneas. Testes locais de recarga, troca de UID,
+duas abas e reconciliação; ensaio UI com Auth + Firestore Emulators antes de
+considerar o beta liberado.
