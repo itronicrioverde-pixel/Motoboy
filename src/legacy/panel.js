@@ -6,6 +6,7 @@ import { mergeLegacyCustomers } from '../features/customers/application/merge-le
 import { clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
 import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
 import { persistMotoSnapshot } from '../features/moto/infrastructure/moto-transaction-writer';
+import { manualConsumptionStatusText } from '../features/moto/presentation/manual-consumption-status';
 import { settleLocalAdd, mergeRemoteWithPending } from '../shared/application/pending-local-write';
 import { applyReceiptResult } from '../features/customers/application/apply-receipt-result';
 import { createReceiptSubmissionManager } from '../features/customers/application/receipt-submission-manager';
@@ -375,6 +376,20 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
 
   let motoRetryTimer = null;
   let motoSyncErrorShown = false;
+  let motoManualSaveState = 'loading';
+  let motoManualPendingValue = null;
+  let motoManualPendingUid = null;
+  function renderManualConsumptionFeedback(){
+    const input = document.getElementById('motoConsumptionInput');
+    const status = document.getElementById('motoConsumptionStatus');
+    if(!status || !input) return;
+    if(!consumoManualDefinido || !(CONSUMO_ATUAL > 0)){
+      status.textContent = '';
+      return;
+    }
+    if(document.activeElement !== input) input.value = CONSUMO_ATUAL;
+    status.textContent = manualConsumptionStatusText(CONSUMO_ATUAL, motoManualSaveState);
+  }
   function scheduleMotoRetry(){
     if(motoRetryTimer !== null) return;
     motoRetryTimer = setTimeout(() => {
@@ -392,11 +407,24 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
       gate: motoHydrated,
       persist: async (ref, snapshot) => {
         const saved = await persistMotoSnapshot(ref, snapshot);
+        if(ref.path.split('/')[1] !== currentUid()) return;
         motoSyncErrorShown = false;
         if(motoRetryTimer !== null){ clearTimeout(motoRetryTimer); motoRetryTimer = null; }
-        window.__applyRemoteMoto?.(saved);
+        if(motoManualPendingUid === currentUid() && motoManualPendingValue === saved.consumption && saved.consumptionIsManual){
+          motoManualSaveState = 'saved';
+          motoManualPendingValue = null;
+          motoManualPendingUid = null;
+        }
+        const visible = motoManualPendingValue !== null
+          ? { ...saved, consumption: CONSUMO_ATUAL, consumptionIsManual: consumoManualDefinido }
+          : saved;
+        window.__applyRemoteMoto?.(visible);
       },
       onError(){
+        if(motoManualPendingUid === currentUid() && motoManualPendingValue !== null){
+          motoManualSaveState = 'awaiting';
+          renderManualConsumptionFeedback();
+        }
         if(!motoSyncErrorShown){
           showToast('Erro ao sincronizar dados da moto. A tentativa será repetida quando houver conexão.', {kind:'error'});
           motoSyncErrorShown = true;
@@ -466,7 +494,9 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
       if(typeof data.consumptionIsManual === 'boolean'){
         consumoManualDefinido = data.consumptionIsManual;
       }
+      motoManualSaveState = consumoManualDefinido && Number(data.consumption) > 0 ? 'saved' : 'loading';
     }
+    renderManualConsumptionFeedback();
     saveLocalState();
   }
   function hydrateClientes(remoteClientes){
@@ -1343,6 +1373,7 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
     if(typeof data.consumptionIsManual === 'boolean'){
       consumoManualDefinido = data.consumptionIsManual;
     }
+    renderManualConsumptionFeedback();
   };
 
   function maintTotal(){ return confirmedRecords(maintenances).reduce((s, m) => s + m.valor, 0); }
@@ -2385,9 +2416,12 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
     }
     CONSUMO_ATUAL = consumption;
     consumoManualDefinido = true;
+    motoManualPendingValue = consumption;
+    motoManualPendingUid = currentUid();
+    motoManualSaveState = 'pending';
     saveLocalState();
     syncMotoToFirestore();
-    document.getElementById('motoConsumptionStatus').textContent = `${consumption.toFixed(1).replace('.', ',')} km/L salvos à mão para estimar jornadas.`;
+    renderManualConsumptionFeedback();
     renderMotoConsumo();
     renderRouteSummary();
     routeServices.forEach((s, i) => s.entregas.forEach((_, j) => updateServiceVerdict(i, j)));
@@ -5010,10 +5044,7 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
   initBrDateFields();
   ensureRefuelDateDefault(); // 2B: preenche a data de hoje na carga (form fixo de abastecimento)
   installStationCombobox(); // 2C: instala o combobox de posto (listeners uma única vez)
-  if(consumoManualDefinido){
-    document.getElementById('motoConsumptionInput').value = CONSUMO_ATUAL;
-    document.getElementById('motoConsumptionStatus').textContent = `${CONSUMO_ATUAL.toFixed(1).replace('.', ',')} km/L salvos à mão para estimar jornadas.`;
-  }
+  renderManualConsumptionFeedback();
   recalculateMotoKmFromRecords();
   recalcConsumoReal();
   renderMotoConsumo();

@@ -98,6 +98,13 @@ describe('panel.js — propriedades estáticas', () => {
       const block = extractWindowAssignment(panelSource, '__applyRemoteMoto');
       expect(block).not.toContain('saveLocalState');
     });
+
+    it('atualiza os controles de consumo quando chega uma projeção remota', () => {
+      expect(extractWindowAssignment(panelSource, '__applyRemoteMoto'))
+        .toContain('renderManualConsumptionFeedback()');
+      expect(extractFunction(panelSource, 'hydrateMoto'))
+        .toContain('renderManualConsumptionFeedback()');
+    });
   });
 
   describe('__applyRemoteClientes não habilita persistência', () => {
@@ -124,6 +131,20 @@ describe('panel.js — propriedades estáticas', () => {
       expect(panelSource).toContain('scheduleMotoRetry()');
       expect(panelSource).toContain("window.addEventListener('online', () => {");
       expect(panelSource).toContain('motoWriter.retry()');
+    });
+
+    it('consumo manual só é marcado salvo depois de persistMotoSnapshot confirmar', () => {
+      const write = panelSource.slice(
+        panelSource.indexOf('persist: async (ref, snapshot) =>'),
+        panelSource.indexOf('onError(){', panelSource.indexOf('persist: async (ref, snapshot) =>')),
+      );
+      expect(write).toMatch(/await persistMotoSnapshot\(ref, snapshot\)[\s\S]*motoManualSaveState = 'saved'/);
+      const click = panelSource.slice(
+        panelSource.indexOf("getElementById('btnSaveConsumption').addEventListener"),
+        panelSource.indexOf('function newEntrega()', panelSource.indexOf("getElementById('btnSaveConsumption').addEventListener")),
+      );
+      expect(click).toContain("motoManualSaveState = 'pending'");
+      expect(click).not.toContain('km/L salvos à mão');
     });
 
     it('syncMotoToFirestore tem guarda if(!motoHydrated.isOpen) return', () => {
@@ -440,7 +461,7 @@ function extractFunction(source: string, name: string): string {
 }
 
 function extractWindowAssignment(source: string, propName: string): string {
-  const regex = new RegExp(`window\\.__${propName}\\s*=\\s*function`);
+  const regex = new RegExp(`window\\.${propName}\\s*=\\s*function`);
   const match = regex.exec(source);
   if (!match) return '';
   const startIdx = source.indexOf('{', match.index);

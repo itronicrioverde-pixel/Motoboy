@@ -550,3 +550,37 @@ manteve a jornada aberta no histórico, também sem badge. A falha de rede e
 o retry continuam cobertos por testes anteriores; este ensaio não os repetiu
 nem substitui a verificação no Android físico/projeto beta. Nenhum deploy ou
 regra foi alterado.
+
+### Uma conta no Android e acesso opcional no computador — 07/10/2026
+
+O cenário de uso foi esclarecido: **um Android por conta**, com acesso
+opcional à mesma conta no computador. Não é requisito operar dois celulares
+simultaneamente. As sessões independentes de navegador abaixo simulam a
+continuidade entre aparelhos, não substituem o teste no Android real.
+
+Em Auth + Firestore Emulators isolados (`demo-motoboy-parity2-1007`), a conta
+sintética A registrou uma manutenção de R$ 32,00 e 5.000 km. Após recarga,
+a sessão do computador mostrou a mesma manutenção, quilometragem e despesa.
+O computador gravou consumo manual de 41 km/L; a outra sessão, após recarga,
+mostrou 41 km/L. Uma conta de cliente **sintética de teste**, de R$ 100,00,
+foi preparada diretamente no Emulator porque a aba Rotas está oculta no beta.
+A conta A recebeu R$ 40,00 pela interface; após recarga, o computador exibiu
+saldo devedor de R$ 60,00, uma entrada de R$ 40,00 e resultado mensal de
+R$ 8,00 após a manutenção. Esse ensaio **não valida** a criação da conta a
+partir de uma rota real.
+
+No mesmo computador, a troca para a conta sintética B exibiu painel sem
+registros, zero clientes e moto sem a manutenção ou quilometragem da conta A.
+Ao voltar para A, os valores reapareceram. A leitura direta do Firestore
+Emulator confirmou A com saldo de cliente de R$ 60,00, uma entrada de
+recebimento e moto em 5.000 km/41 km/L; B não tinha clientes nem entradas.
+Não houve escrita simultânea entre as sessões.
+
+O ensaio revelou que o consumo manual dizia “salvo” antes da confirmação
+remota, pois o writer aplica debounce. A interface passou a mostrar
+**Sincronizando** durante a tentativa, **Aguardando conexão. Ainda não
+confirmado** em erro e **salvos à mão** somente após o retorno da transação;
+a hidratação remota também atualiza campo e status. O teste focado foi
+executado e a UI foi verificada novamente no Emulator. Ainda faltam o teste
+no Android físico e no projeto beta real, inclusive rede móvel, reconexão e
+teclado virtual. Nenhum deploy ou regra foi alterado.
