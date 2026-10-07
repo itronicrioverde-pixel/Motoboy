@@ -2,7 +2,16 @@
 
 Roteiro de teste manual para a preparação do beta (`review/beta-preparacao`).
 Ele complementa a suíte automatizada (vitest) cobrindo o que os testes mockam:
-autenticação real, Firestore real e comportamento multi-dispositivo.
+autenticação real, Firestore real e continuidade dos dados entre celular e
+computador da mesma conta.
+
+**Escopo confirmado para o beta em 07/10/2026:** cada pessoa usará um celular
+por conta, mas poderá entrar na mesma conta pelo computador e encontrar seus
+dados. O teste de aceite deve comprovar a ida e a volta celular ↔ computador,
+com recarga após cada gravação. Não é necessário operar dois celulares ao
+mesmo tempo nem provocar escritas concorrentes entre aparelhos para liberar
+este beta. As proteções de concorrência já implementadas permanecem; os
+ensaios históricos abaixo não passam a ser requisito de dois celulares.
 
 > NUNCA executar `firebase deploy` sem autorização. Estes passos usam o
 > preview local (`npm run dev`) com o projeto real do `index.html`.
@@ -17,20 +26,23 @@ e executar o Vite com `VITE_USE_LOCAL_EMULATORS=true`,
 O proxy do Vite e a conexão dos SDKs só são habilitados em desenvolvimento
 com `projectId` iniciado por `demo-`; não são usados no build de produção.
 As contas criadas nesse ambiente são descartáveis e não substituem o teste
-em dois dispositivos/contas do projeto de beta.
+da mesma conta no celular e no computador, nem o isolamento entre duas contas
+do projeto beta.
 
 ### Como abrir esta revisão no celular, sem deploy
 
 1. No checkout `review/beta-preparacao`, configure `.env.local` com os seis
    valores `VITE_FIREBASE_*` do **projeto beta** indicados em `.env.example`.
    O arquivo é ignorado pelo Git; não envie seus valores no relato do teste.
-   Use duas contas descartáveis e confirme que pertencem ao projeto beta.
+   Use duas contas descartáveis A/B e confirme que pertencem ao projeto beta.
+   A comprova a continuidade celular ↔ computador; B serve somente para
+   verificar isolamento e pode ser acessada sequencialmente no mesmo aparelho.
 2. No computador, execute `npm run dev -- --host 0.0.0.0`. Com o celular na
    mesma rede Wi-Fi, abra `http://IP-DO-COMPUTADOR:5173/` (ou a porta que o
    Vite imprimir). Use apenas a rede local de confiança e encerre o servidor
    após o ensaio. Não é necessário fazer deploy de regras ou da aplicação.
-3. Execute os passos 1–4 abaixo com os dois usuários de teste. Registre
-   aparelho, navegador, data, número do passo, **passou/falhou** e, em falha,
+3. Execute os passos 1–4 abaixo; use B onde o roteiro pede troca de conta.
+   Registre aparelho, navegador, data, número do passo, **passou/falhou** e, em falha,
    texto exibido e captura de tela. Identifique as contas como A/B; não envie
    senhas, chaves Firebase nem dados pessoais no relato.
 
@@ -49,6 +61,7 @@ de alterar qualquer regra ou dado.
 | 1.3 | Sair (menu → Sair) e entrar com OUTRO e-mail | Dados do usuário anterior SUMEM (isolamento por UID); página recarrega |
 | 1.4 | Recarregar a página com a mesma sessão | Dados persistem (abastecimentos/entradas/jornada continuam) |
 | 1.5 | Desligar a rede no DevTools (offline) e tentar o login | Nenhuma mensagem revela se o e-mail existe; erro genérico |
+| 1.6 | Após os passos 2–3 na conta A pelo celular, entrar na mesma conta pelo computador e recarregar; conferir clientes/contas de teste, moto, abastecimentos, manutenção, entradas/faturamento e jornada/histórico que existirem; criar uma nova entrada de teste no computador e voltar ao celular para recarregar | Os dados e valores confirmados aparecem nos dois aparelhos, inclusive a nova entrada, sem duplicação; B não vê os dados de A. Não fazer gravações simultâneas |
 
 ## 2. Etapa 1 — gravação só confirmada pelo servidor
 
@@ -110,9 +123,11 @@ roteiro manual acima e NÃO podem ser validadas por `vitest run`:
 | Functions no Firestore Emulator | Automática — `functions test:emulator` (gate `FIRESTORE_EMULATOR_HOST`) |
 | Desempenho/UX tátil no celular | Manual — revisar em aparelho real antes do beta |
 
-**Critério de liberação do beta:** roteiro manual 1–4 concluído em aparelho
-real + `npm run check` verde na branch `review/beta-preparacao` + `git diff
---check` limpo.
+**Critério de liberação do beta:** roteiro manual 1–4 concluído no Android
+real, passo 1.6 comprovado também no computador com a mesma conta,
+`npm run check` verde na branch `review/beta-preparacao` e
+`git diff --check` limpo.
+Concorrência entre dois celulares não é gate deste beta.
 
 ## Resultados registrados — 28–29/09/2026
 
