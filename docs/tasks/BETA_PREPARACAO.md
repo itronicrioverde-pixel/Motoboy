@@ -531,3 +531,22 @@ backend demo; **não** comprova Android físico, projeto beta real, toque,
 teclado virtual, rede móvel ou paridade de todos os fluxos do roteiro 1.6.
 O teste Android ↔ computador e o isolamento da conta B continuam necessários
 para a aprovação final. Nenhum deploy ou regra foi alterado.
+
+### Correção do indicador da jornada confirmada — 07/10/2026
+
+O ensaio acima revelou que o aviso de sucesso da abertura podia coexistir
+com **Aguardando conexão**. A causa foi confirmada no código: o callback de
+sucesso marcava `fsId` e `syncState: saved`, mas mantinha `pendingCreateId` no
+registro local; o indicador priorizava esse ID e apresentava uma pendência
+inexistente até a próxima recarga. O painel agora remove a identidade local
+depois de retirar a tentativa do armazenamento, e o indicador não mostra
+pendência para um registro com ID remoto e estado salvo.
+
+O teste de regressão falhou antes da correção e passou depois. Na UI com
+Auth + Firestore Emulators (`demo-motoboy-badge-1007`), uma conta sintética
+abriu jornada em 1.000 km: **Sincronizando** apareceu durante o envio;
+após a confirmação, o aviso de início surgiu sem badge pendente. A recarga
+manteve a jornada aberta no histórico, também sem badge. A falha de rede e
+o retry continuam cobertos por testes anteriores; este ensaio não os repetiu
+nem substitui a verificação no Android físico/projeto beta. Nenhum deploy ou
+regra foi alterado.

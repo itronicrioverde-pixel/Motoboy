@@ -36,9 +36,10 @@ describe('painel usa a criação durável nos três fluxos', () => {
     expect(actions).toContain('data-record-action="retry"');
     expect(actions).toContain('Tentar novamente');
     const badge = sliceFrom('function syncBadgeHTML(', 'function retryRefuel(');
-    expect(badge).toContain('Aguardando conexão');
-    expect(badge).toContain('Não confirmado');
-    expect(badge).not.toContain('Salvo');
+    expect(panelSource).toContain("import { getSyncBadge } from '../shared/presentation/sync-badge'");
+    expect(badge).toContain('getSyncBadge(record)');
+    expect(badge).toContain('badge.kind');
+    expect(badge).toContain('badge.text');
   });
 
   it('confirma sucesso só depois do retry remoto, sem duas callbacks de clique simultâneo', () => {

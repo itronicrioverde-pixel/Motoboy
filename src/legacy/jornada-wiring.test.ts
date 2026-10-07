@@ -89,6 +89,17 @@ describe('painel recebe jornadas do Firestore e mescla pendências', () => {
     expect(panelSource).toContain('Início: ');
     expect(panelSource).toContain('Fim: ');
   });
+
+  it('remove a identidade pendente do registro local somente após confirmar no servidor', () => {
+    const success = panelSource.slice(
+      panelSource.indexOf('onPersistenceConfirmed(r, id){', panelSource.indexOf('function runJournadaStartSettle')),
+      panelSource.indexOf('onPersistenceFailed(r, cause){', panelSource.indexOf('function runJournadaStartSettle')),
+    );
+    expect(success).toContain('removeJornadaAttempt(r);');
+    expect(success).toContain('delete r.pendingCreateId;');
+    expect(success).toContain('delete r.pendingUid;');
+    expect(success.indexOf('removeJornadaAttempt(r);')).toBeLessThan(success.indexOf('delete r.pendingCreateId;'));
+  });
 });
 
 describe('main.ts conecta a bridge de jornada', () => {

@@ -1,5 +1,6 @@
 import { Chart } from 'chart.js/auto';
 import { showToast } from '../shared/presentation/notifications/index';
+import { getSyncBadge } from '../shared/presentation/sync-badge';
 import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
 import { clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
@@ -829,17 +830,8 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
   let entryWriteBusy = false;
 
   function syncBadgeHTML(record){
-    if(!record) return '';
-    if(record.pendingCreateId){
-      return record.syncState === 'pending'
-        ? ' <span class="sync-badge pending">Sincronizando</span>'
-        : record.syncState === 'failed'
-          ? ' <span class="sync-badge failure">Não confirmado</span>'
-          : ' <span class="sync-badge pending">Aguardando conexão</span>';
-    }
-    if(record.syncState === 'failed') return ' <span class="sync-badge failure">Não salvo</span>';
-    if(record.syncState === 'pending') return ' <span class="sync-badge pending">Sincronizando</span>';
-    return '';
+    const badge = getSyncBadge(record);
+    return badge ? ' <span class="sync-badge ' + badge.kind + '">' + badge.text + '</span>' : '';
   }
 
   const durableRetryUiInFlight = new WeakSet();
@@ -4672,6 +4664,8 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
         r.fsId = id;
         r.syncState = 'saved';
         removeJornadaAttempt(r);
+        delete r.pendingCreateId;
+        delete r.pendingUid;
         registrarKm(r.kmInicial);
         syncMotoToFirestore();
         saveLocalState();
