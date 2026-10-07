@@ -506,3 +506,28 @@ tipagem, 22 testes e build; a suíte das Functions no Firestore Emulator
 passou com **7 testes**. A auditoria web continua com **4 altos**. Estes
 alertas restantes seguem abertos e os quatro jobs verdes da CI não devem
 ser interpretados como auditoria limpa. Nenhum deploy ou regra foi alterado.
+
+### Paridade entre sessões independentes da mesma conta — 07/10/2026
+
+Com Auth + Firestore Emulators no projeto descartável
+`demo-motoboy-parity-1007`, a mesma conta sintética entrou em duas origens
+independentes do navegador (`127.0.0.1:5177` e `localhost:5177`). A primeira
+sessão cadastrou **Cliente Paridade Beta**; a segunda, após recarga, exibiu
+esse cliente. A segunda criou a entrada **Paridade PC para celular** de
+R$ 73,50; a primeira, após recarga, mostrou a entrada e o mesmo total no
+faturamento. Uma jornada foi iniciada em 12.345 km e encerrada em 12.380 km
+na segunda sessão; a primeira mostrou, após recarga, histórico encerrado,
+percurso de 35 km e custo **estimado** de R$ 6,00. Um abastecimento de
+R$ 30,00 feito na primeira apareceu na segunda após recarga, com resultado
+mensal de R$ 43,50 (R$ 73,50 recebidos menos R$ 30,00 de despesa real).
+
+Logo após a abertura da jornada, a interface exibiu transitoriamente
+**Aguardando conexão** junto de um aviso de início. A recarga de ambas as
+sessões recuperou a jornada sem badge pendente; este ensaio considera a
+persistência confirmada apenas após essa leitura independente, não pelo
+aviso transitório. Não houve escrita simultânea entre sessões. O teste
+comprova continuidade sequencial em duas sessões de navegador com o mesmo
+backend demo; **não** comprova Android físico, projeto beta real, toque,
+teclado virtual, rede móvel ou paridade de todos os fluxos do roteiro 1.6.
+O teste Android ↔ computador e o isolamento da conta B continuam necessários
+para a aprovação final. Nenhum deploy ou regra foi alterado.
