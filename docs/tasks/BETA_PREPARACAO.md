@@ -488,3 +488,21 @@ ficou entre x=5 e x=300 px; manutenção e entrada também ficaram nessa faixa.
 Esta é **simulação de viewport**, não prova de toque, teclado virtual,
 safe-area ou desempenho em Android físico. Nenhum registro financeiro foi
 criado e nenhum deploy ou regra foi alterado.
+
+### Auditoria complementar de dependências — 07/10/2026
+
+A auditoria de produção das Functions identificou um alerta **crítico** novo
+em `proxy-addr@2.0.7` (cadeia `firebase-functions → express → proxy-addr`),
+relativo à confiança incorreta em IPs quando a aplicação configura certas
+sub-redes IPv6 mapeadas para IPv4. O [aviso oficial](https://github.com/advisories/GHSA-jqcg-44mw-7w3h)
+marca `2.0.8` como corrigida. O `express@4.22.2` instalado aceita essa
+versão pela faixa `~2.0.7`; portanto, apenas `functions/package-lock.json`
+foi atualizado, sem upgrade major nem mudança no código da aplicação.
+
+Após `npm ci`, `npm ls` mostrou `proxy-addr@2.0.8`; `npm audit --omit=dev`
+passou a reportar **0 críticos, 2 altos e 10 moderados** nas Functions (o
+comando ainda retorna falha). `npm run check` das Functions passou com
+tipagem, 22 testes e build; a suíte das Functions no Firestore Emulator
+passou com **7 testes**. A auditoria web continua com **4 altos**. Estes
+alertas restantes seguem abertos e os quatro jobs verdes da CI não devem
+ser interpretados como auditoria limpa. Nenhum deploy ou regra foi alterado.
