@@ -584,3 +584,24 @@ a hidratação remota também atualiza campo e status. O teste focado foi
 executado e a UI foi verificada novamente no Emulator. Ainda faltam o teste
 no Android físico e no projeto beta real, inclusive rede móvel, reconexão e
 teclado virtual. Nenhum deploy ou regra foi alterado.
+
+### Pendência reproduzida: consumo manual sem confirmação — 08/10/2026
+
+No Auth + Firestore Emulators isolado `demo-motoboy-moto-offline-1007`, uma
+conta sintética confirmou inicialmente 35 km/L. Com os Emulators parados,
+informou 39 km/L: a UI mostrou **Sincronizando**, não “salvo”. Após recarga
+ainda sem conexão, o campo mostrou 39 km/L e **Verificando sincronização**.
+Reiniciados os Emulators com o mesmo UID e o valor remoto anterior de
+35 km/L, uma nova entrada na conta carregou **35 km/L salvos**, substituindo
+os 39 km/L não confirmados. Leitura direta do Firestore confirmou apenas
+35 km/L no servidor. Portanto, a correção visual anterior não oferece
+retry durável do consumo manual após recarga; a tentativa pode ser perdida.
+
+O reinício dos Emulators também reiniciou o Auth, exigindo novo login; este
+ensaio demonstra a perda da tentativa para o mesmo UID, mas não simula com
+fidelidade uma queda apenas do Firestore com Auth contínuo. A correção
+proposta é persistir a tentativa de consumo separadamente por UID antes do
+envio, restaurá-la após recarga, exibir **Não confirmado** e retry visível,
+removendo-a somente após confirmação ou reconciliação remota. Mudança de
+arquitetura/registro de decisão aguardam aprovação do proprietário. Não
+houve alteração de código, regra ou deploy nesta etapa.
