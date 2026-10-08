@@ -5,7 +5,10 @@ import { currentUid } from '../features/auth/application/auth-service';
 import { mergeLegacyCustomers } from '../features/customers/application/merge-legacy-customers';
 import { clientsHydrated, motoHydrated } from '../shared/application/panel-hydration';
 import { createFirestoreWriter } from '../shared/infrastructure/firestore-writer';
-import { persistMotoSnapshot } from '../features/moto/infrastructure/moto-transaction-writer';
+import { persistMotoTelemetrySnapshot } from '../features/moto/infrastructure/moto-transaction-writer';
+import { createManualConsumptionManager } from '../features/moto/application/manual-consumption-attempt';
+import { createLocalManualConsumptionStore } from '../features/moto/infrastructure/local-manual-consumption-store';
+import { firestoreManualConsumptionGateway } from '../features/moto/infrastructure/firestore-manual-consumption-gateway';
 import { manualConsumptionStatusText } from '../features/moto/presentation/manual-consumption-status';
 import { settleLocalAdd, mergeRemoteWithPending } from '../shared/application/pending-local-write';
 import { applyReceiptResult } from '../features/customers/application/apply-receipt-result';
@@ -376,19 +379,67 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
 
   let motoRetryTimer = null;
   let motoSyncErrorShown = false;
-  let motoManualSaveState = 'loading';
-  let motoManualPendingValue = null;
-  let motoManualPendingUid = null;
+  const manualConsumptionManager = ignoreLocalCache ? null : createManualConsumptionManager(
+    createLocalManualConsumptionStore(localStorage),
+    firestoreManualConsumptionGateway,
+    generateUuid,
+  );
+  let restoredManualAttempt = null;
+  try{
+    if(manualConsumptionManager && currentUid()) restoredManualAttempt = manualConsumptionManager.get(currentUid());
+  }catch(error){
+    console.error('[Moto] Tentativa local inválida:', error);
+    showToast('Não foi possível ler o consumo pendente neste dispositivo. Nada foi sobrescrito.', {kind:'error'});
+  }
+  let motoManualSaveState = restoredManualAttempt ? 'awaiting' : 'loading';
+  let manualConsumptionBusy = false;
+  let manualConsumptionVersion = 0;
   function renderManualConsumptionFeedback(){
     const input = document.getElementById('motoConsumptionInput');
     const status = document.getElementById('motoConsumptionStatus');
+    const button = document.getElementById('btnSaveConsumption');
     if(!status || !input) return;
+    input.disabled = Boolean(restoredManualAttempt);
+    if(button){
+      button.disabled = manualConsumptionBusy;
+      button.textContent = restoredManualAttempt
+        ? (manualConsumptionBusy ? 'Sincronizando…' : 'Tentar novamente')
+        : 'Salvar consumo à mão';
+    }
     if(!consumoManualDefinido || !(CONSUMO_ATUAL > 0)){
       status.textContent = '';
       return;
     }
     if(document.activeElement !== input) input.value = CONSUMO_ATUAL;
     status.textContent = manualConsumptionStatusText(CONSUMO_ATUAL, motoManualSaveState);
+  }
+  function retryManualConsumption(){
+    if(manualConsumptionBusy || !restoredManualAttempt || !manualConsumptionManager) return;
+    if(!ensureMotoInteractive()) return;
+    const uid = currentUid();
+    if(uid !== restoredManualAttempt.uid) return;
+    manualConsumptionBusy = true;
+    motoManualSaveState = 'pending';
+    renderManualConsumptionFeedback();
+    manualConsumptionManager.retry(uid).then(saved => {
+      if(uid !== currentUid()) return;
+      restoredManualAttempt = null;
+      manualConsumptionVersion += 1;
+      motoManualSaveState = 'saved';
+      window.__applyRemoteMoto?.(saved);
+      saveLocalState();
+      renderMotoConsumo();
+      renderRouteSummary();
+    }).catch(error => {
+      if(uid !== currentUid()) return;
+      motoManualSaveState = 'awaiting';
+      console.error('[Moto] Consumo manual não confirmado:', error);
+      showToast('Consumo não confirmado. Tente novamente quando houver conexão.', {kind:'error'});
+    }).finally(() => {
+      if(uid !== currentUid()) return;
+      manualConsumptionBusy = false;
+      renderManualConsumptionFeedback();
+    });
   }
   function scheduleMotoRetry(){
     if(motoRetryTimer !== null) return;
@@ -406,25 +457,17 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
     {
       gate: motoHydrated,
       persist: async (ref, snapshot) => {
-        const saved = await persistMotoSnapshot(ref, snapshot);
+        const versionAtSend = manualConsumptionVersion;
+        const saved = await persistMotoTelemetrySnapshot(ref, snapshot);
         if(ref.path.split('/')[1] !== currentUid()) return;
         motoSyncErrorShown = false;
         if(motoRetryTimer !== null){ clearTimeout(motoRetryTimer); motoRetryTimer = null; }
-        if(motoManualPendingUid === currentUid() && motoManualPendingValue === saved.consumption && saved.consumptionIsManual){
-          motoManualSaveState = 'saved';
-          motoManualPendingValue = null;
-          motoManualPendingUid = null;
-        }
-        const visible = motoManualPendingValue !== null
+        const visible = restoredManualAttempt !== null || versionAtSend !== manualConsumptionVersion
           ? { ...saved, consumption: CONSUMO_ATUAL, consumptionIsManual: consumoManualDefinido }
           : saved;
         window.__applyRemoteMoto?.(visible);
       },
       onError(){
-        if(motoManualPendingUid === currentUid() && motoManualPendingValue !== null){
-          motoManualSaveState = 'awaiting';
-          renderManualConsumptionFeedback();
-        }
         if(!motoSyncErrorShown){
           showToast('Erro ao sincronizar dados da moto. A tentativa será repetida quando houver conexão.', {kind:'error'});
           motoSyncErrorShown = true;
@@ -436,6 +479,7 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
   window.addEventListener('online', () => {
     if(motoRetryTimer !== null){ clearTimeout(motoRetryTimer); motoRetryTimer = null; }
     motoWriter.retry();
+    retryManualConsumption();
   });
   function saveMotoToFirestore(){
     if(!motoHydrated.isOpen) return;
@@ -495,6 +539,11 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
         consumoManualDefinido = data.consumptionIsManual;
       }
       motoManualSaveState = consumoManualDefinido && Number(data.consumption) > 0 ? 'saved' : 'loading';
+    }
+    if(restoredManualAttempt){
+      CONSUMO_ATUAL = restoredManualAttempt.consumption;
+      consumoManualDefinido = true;
+      motoManualSaveState = 'awaiting';
     }
     renderManualConsumptionFeedback();
     saveLocalState();
@@ -2280,10 +2329,10 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
   // O consumo vem de Minha Moto e o preço por litro vem do último abastecimento.
   // Um serviço = 1 coleta que pode gerar várias entregas (motoboy pega vários pacotes
   // no mesmo lugar e entrega em endereços diferentes).
-  let CONSUMO_ATUAL = Number(localState.manualConsumption) > 0 ? Number(localState.manualConsumption) : 0; // informado em Minha Moto ou calculado pelos abastecimentos
+  let CONSUMO_ATUAL = restoredManualAttempt?.consumption || (Number(localState.manualConsumption) > 0 ? Number(localState.manualConsumption) : 0); // informado em Minha Moto ou calculado pelos abastecimentos
   let PRECO_ATUAL = latestRefuelPrice(); // calculado em Abastecimentos
   let consumoReal = null;                // km/L calculado a partir dos abastecimentos com km do painel
-  let consumoManualDefinido = Boolean(localState.consumoManualDefinido && Number(localState.manualConsumption) > 0); // se o motoboy digitou um consumo à mão, respeitamos a escolha dele
+  let consumoManualDefinido = Boolean(restoredManualAttempt || (localState.consumoManualDefinido && Number(localState.manualConsumption) > 0)); // se o motoboy digitou um consumo à mão, respeitamos a escolha dele
 
   // Calcula o consumo real (km/L) usando os abastecimentos que têm km do painel anotado.
   // Entre dois abastecimentos consecutivos, o motoboy rodou (km maior - km menor) e, pra
@@ -2408,23 +2457,32 @@ export function bootstrapPanel({ ignoreLocalCache = false } = {}) {
   }
 
   document.getElementById('btnSaveConsumption').addEventListener('click', () => {
+    if(restoredManualAttempt){
+      retryManualConsumption();
+      return;
+    }
     if(!ensureMotoInteractive()) return;
     const consumption = parseBrazilianInput(document.getElementById('motoConsumptionInput').value);
     if(!consumption || consumption <= 0){
       showToast('Informe um consumo médio maior que zero.', {kind:'warning'});
       return;
     }
+    try{
+      if(!manualConsumptionManager || !currentUid()) throw new Error('Armazenamento ou sessão indisponível.');
+      restoredManualAttempt = manualConsumptionManager.prepare(currentUid(), consumption);
+    }catch(error){
+      showToast('Não foi possível guardar a tentativa neste dispositivo. Nada foi enviado.', {kind:'error'});
+      return;
+    }
     CONSUMO_ATUAL = consumption;
     consumoManualDefinido = true;
-    motoManualPendingValue = consumption;
-    motoManualPendingUid = currentUid();
     motoManualSaveState = 'pending';
     saveLocalState();
-    syncMotoToFirestore();
     renderManualConsumptionFeedback();
     renderMotoConsumo();
     renderRouteSummary();
     routeServices.forEach((s, i) => s.entregas.forEach((_, j) => updateServiceVerdict(i, j)));
+    retryManualConsumption();
   });
 
   function newEntrega(){ return { entrega:'', entregaCoords:null, distancia:null, tempo:null, valor:null, status:'idle', errorMsg:'', approx:false, approxConfirmed:false }; }

@@ -121,12 +121,15 @@ roteiro manual acima e NÃO podem ser validadas por `vitest run`:
 | Recebimento × cancelamento no Firestore | Automática — `client-writer.emulator.test.ts` (1) executa as duas transações reais em concorrência e verifica os dois resultados admissíveis; teste determinístico do interleaving cancelamento-primeiro permanece em `client-writer.test.ts` |
 | Repositórios de Abastecimento, Manutenção, Entrada manual e Moto | Automática — `beta-repositories.emulator.test.ts` grava, edita/reconsulta e verifica documentos reais no Emulator, incluindo snapshot de outro aparelho que não pode reduzir o hodômetro; a criação ativa usa a suíte durável acima |
 | Functions no Firestore Emulator | Automática — `functions test:emulator` (gate `FIRESTORE_EMULATOR_HOST`) |
-| Desempenho/UX tátil no celular | Manual — revisar em aparelho real antes do beta |
+| Desempenho/UX tátil no celular | Manual — não validado; o proprietário retirou este gate em 08/10 e aceitou o risco residual para o beta |
 
-**Critério de liberação do beta:** roteiro manual 1–4 concluído no Android
-real, passo 1.6 comprovado também no computador com a mesma conta,
-`npm run check` verde na branch `review/beta-preparacao` e
-`git diff --check` limpo.
+**Critério de liberação do beta (atualizado em 08/10/2026):** o proprietário
+retirou o teste no Android físico deste ciclo. O código deve ter `npm run check`,
+suítes do Firestore Emulator e CI verdes no HEAD final, `git diff --check`
+limpo, e um smoke test de login, escrita, recarga e isolamento no projeto beta
+antes de publicar. Os Emulators não comprovam configuração, regras implantadas
+ou conectividade do projeto beta. O risco de toque, teclado virtual, rede móvel
+e safe-area sem ensaio físico fica explicitamente aceito para este beta.
 Concorrência entre dois celulares não é gate deste beta.
 
 ## Resultados registrados — 28–29/09/2026
@@ -407,8 +410,9 @@ sempre a execução correspondente ao HEAD publicado.
 
 O proprietário autorizou commit/push da branch e o login sintético em 05/10;
 o ensaio acima cobriu o login. Os quatro jobs passaram no commit `ff8a1d9`.
-O beta ainda não pode ser declarado liberado até a CI do HEAD final e a
-execução do roteiro em aparelho físico. O proprietário fará a etapa no celular.
+À data deste registro (05/10), o beta dependia da CI do HEAD final e do
+roteiro em aparelho físico. O gate físico foi retirado pelo proprietário em
+08/10; valem os critérios atualizados acima e a seção final deste documento.
 
 ### Ensaio complementar de UI: concorrência, recarga e reconexão — 06/10/2026
 
@@ -621,3 +625,37 @@ não depende de reiniciar Auth ou trocar de UID. Este teste não altera o
 pedido de aprovação da tentativa local durável descrita acima e não
 substitui o ensaio no Android/projeto beta real. Nenhum deploy ou regra foi
 alterado.
+
+### Escopo de liberação ajustado — 08/10/2026
+
+O proprietário dispensou o ensaio no Android para terminar a preparação do
+beta. Isto remove um gate de aceite, não transforma os testes de navegador
+em evidência de comportamento físico no aparelho. Continua necessário
+validar a configuração e uma gravação/recarga com conta descartável no
+projeto beta, além da CI do HEAD final. O lançamento/deploy permanece sujeito
+à autorização específica do proprietário.
+
+O consumo manual da moto ganhou tentativa durável por UID (DEC-031). O valor,
+ID e UID são persistidos antes do envio, a UI permite retry após recarga e
+o writer de telemetria não confirma nem sobrescreve esse valor. `npm run check`
+passou com tipagem global, 68 arquivos/1.021 testes e build; a suíte web do
+Firestore Emulator passou com 6 arquivos/35 testes, inclusive marcador e
+isolamento por UID. Nas Functions, tipagem, 22 testes e build passaram com
+permissão de leitura suficiente para o esbuild; a suíte das Functions no
+Firestore Emulator passou com 7 testes. Esses números são do checkout local
+antes da CI do HEAD final. O smoke no projeto beta ainda deve ser registrado
+separadamente; não declarar o beta publicado a partir dos testes locais.
+
+Em navegador local com Auth e Firestore Emulators separados no projeto
+`demo-motoboy-manual-ui-1008`, a conta sintética confirmou 35 km/L. Com
+apenas o Firestore indisponível, informou 39 km/L: a UI mostrou
+**Sincronizando**, sem “salvo”. Após recarga com Auth ativo, Minha Moto
+mostrou **39,0 km/L: Aguardando conexão. Ainda não confirmado** e o botão
+**Tentar novamente**. O Firestore foi restaurado com os 35 km/L anteriores;
+outra recarga manteve a tentativa de 39 km/L. O retry confirmou 39 km/L,
+e a leitura direta encontrou um documento da moto com 39 e exatamente um
+marcador `motoConsumptionAttempts` com o mesmo valor. Nova recarga mostrou
+**39,0 km/L salvos à mão**, sem retry pendente. A simulação não comprova rede
+móvel, toque no Android, resposta perdida no navegador nem projeto beta real;
+resposta perdida e retries simultâneos estão cobertos nos testes unitários e
+de transação do Emulator. Nenhuma regra foi alterada e nenhum deploy foi feito.

@@ -121,9 +121,9 @@ describe('panel.js — propriedades estáticas', () => {
 
   describe('sync bloqueado antes da hidratação via SyncGate', () => {
     it('moto usa a persistência transacional que preserva o maior hodômetro', () => {
-      expect(panelSource).toContain("import { persistMotoSnapshot } from");
+      expect(panelSource).toContain("import { persistMotoTelemetrySnapshot } from");
       expect(panelSource).toContain('persist: async (ref, snapshot) =>');
-      expect(panelSource).toContain('await persistMotoSnapshot(ref, snapshot)');
+      expect(panelSource).toContain('await persistMotoTelemetrySnapshot(ref, snapshot)');
       expect(panelSource).not.toContain("from 'firebase/firestore'");
     });
 
@@ -133,18 +133,23 @@ describe('panel.js — propriedades estáticas', () => {
       expect(panelSource).toContain('motoWriter.retry()');
     });
 
-    it('consumo manual só é marcado salvo depois de persistMotoSnapshot confirmar', () => {
-      const write = panelSource.slice(
-        panelSource.indexOf('persist: async (ref, snapshot) =>'),
-        panelSource.indexOf('onError(){', panelSource.indexOf('persist: async (ref, snapshot) =>')),
-      );
-      expect(write).toMatch(/await persistMotoSnapshot\(ref, snapshot\)[\s\S]*motoManualSaveState = 'saved'/);
+    it('consumo manual usa tentativa durável e só é marcado salvo após retry confirmar', () => {
+      const retry = extractFunction(panelSource, 'retryManualConsumption');
+      expect(retry).toMatch(/manualConsumptionManager\.retry\(uid\)\.then\(saved => \{[\s\S]*motoManualSaveState = 'saved'/);
       const click = panelSource.slice(
         panelSource.indexOf("getElementById('btnSaveConsumption').addEventListener"),
         panelSource.indexOf('function newEntrega()', panelSource.indexOf("getElementById('btnSaveConsumption').addEventListener")),
       );
+      expect(click).toContain('manualConsumptionManager.prepare(currentUid(), consumption)');
       expect(click).toContain("motoManualSaveState = 'pending'");
+      expect(click).not.toContain('syncMotoToFirestore()');
       expect(click).not.toContain('km/L salvos à mão');
+    });
+
+    it('resposta atrasada da telemetria não substitui consumo manual recém-confirmado', () => {
+      expect(panelSource).toContain('const versionAtSend = manualConsumptionVersion');
+      expect(panelSource).toContain('versionAtSend !== manualConsumptionVersion');
+      expect(panelSource).toContain('manualConsumptionVersion += 1');
     });
 
     it('syncMotoToFirestore tem guarda if(!motoHydrated.isOpen) return', () => {

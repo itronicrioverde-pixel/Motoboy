@@ -12,6 +12,7 @@ const paths = [
   ['clientes (perfil)', 'customers/client-1'],
   ['clientes (financeiro)', 'clients/data'],
   ['moto', 'moto/data'],
+  ['tentativa de consumo manual', 'motoConsumptionAttempts/manual-1'],
   ['abastecimentos', 'abastecimentos/refuel-1'],
   ['manutenções', 'manutencoes/maint-1'],
   ['faturamento', 'entradas/entry-1'],

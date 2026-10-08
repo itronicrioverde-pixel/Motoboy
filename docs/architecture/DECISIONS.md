@@ -1639,3 +1639,53 @@ Teste no Firestore Emulator do retry após fecho remoto, do documento legado
 fechado e de aberturas simultâneas. Testes locais de recarga, troca de UID,
 duas abas e reconciliação; ensaio UI com Auth + Firestore Emulators antes de
 considerar o beta liberado.
+
+---
+
+## DEC-031 — Tentativa durável para consumo manual da moto
+
+**Status:** Aprovada
+**Data:** 08/10/2026
+**Decisor:** proprietário do Motoboy
+
+### Contexto
+
+O writer debounced da moto passou a esperar a confirmação para exibir
+“salvo”, mas um ensaio com Auth contínuo e queda apenas do Firestore mostrou
+que 39 km/L não confirmados eram substituídos por 35 km/L remotos após
+recarga e reconexão, sem ação de retry. O cache agregado do painel não pode
+ser a identidade de uma tentativa de gravação.
+
+### Decisão
+
+- Antes do primeiro envio, guardar uma tentativa com ID, UID e consumo
+  imutáveis em chave local independente e isolada por UID. Falha ao guardar
+  impede o envio e não altera o valor confirmado no servidor.
+- Uma tentativa por UID permanece disponível após recarga; cliques simultâneos
+  compartilham uma única operação. Um novo valor não substitui a tentativa
+  pendente. A UI mostra “Sincronizando” ou “Aguardando conexão. Ainda não
+  confirmado” e “Tentar novamente”; só anuncia “salvo” após resposta
+  confirmada ou reconciliação do marcador remoto.
+- Uma transação lê `users/{uid}/motoConsumptionAttempts/{id}` e
+  `users/{uid}/moto/data`, grava o valor manual e o marcador no mesmo commit.
+  Retry com marcador e payload iguais é no-op; marcador com payload diferente
+  é conflito. Uma resposta perdida não regrava um valor antigo sobre uma
+  atualização posterior.
+- O writer de hodômetro e consumo calculado mantém transação própria: avança
+  o hodômetro, mas nunca confirma nem sobrescreve um consumo manual remoto.
+  Um consumo manual pendente só pode ser confirmado pela transação acima.
+- Registros existentes não são migrados nem apagados. As regras atuais já
+  autorizam documentos sob o próprio UID; não há mudança ou deploy de regras.
+
+### Alternativas e consequências
+
+Manter apenas o cache agregado e repetir o snapshot era mais simples, mas
+perdia a tentativa após hidratação e podia regravar dados antigos. Um único
+campo de último ID na moto evitaria repetição imediata, mas não impediria
+um retry antigo após atualização posterior. O marcador por tentativa custa
+um documento adicional e permanece para garantir idempotência.
+
+Esta decisão complementa a DEC-028 (criações duráveis) sem incluir a moto
+naquele contrato de documentos de coleção. A validação exige recarga,
+resposta perdida, retries simultâneos, troca de UID e transação real no
+Firestore Emulator, além de inspeção de UI antes de publicar o beta.
