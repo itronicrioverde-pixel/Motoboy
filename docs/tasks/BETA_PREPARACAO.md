@@ -605,3 +605,19 @@ envio, restaurá-la após recarga, exibir **Não confirmado** e retry visível,
 removendo-a somente após confirmação ou reconciliação remota. Mudança de
 arquitetura/registro de decisão aguardam aprovação do proprietário. Não
 houve alteração de código, regra ou deploy nesta etapa.
+
+### Confirmação com Auth contínuo — 08/10/2026
+
+O limite do ensaio anterior foi removido em novo projeto descartável
+`demo-motoboy-auth-continuity-1008`: Auth e Firestore Emulators rodaram em
+processos separados. A conta sintética confirmou 35 km/L, apenas o
+Firestore foi interrompido, e a mesma sessão autenticada informou 39 km/L.
+A UI mostrou **Sincronizando**. Após recarregar com Auth ainda ativo,
+mostrou 39 km/L como **Verificando sincronização**, sem confirmação.
+O Firestore foi restaurado com o valor remoto confirmado de 35 km/L; ao
+abrir novamente o app na mesma origem e sessão, Minha Moto exibiu **35 km/L
+salvos** e não apresentou retry para os 39 km/L. Assim, a perda da tentativa
+não depende de reiniciar Auth ou trocar de UID. Este teste não altera o
+pedido de aprovação da tentativa local durável descrita acima e não
+substitui o ensaio no Android/projeto beta real. Nenhum deploy ou regra foi
+alterado.
