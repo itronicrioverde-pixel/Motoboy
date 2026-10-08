@@ -3,7 +3,8 @@ import type { FirebaseApp } from 'firebase/app';
 import { connectFirestoreEmulator, doc, getDocFromServer, getFirestore, setDoc, terminate } from 'firebase/firestore';
 import type { Firestore } from 'firebase/firestore';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { ManualConsumptionAttempt } from '../application/manual-consumption-attempt';
+import { createManualConsumptionManager, type ManualConsumptionAttempt } from '../application/manual-consumption-attempt';
+import { createLocalManualConsumptionStore } from './local-manual-consumption-store';
 
 const uid = 'moto-manual-user';
 let app: FirebaseApp;
@@ -55,5 +56,41 @@ describe('consumo manual no Firestore Emulator', () => {
     await expect(apply({ id: 'manual-first', uid, consumption: 99 })).rejects.toThrow('outros dados');
     expect((await getDocFromServer(doc(db, 'users', uid, 'moto', 'data'))).data())
       .toMatchObject({ consumption: 41 });
+  });
+
+  it('retoma após recarga e resposta perdida sem reaplicar consumo antigo', async () => {
+    const motoRef = doc(db, 'users', uid, 'moto', 'data');
+    await setDoc(motoRef, { currentKm: 1500, consumption: 35, consumptionIsManual: true });
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    };
+    const first = createManualConsumptionManager(
+      createLocalManualConsumptionStore(storage),
+      { apply: async (attempt: ManualConsumptionAttempt) => {
+        await apply(attempt);
+        throw new Error('Resposta perdida depois do commit');
+      } },
+      () => 'manual-lost-response',
+    );
+    const attempt = first.prepare(uid, 39);
+    await expect(first.retry(uid)).rejects.toThrow('Resposta perdida');
+    expect(first.get(uid)).toEqual(attempt);
+    expect((await getDocFromServer(motoRef)).data()).toMatchObject({ consumption: 39 });
+
+    await apply({ id: 'manual-newer', uid, consumption: 41 });
+    const afterReload = createManualConsumptionManager(
+      createLocalManualConsumptionStore(storage),
+      { apply },
+      () => 'unused-new-id',
+    );
+    expect(afterReload.get(uid)).toEqual(attempt);
+    await expect(afterReload.retry(uid)).resolves.toMatchObject({ consumption: 41 });
+    expect(afterReload.get(uid)).toBeNull();
+    expect((await getDocFromServer(motoRef)).data()).toMatchObject({ consumption: 41 });
+    expect((await getDocFromServer(doc(db, 'users', uid, 'motoConsumptionAttempts', attempt.id))).data())
+      .toMatchObject({ uid, consumption: 39 });
   });
 });

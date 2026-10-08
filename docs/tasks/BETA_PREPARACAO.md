@@ -659,3 +659,11 @@ marcador `motoConsumptionAttempts` com o mesmo valor. Nova recarga mostrou
 móvel, toque no Android, resposta perdida no navegador nem projeto beta real;
 resposta perdida e retries simultâneos estão cobertos nos testes unitários e
 de transação do Emulator. Nenhuma regra foi alterada e nenhum deploy foi feito.
+
+Em 08/10, um teste adicional no Firestore Emulator confirmou a integração
+entre tentativa local durável e transação: a primeira gravação de 39 km/L foi
+commitada, mas a resposta foi simulada como perdida; após recriar o gerenciador
+com o mesmo armazenamento (recarga), o retry conservou o ID, UID e payload.
+Mesmo com uma gravação mais recente de 41 km/L no servidor, o retry antigo
+não a sobrescreveu e limpou a tentativa local apenas ao receber confirmação.
+O ensaio não substitui o smoke no projeto beta real.
