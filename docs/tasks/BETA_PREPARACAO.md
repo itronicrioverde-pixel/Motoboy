@@ -667,3 +667,20 @@ com o mesmo armazenamento (recarga), o retry conservou o ID, UID e payload.
 Mesmo com uma gravação mais recente de 41 km/L no servidor, o retry antigo
 não a sobrescreveu e limpou a tentativa local apenas ao receber confirmação.
 O ensaio não substitui o smoke no projeto beta real.
+
+### Dependência gRPC e gate de auditoria — 09/10/2026
+
+A DEC-032 aprovou um override restrito de `@grpc/grpc-js@1.14.6` sob
+`@firebase/firestore`, sem trocar `firebase@12.18.0` nem o lockfile das
+Functions. `npm ci` passou em Node 22.23.3; `npm ls @grpc/grpc-js --all`
+mostrou somente a cópia web `1.14.6 overridden`; a árvore independente de
+Functions mantém `1.14.5`. `npm audit --omit=dev` retornou zero
+vulnerabilidades. A instalação reportou uma ocorrência alta na árvore
+completa (`source-map-js@1.2.1` via Vite → PostCSS, dependência de
+desenvolvimento); não declarar auditoria global limpa.
+
+Com o override instalado, `npm run check` passou em Node 22 (tipagem global,
+68 arquivos/1.021 testes e build). A suíte web no Firestore Emulator passou
+com 6 arquivos/36 testes. Após esses gates, a auditoria web passou a bloquear
+o job da CI se falhar. A execução remota do novo HEAD e o smoke no projeto
+beta real ainda precisam ser registrados; nenhum deploy ou regra foi alterado.

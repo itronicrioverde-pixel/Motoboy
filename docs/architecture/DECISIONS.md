@@ -1689,3 +1689,65 @@ Esta decisão complementa a DEC-028 (criações duráveis) sem incluir a moto
 naquele contrato de documentos de coleção. A validação exige recarga,
 resposta perdida, retries simultâneos, troca de UID e transação real no
 Firestore Emulator, além de inspeção de UI antes de publicar o beta.
+
+---
+
+## DEC-032 — Override restrito do gRPC transitivo do Firebase Web
+
+**Status:** Aprovada e implementada
+**Data:** 09/10/2026
+**Decisor:** proprietário do Motoboy
+
+### Contexto
+
+O `firebase@12.18.0` instala `@firebase/firestore@4.17.1`, que fixa
+`@grpc/grpc-js` em `~1.9.0`; o lockfile resolvia `1.9.16`. A auditoria web
+contava quatro pacotes afetados na mesma cadeia de dependências. Os avisos
+do gRPC tratam de comportamento de servidor; o bundle web atual não inclui
+essa implementação, mas a árvore instalada permanecia vulnerável e o passo
+`npm audit --omit=dev` da CI falhava sem bloquear o job.
+
+### Decisão
+
+- Manter `firebase@12.18.0` e aplicar no `package.json` raiz um override
+  **somente para o `@grpc/grpc-js` descendente de `@firebase/firestore`**,
+  fixando `1.14.6`; registrar a resolução no `package-lock.json`.
+- Não alterar o lockfile independente de `functions/`, regras do Firestore,
+  dados persistidos ou APIs da aplicação.
+- Antes de retirar `continue-on-error` da auditoria web, exigir: instalação
+  limpa com `npm ci` no Node 22; `npm ls @grpc/grpc-js` sem cópia vulnerável;
+  `npm audit --omit=dev` aprovado; testes, build e suíte web no Firestore
+  Emulator aprovados. Se algum gate falhar, a CI permanece como está e o
+  resultado volta para revisão; a auditoria não será declarada limpa.
+- Rever e remover o override quando o Firebase oferecer uma dependência
+  corrigida dentro da sua faixa declarada, após nova validação.
+
+### Alternativas consideradas
+
+- **Aguardar o Firebase:** evita desviar da faixa transitiva, mas deixa a
+  instalação e a auditoria atuais com o alerta.
+- **Atualizar para Firebase 13:** mudança major mais ampla; seu Firestore
+  ainda declara `~1.9.0` para gRPC e exige Node 24, enquanto a CI usa Node 22.
+- **`npm audit fix --force`:** propõe alteração incompatível do Firebase e
+  não é uma correção controlada para este produto.
+
+### Consequências
+
+O override atravessa a faixa `~1.9.0` escolhida pelo Firebase. Isso exige
+testar compatibilidade no Emulator e vigiar futuras atualizações do SDK.
+O escopo limitado evita trocar Auth, Firestore e o runtime da CI de uma vez.
+Um job verde não equivale a auditoria limpa até o passo de auditoria terminar
+com código zero e o gate ser tornado bloqueante.
+
+### Validação e ativação — 09/10/2026
+
+- `npm ci` executado com Node 22.23.3: passou. O aviso de uma ocorrência
+  alta na árvore completa vem de `source-map-js@1.2.1` pela cadeia dev
+  Vite → PostCSS; não pertence à auditoria de produção abaixo.
+- `npm ls @grpc/grpc-js --all`: uma única cópia web, `1.14.6 overridden`;
+  `functions/` usa sua árvore separada com `1.14.5`.
+- `npm audit --omit=dev`: passou com zero vulnerabilidades.
+- `npm run check` em Node 22: tipagem global, 68 arquivos/1.021 testes e
+  build passaram. Firestore Emulator: 6 arquivos/36 testes passaram.
+- Após esses gates, o passo web da CI perdeu `continue-on-error`. A CI do
+  **novo HEAD** ainda precisa executar antes de declarar o gate remoto verde.

@@ -32,7 +32,6 @@ jobs:
 
       - name: Auditoria de dependências de produção
         run: npm audit --omit=dev
-        continue-on-error: true
 
   check-functions:
     name: Functions (typecheck + teste + build)

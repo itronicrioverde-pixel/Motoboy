@@ -18,6 +18,11 @@
     "firebase": "12.18.0",
     "leaflet": "^1.9.4"
   },
+  "overrides": {
+    "@firebase/firestore": {
+      "@grpc/grpc-js": "1.14.6"
+    }
+  },
   "devDependencies": {
     "@firebase/rules-unit-testing": "^5.0.2",
     "@types/leaflet": "^1.9.22",
